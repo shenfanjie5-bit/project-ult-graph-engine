@@ -1,0 +1,297 @@
+"""Fundamental single-channel propagation over a temporary GDS projection."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from graph_engine.client import Neo4jClient
+from graph_engine.models import PropagationContext, PropagationResult
+from graph_engine.propagation.scoring import build_score_explanation
+from graph_engine.schema.definitions import RelationshipType
+
+FUNDAMENTAL_RELATIONSHIP_TYPES = (
+    RelationshipType.SUPPLY_CHAIN.value,
+    RelationshipType.OWNERSHIP.value,
+    RelationshipType.INDUSTRY_CHAIN.value,
+    RelationshipType.SECTOR_MEMBERSHIP.value,
+)
+_FUNDAMENTAL_CHANNEL = "fundamental"
+
+
+def run_fundamental_propagation(
+    context: PropagationContext,
+    client: Neo4jClient,
+    *,
+    graph_name: str = "graph_engine_fundamental",
+    max_iterations: int = 20,
+    result_limit: int = 100,
+) -> PropagationResult:
+    """Run weighted PageRank for the fundamental channel and explain edge paths."""
+
+    if _FUNDAMENTAL_CHANNEL not in context.enabled_channels:
+        raise PermissionError("fundamental propagation requires the fundamental channel")
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be greater than zero")
+    if result_limit < 1:
+        raise ValueError("result_limit must be greater than zero")
+
+    _drop_projection_if_exists(client, graph_name)
+    try:
+        _create_projection(client, graph_name)
+        impacted_entities = _stream_pagerank(
+            client,
+            graph_name,
+            max_iterations=max_iterations,
+            result_limit=result_limit,
+        )
+        activated_paths = _read_activated_paths(
+            context,
+            client,
+            result_limit=result_limit,
+        )
+    finally:
+        _drop_projection_if_exists(client, graph_name)
+
+    channel_breakdown: dict[str, Any] = {
+        _FUNDAMENTAL_CHANNEL: {
+            "relationship_types": list(FUNDAMENTAL_RELATIONSHIP_TYPES),
+            "path_count": len(activated_paths),
+            "impacted_entity_count": len(impacted_entities),
+            "total_path_score": sum(float(path["score"]) for path in activated_paths),
+            "channel_multiplier": _context_multiplier(context.channel_multipliers),
+            "regime_multiplier": _context_multiplier(context.regime_multipliers),
+        },
+    }
+    return PropagationResult(
+        cycle_id=context.cycle_id,
+        graph_generation_id=context.graph_generation_id,
+        activated_paths=activated_paths,
+        impacted_entities=impacted_entities,
+        channel_breakdown=channel_breakdown,
+    )
+
+
+def _drop_projection_if_exists(client: Neo4jClient, graph_name: str) -> None:
+    rows = _execute_gds_read(
+        client,
+        "CALL gds.graph.exists($graph_name) YIELD exists RETURN exists",
+        {"graph_name": graph_name},
+    )
+    if rows and rows[0].get("exists") is True:
+        _execute_gds_write(
+            client,
+            "CALL gds.graph.drop($graph_name) YIELD graphName RETURN graphName",
+            {"graph_name": graph_name},
+        )
+
+
+def _create_projection(client: Neo4jClient, graph_name: str) -> None:
+    relationship_projection = {
+        relationship_type: {
+            "type": relationship_type,
+            "orientation": "NATURAL",
+            "properties": {
+                "weight": {
+                    "property": "weight",
+                    "defaultValue": 1.0,
+                },
+            },
+        }
+        for relationship_type in FUNDAMENTAL_RELATIONSHIP_TYPES
+    }
+    _execute_gds_write(
+        client,
+        """
+CALL gds.graph.project($graph_name, "*", $relationship_projection)
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount
+""",
+        {
+            "graph_name": graph_name,
+            "relationship_projection": relationship_projection,
+        },
+    )
+
+
+def _stream_pagerank(
+    client: Neo4jClient,
+    graph_name: str,
+    *,
+    max_iterations: int,
+    result_limit: int,
+) -> list[dict[str, Any]]:
+    rows = _execute_gds_read(
+        client,
+        """
+CALL gds.pageRank.stream($graph_name, {
+    maxIterations: $max_iterations,
+    relationshipWeightProperty: "weight"
+})
+YIELD nodeId, score
+WITH gds.util.asNode(nodeId) AS node, score
+WITH node,
+     score,
+     coalesce(node.node_id, elementId(node)) AS stable_node_id
+RETURN node.node_id AS node_id,
+       node.canonical_entity_id AS canonical_entity_id,
+       labels(node) AS labels,
+       stable_node_id,
+       score
+ORDER BY score DESC, stable_node_id ASC
+LIMIT $result_limit
+""",
+        {
+            "graph_name": graph_name,
+            "max_iterations": max_iterations,
+            "result_limit": result_limit,
+        },
+    )
+    impacted_entities = [_impacted_entity(row) for row in rows]
+    impacted_entities.sort(
+        key=lambda entity: (-float(entity["score"]), str(entity["stable_node_id"])),
+    )
+    return impacted_entities[:result_limit]
+
+
+def _read_activated_paths(
+    context: PropagationContext,
+    client: Neo4jClient,
+    *,
+    result_limit: int,
+) -> list[dict[str, Any]]:
+    rows = client.execute_read(
+        """
+MATCH (source)-[relationship]->(target)
+WHERE type(relationship) IN $relationship_types
+RETURN source.node_id AS source_node_id,
+       source.canonical_entity_id AS source_entity_id,
+       labels(source) AS source_labels,
+       target.node_id AS target_node_id,
+       target.canonical_entity_id AS target_entity_id,
+       labels(target) AS target_labels,
+       relationship.edge_id AS edge_id,
+       type(relationship) AS relationship_type,
+       coalesce(relationship.weight, 1.0) AS relation_weight,
+       coalesce(relationship.evidence_confidence, 1.0) AS evidence_confidence,
+       coalesce(relationship.recency_decay, 1.0) AS recency_decay
+ORDER BY source_node_id ASC, relationship_type ASC, target_node_id ASC, edge_id ASC
+LIMIT $result_limit
+""",
+        {
+            "relationship_types": list(FUNDAMENTAL_RELATIONSHIP_TYPES),
+            "result_limit": result_limit,
+        },
+    )
+
+    channel_multiplier = _context_multiplier(context.channel_multipliers)
+    regime_multiplier = _context_multiplier(context.regime_multipliers)
+    activated_paths = [
+        _activated_path(row, channel_multiplier, regime_multiplier)
+        for row in rows
+    ]
+    activated_paths.sort(
+        key=lambda path: (
+            -float(path["score"]),
+            str(path["source_node_id"]),
+            str(path["relationship_type"]),
+            str(path["target_node_id"]),
+            str(path["edge_id"]),
+        ),
+    )
+    return activated_paths[:result_limit]
+
+
+def _activated_path(
+    row: dict[str, Any],
+    channel_multiplier: float,
+    regime_multiplier: float,
+) -> dict[str, Any]:
+    relation_weight = _float_value(row.get("relation_weight"), default=1.0)
+    evidence_confidence = _float_value(row.get("evidence_confidence"), default=1.0)
+    recency_decay = _float_value(row.get("recency_decay"), default=1.0)
+    explanation = build_score_explanation(
+        relation_weight=relation_weight,
+        evidence_confidence=evidence_confidence,
+        channel_multiplier=channel_multiplier,
+        regime_multiplier=regime_multiplier,
+        recency_decay=recency_decay,
+    )
+
+    return {
+        "channel": _FUNDAMENTAL_CHANNEL,
+        "source_node_id": row.get("source_node_id"),
+        "source_entity_id": row.get("source_entity_id"),
+        "source_labels": _string_list(row.get("source_labels")),
+        "target_node_id": row.get("target_node_id"),
+        "target_entity_id": row.get("target_entity_id"),
+        "target_labels": _string_list(row.get("target_labels")),
+        "edge_id": row.get("edge_id"),
+        "relationship_type": row.get("relationship_type"),
+        "score": explanation["score"],
+        "explanation": explanation,
+    }
+
+
+def _impacted_entity(row: dict[str, Any]) -> dict[str, Any]:
+    stable_node_id = str(row.get("stable_node_id") or row.get("node_id") or "")
+    return {
+        "channel": _FUNDAMENTAL_CHANNEL,
+        "node_id": row.get("node_id"),
+        "canonical_entity_id": row.get("canonical_entity_id"),
+        "labels": _string_list(row.get("labels")),
+        "score": _float_value(row.get("score"), default=0.0),
+        "stable_node_id": stable_node_id,
+    }
+
+
+def _context_multiplier(multipliers: dict[str, float]) -> float:
+    return float(multipliers.get(_FUNDAMENTAL_CHANNEL, 1.0))
+
+
+def _float_value(value: Any, *, default: float) -> float:
+    if value is None:
+        return default
+    return float(value)
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return sorted(str(item) for item in value)
+
+
+def _execute_gds_read(
+    client: Neo4jClient,
+    query: str,
+    parameters: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        return client.execute_read(query, parameters)
+    except Exception as exc:
+        if _is_missing_gds_error(exc):
+            raise RuntimeError("GDS plugin not available") from exc
+        raise
+
+
+def _execute_gds_write(
+    client: Neo4jClient,
+    query: str,
+    parameters: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        return client.execute_write(query, parameters)
+    except Exception as exc:
+        if _is_missing_gds_error(exc):
+            raise RuntimeError("GDS plugin not available") from exc
+        raise
+
+
+def _is_missing_gds_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    missing_markers = (
+        "no procedure",
+        "not registered",
+        "unknown procedure",
+        "procedure not found",
+    )
+    return "gds." in message and any(marker in message for marker in missing_markers)

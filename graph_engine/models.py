@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class GraphNodeRecord(BaseModel):
@@ -75,6 +75,43 @@ class PromotionPlan(BaseModel):
     edge_records: list[GraphEdgeRecord]
     assertion_records: list[GraphAssertionRecord]
     created_at: datetime
+
+
+class PropagationContext(BaseModel):
+    """Runtime context for one read-only propagation run."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    cycle_id: str = Field(min_length=1)
+    world_state_ref: str = Field(min_length=1)
+    graph_generation_id: int = Field(ge=0)
+    enabled_channels: list[Literal["fundamental"]] = Field(min_length=1)
+    channel_multipliers: dict[str, float]
+    regime_multipliers: dict[str, float]
+    decay_policy: dict[str, Any]
+    regime_context: dict[str, Any]
+
+    @field_validator("enabled_channels")
+    @classmethod
+    def _requires_fundamental_channel(
+        cls,
+        enabled_channels: list[Literal["fundamental"]],
+    ) -> list[Literal["fundamental"]]:
+        if "fundamental" not in enabled_channels:
+            raise ValueError("enabled_channels must include 'fundamental'")
+        return enabled_channels
+
+
+class PropagationResult(BaseModel):
+    """Serializable propagation output used to build impact snapshots."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    cycle_id: str = Field(min_length=1)
+    graph_generation_id: int = Field(ge=0)
+    activated_paths: list[dict[str, Any]]
+    impacted_entities: list[dict[str, Any]]
+    channel_breakdown: dict[str, Any]
 
 
 class GraphSnapshot(BaseModel):
