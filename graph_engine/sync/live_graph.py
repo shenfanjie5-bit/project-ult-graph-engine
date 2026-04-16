@@ -43,14 +43,10 @@ def sync_live_graph(
         raise ValueError("batch_size must be greater than zero")
 
     _validate_dynamic_identifiers(promotion_batch)
-    _validate_referenced_nodes_exist(
-        _referenced_endpoint_node_ids(promotion_batch)
-        - {node_record.node_id for node_record in promotion_batch.node_records},
-        client,
-    )
     query, parameters = _sync_query_and_parameters(promotion_batch, batch_size)
     if query:
-        client.execute_write(query, parameters)
+        rows = client.execute_write(query, parameters)
+        _raise_for_missing_endpoints(rows)
 
 
 def _sync_query_and_parameters(
@@ -112,7 +108,40 @@ def _sync_query_and_parameters(
 
     if not clauses:
         return "", {}
-    return "\n".join(clauses) + "\nRETURN 1 AS synced_count\n", parameters
+
+    required_endpoint_node_ids = _referenced_endpoint_node_ids(promotion_batch) - {
+        node_record.node_id for node_record in promotion_batch.node_records
+    }
+    parameters["required_endpoint_node_ids"] = sorted(required_endpoint_node_ids)
+    return _sync_transaction_query(clauses), parameters
+
+
+def _sync_transaction_query(clauses: list[str]) -> str:
+    mutation_clauses = "\n".join(clauses)
+    return f"""
+WITH $required_endpoint_node_ids AS required_endpoint_node_ids
+CALL {{
+    WITH required_endpoint_node_ids
+    UNWIND required_endpoint_node_ids AS node_id
+    OPTIONAL MATCH (n {{node_id: node_id}})
+    WITH node_id, count(n) AS match_count
+    WHERE match_count = 0
+    RETURN collect(node_id) AS missing_endpoint_node_ids
+}}
+CALL {{
+    WITH missing_endpoint_node_ids
+    WITH missing_endpoint_node_ids
+    WHERE size(missing_endpoint_node_ids) = 0
+{mutation_clauses}
+    RETURN 1 AS mutation_applied
+    UNION
+    WITH missing_endpoint_node_ids
+    WITH missing_endpoint_node_ids
+    WHERE size(missing_endpoint_node_ids) > 0
+    RETURN 0 AS mutation_applied
+}}
+RETURN missing_endpoint_node_ids, mutation_applied
+"""
 
 
 def _node_sync_clause(
@@ -213,28 +242,24 @@ CALL {{
 """
 
 
-def _validate_referenced_nodes_exist(
-    node_ids: set[str],
-    client: Neo4jClient,
-) -> None:
-    if not node_ids:
+def _raise_for_missing_endpoints(rows: list[dict[str, Any]]) -> None:
+    if not isinstance(rows, list):
         return
+    if not rows:
+        raise RuntimeError("live graph sync did not return endpoint validation status")
 
-    rows = client.execute_read(
-        """
-UNWIND $node_ids AS node_id
-MATCH (n {node_id: node_id})
-RETURN collect(DISTINCT n.node_id) AS node_ids
-""",
-        {"node_ids": sorted(node_ids)},
-    )
-    existing_node_ids = _existing_node_ids(rows)
-    missing_node_ids = sorted(node_ids - existing_node_ids)
+    raw_missing_node_ids = rows[0].get("missing_endpoint_node_ids", [])
+    if not isinstance(raw_missing_node_ids, list):
+        raw_missing_node_ids = []
+    missing_node_ids = sorted(str(node_id) for node_id in raw_missing_node_ids)
     if missing_node_ids:
         raise ValueError(
             "live graph is missing endpoint nodes: "
             + ", ".join(missing_node_ids),
         )
+
+    if rows[0].get("mutation_applied") == 0:
+        raise RuntimeError("live graph sync did not apply mutations")
 
 
 def _referenced_endpoint_node_ids(promotion_batch: PromotionPlan) -> set[str]:
@@ -247,15 +272,6 @@ def _referenced_endpoint_node_ids(promotion_batch: PromotionPlan) -> set[str]:
         if assertion_record.target_node_id is not None:
             node_ids.add(assertion_record.target_node_id)
     return node_ids
-
-
-def _existing_node_ids(rows: list[dict[str, Any]]) -> set[str]:
-    if not rows:
-        return set()
-    raw_node_ids = rows[0].get("node_ids", ())
-    if not isinstance(raw_node_ids, list):
-        return set()
-    return {str(node_id) for node_id in raw_node_ids}
 
 
 def _node_row(node_record: GraphNodeRecord) -> dict[str, Any]:
