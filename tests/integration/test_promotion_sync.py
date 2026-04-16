@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -99,6 +100,12 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
                 )
 
             counts = _live_graph_counts(client, node_ids, edge_id, assertion_id)
+            serialized_payloads = _live_graph_serialized_payloads(
+                client,
+                source_node_id,
+                edge_id,
+                assertion_id,
+            )
         finally:
             client.execute_write(
                 "MATCH (n) WHERE n.node_id IN $node_ids DETACH DELETE n",
@@ -111,6 +118,17 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
         "business_edges": 1,
         "assertion_nodes": 1,
         "assertion_links": 2,
+    }
+    assert serialized_payloads == {
+        "node_properties_json": _json_payload(_node_properties(source_node_id)),
+        "node_integration_prefix": source_node_id,
+        "node_metadata": None,
+        "edge_properties_json": _json_payload(_edge_properties(edge_id)),
+        "edge_integration_prefix": edge_id,
+        "edge_metadata": None,
+        "edge_properties": None,
+        "assertion_evidence_json": _json_payload(_assertion_evidence()),
+        "assertion_evidence": None,
     }
 
 
@@ -147,6 +165,36 @@ RETURN business_nodes, business_edges, assertion_nodes, count(assertion_link) AS
     }
 
 
+def _live_graph_serialized_payloads(
+    client: Neo4jClient,
+    source_node_id: str,
+    edge_id: str,
+    assertion_id: str,
+) -> dict[str, object]:
+    rows = client.execute_read(
+        """
+MATCH (node {node_id: $source_node_id})
+MATCH ()-[edge:SUPPLY_CHAIN {edge_id: $edge_id}]->()
+MATCH (assertion:Assertion {node_id: $assertion_id})
+RETURN node.properties_json AS node_properties_json,
+       node.integration_prefix AS node_integration_prefix,
+       node.metadata AS node_metadata,
+       edge.properties_json AS edge_properties_json,
+       edge.integration_prefix AS edge_integration_prefix,
+       edge.metadata AS edge_metadata,
+       edge.properties AS edge_properties,
+       assertion.evidence_json AS assertion_evidence_json,
+       assertion.evidence AS assertion_evidence
+""",
+        {
+            "source_node_id": source_node_id,
+            "edge_id": edge_id,
+            "assertion_id": assertion_id,
+        },
+    )
+    return rows[0]
+
+
 def _node_delta(
     delta_id: str,
     node_id: str,
@@ -162,7 +210,7 @@ def _node_delta(
                 "node_id": node_id,
                 "canonical_entity_id": canonical_entity_id,
                 "label": NodeLabel.ENTITY.value,
-                "properties": {"integration_prefix": node_id},
+                "properties": _node_properties(node_id),
                 "created_at": NOW,
                 "updated_at": NOW,
             }
@@ -189,7 +237,7 @@ def _edge_delta(
                 "source_node_id": source_node_id,
                 "target_node_id": target_node_id,
                 "relationship_type": RelationshipType.SUPPLY_CHAIN.value,
-                "properties": {"integration_prefix": edge_id},
+                "properties": _edge_properties(edge_id),
                 "weight": 0.7,
                 "created_at": NOW,
                 "updated_at": NOW,
@@ -217,10 +265,35 @@ def _assertion_delta(
                 "source_node_id": source_node_id,
                 "target_node_id": target_node_id,
                 "assertion_type": "integration",
-                "evidence": {"source": "test"},
+                "evidence": _assertion_evidence(),
                 "confidence": 0.9,
                 "created_at": NOW,
             }
         },
         validation_status="frozen",
     )
+
+
+def _node_properties(node_id: str) -> dict[str, object]:
+    return {
+        "integration_prefix": node_id,
+        "metadata": {"tier": "critical"},
+    }
+
+
+def _edge_properties(edge_id: str) -> dict[str, object]:
+    return {
+        "integration_prefix": edge_id,
+        "metadata": {"source_system": "fixture"},
+    }
+
+
+def _assertion_evidence() -> dict[str, object]:
+    return {
+        "source": "test",
+        "documents": [{"document_id": "doc-1"}],
+    }
+
+
+def _json_payload(payload: dict[str, object]) -> str:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)

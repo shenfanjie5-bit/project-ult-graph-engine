@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -39,6 +40,12 @@ def test_sync_live_graph_uses_idempotent_merge_queries() -> None:
         for query in queries
     )
     assert queries[0].count("`ASSERTION_LINK`") == 2
+    assert "n.properties = row.properties" not in queries[0]
+    assert "r.properties = row.properties" not in queries[0]
+    assert "assertion.evidence = row.evidence" not in queries[0]
+    assert "n.properties_json = row.properties_json" in queries[0]
+    assert "r.properties_json = row.properties_json" in queries[0]
+    assert "assertion.evidence_json = row.evidence_json" in queries[0]
 
 
 def test_sync_live_graph_batches_rows_by_node_label() -> None:
@@ -180,16 +187,22 @@ def test_sync_live_graph_does_not_split_stale_delete_and_replacement_writes() ->
 
 def test_sync_live_graph_expands_only_safe_properties() -> None:
     client = MagicMock(spec=Neo4jClient)
+    properties = {
+        "ticker": "ULT",
+        "tags": ["supply-chain", "issuer"],
+        "metadata": {"risk_level": "high"},
+        "bad-key": "ignored",
+        "nested_list": [{"source": "filing"}],
+        "node_id": "not-overwritten",
+        "properties_json": "not-overwritten",
+        "nullable": None,
+    }
     plan = _promotion_plan(
         node_records=[
             _node_record(
                 "node-1",
                 "entity-1",
-                properties={
-                    "ticker": "ULT",
-                    "bad-key": "ignored",
-                    "node_id": "not-overwritten",
-                },
+                properties=properties,
             )
         ],
     )
@@ -197,12 +210,44 @@ def test_sync_live_graph_expands_only_safe_properties() -> None:
     sync_live_graph(plan, client)
 
     rows = client.execute_write.call_args.args[1]["node_rows_0"]
-    assert rows[0]["properties"] == {
+    assert rows[0]["properties_json"] == _json_payload(properties)
+    assert rows[0]["safe_properties"] == {
+        "tags": ["supply-chain", "issuer"],
         "ticker": "ULT",
-        "bad-key": "ignored",
-        "node_id": "not-overwritten",
     }
-    assert rows[0]["safe_properties"] == {"ticker": "ULT"}
+    assert "properties" not in rows[0]
+
+
+def test_sync_live_graph_serializes_edge_properties_and_assertion_evidence() -> None:
+    client = MagicMock(spec=Neo4jClient)
+    edge_properties = {
+        "source": "filing",
+        "details": {"form": "10-K"},
+        "confidence_band": ["medium", "high"],
+        "properties_json": "not-overwritten",
+    }
+    assertion_evidence = {
+        "source": "contract",
+        "documents": [{"document_id": "doc-1"}],
+    }
+    plan = _promotion_plan(
+        edge_records=[_edge_record(properties=edge_properties)],
+        assertion_records=[_assertion_record(evidence=assertion_evidence)],
+    )
+
+    sync_live_graph(plan, client)
+
+    parameters = client.execute_write.call_args.args[1]
+    edge_row = parameters["edge_rows_0"][0]
+    assertion_row = parameters["assertion_source_rows_1"][0]
+    assert edge_row["properties_json"] == _json_payload(edge_properties)
+    assert edge_row["safe_properties"] == {
+        "confidence_band": ["medium", "high"],
+        "source": "filing",
+    }
+    assert "properties" not in edge_row
+    assert assertion_row["evidence_json"] == _json_payload(assertion_evidence)
+    assert "evidence" not in assertion_row
 
 
 def test_sync_live_graph_rejects_invalid_node_label_before_writing() -> None:
@@ -275,26 +320,30 @@ def _edge_record(
     source_node_id: str = "node-1",
     target_node_id: str = "node-2",
     relationship_type: str = RelationshipType.SUPPLY_CHAIN.value,
+    properties: dict[str, object] | None = None,
 ) -> GraphEdgeRecord:
     return GraphEdgeRecord(
         edge_id=edge_id,
         source_node_id=source_node_id,
         target_node_id=target_node_id,
         relationship_type=relationship_type,
-        properties={"source": "filing"},
+        properties=properties or {"source": "filing"},
         weight=0.7,
         created_at=NOW,
         updated_at=NOW,
     )
 
 
-def _assertion_record() -> GraphAssertionRecord:
+def _assertion_record(
+    *,
+    evidence: dict[str, object] | None = None,
+) -> GraphAssertionRecord:
     return GraphAssertionRecord(
         assertion_id="assertion-1",
         source_node_id="node-1",
         target_node_id="node-2",
         assertion_type="risk",
-        evidence={"source": "contract"},
+        evidence=evidence or {"source": "contract"},
         confidence=0.8,
         created_at=NOW,
     )
@@ -305,8 +354,12 @@ def _expected_node_row(node_id: str, canonical_entity_id: str) -> dict[str, obje
         "node_id": node_id,
         "canonical_entity_id": canonical_entity_id,
         "label": NodeLabel.ENTITY.value,
-        "properties": {"ticker": "ULT"},
+        "properties_json": _json_payload({"ticker": "ULT"}),
         "safe_properties": {"ticker": "ULT"},
         "created_at": NOW,
         "updated_at": NOW,
     }
+
+
+def _json_payload(payload: dict[str, object]) -> str:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from collections.abc import Iterator
+from datetime import date, datetime, time
 from typing import Any
 
 from graph_engine.client import Neo4jClient
@@ -20,9 +22,11 @@ _RESERVED_PROPERTY_NAMES = {
     "created_at",
     "edge_id",
     "evidence",
+    "evidence_json",
     "label",
     "node_id",
     "properties",
+    "properties_json",
     "relationship_type",
     "source_node_id",
     "target_node_id",
@@ -155,7 +159,7 @@ CALL {{
     MERGE (n:{label_identifier} {{node_id: row.node_id}})
     SET n.canonical_entity_id = row.canonical_entity_id,
         n.label = row.label,
-        n.properties = row.properties,
+        n.properties_json = row.properties_json,
         n.created_at = row.created_at,
         n.updated_at = row.updated_at
     SET n += row.safe_properties
@@ -186,7 +190,7 @@ CALL {{
     MERGE (source)-[r:{relationship_identifier} {{edge_id: row.edge_id}}]->(target)
     SET r.relationship_type = row.relationship_type,
         r.weight = row.weight,
-        r.properties = row.properties,
+        r.properties_json = row.properties_json,
         r.created_at = row.created_at,
         r.updated_at = row.updated_at
     SET r += row.safe_properties
@@ -206,7 +210,7 @@ CALL {{
     SET assertion.assertion_id = row.assertion_id,
         assertion.assertion_type = row.assertion_type,
         assertion.confidence = row.confidence,
-        assertion.evidence = row.evidence,
+        assertion.evidence_json = row.evidence_json,
         assertion.source_node_id = row.source_node_id,
         assertion.target_node_id = row.target_node_id,
         assertion.created_at = row.created_at
@@ -279,7 +283,7 @@ def _node_row(node_record: GraphNodeRecord) -> dict[str, Any]:
         "node_id": node_record.node_id,
         "canonical_entity_id": node_record.canonical_entity_id,
         "label": node_record.label,
-        "properties": node_record.properties,
+        "properties_json": _structured_payload_json(node_record.properties),
         "safe_properties": _safe_properties(node_record.properties),
         "created_at": node_record.created_at,
         "updated_at": node_record.updated_at,
@@ -293,7 +297,7 @@ def _edge_row(edge_record: GraphEdgeRecord) -> dict[str, Any]:
         "target_node_id": edge_record.target_node_id,
         "relationship_type": edge_record.relationship_type,
         "weight": edge_record.weight,
-        "properties": edge_record.properties,
+        "properties_json": _structured_payload_json(edge_record.properties),
         "safe_properties": _safe_properties(edge_record.properties),
         "created_at": edge_record.created_at,
         "updated_at": edge_record.updated_at,
@@ -306,7 +310,7 @@ def _assertion_row(assertion_record: GraphAssertionRecord) -> dict[str, Any]:
         "source_node_id": assertion_record.source_node_id,
         "target_node_id": assertion_record.target_node_id,
         "assertion_type": assertion_record.assertion_type,
-        "evidence": assertion_record.evidence,
+        "evidence_json": _structured_payload_json(assertion_record.evidence),
         "confidence": assertion_record.confidence,
         "created_at": assertion_record.created_at,
     }
@@ -316,8 +320,35 @@ def _safe_properties(properties: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in properties.items()
-        if _is_safe_property_name(key)
+        if _is_safe_property_name(key) and _is_neo4j_property_value(value)
     }
+
+
+def _structured_payload_json(payload: dict[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        default=_json_default,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, datetime | date | time):
+        return value.isoformat()
+    return str(value)
+
+
+def _is_neo4j_property_value(value: Any) -> bool:
+    if _is_neo4j_scalar_property_value(value):
+        return True
+    if isinstance(value, list):
+        return all(_is_neo4j_scalar_property_value(item) for item in value)
+    return False
+
+
+def _is_neo4j_scalar_property_value(value: Any) -> bool:
+    return isinstance(value, str | bool | int | float)
 
 
 def _is_safe_property_name(property_name: str) -> bool:
