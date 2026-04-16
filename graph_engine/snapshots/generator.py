@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol
 
 from graph_engine.client import Neo4jClient
 from graph_engine.models import (
@@ -20,6 +20,13 @@ from graph_engine.propagation.fundamental import run_fundamental_propagation
 from graph_engine.snapshots.writer import SnapshotWriter
 
 
+class GraphStatusReader(Protocol):
+    """Read the current live graph status from the status boundary."""
+
+    def read_graph_status(self) -> Neo4jGraphStatus:
+        """Return the current Neo4j graph status."""
+
+
 def build_graph_snapshot(
     cycle_id: str,
     graph_generation_id: int,
@@ -28,15 +35,13 @@ def build_graph_snapshot(
     """Read live graph metrics and return a deterministic structural snapshot."""
 
     node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
-    return GraphSnapshot(
-        cycle_id=cycle_id,
-        snapshot_id=f"graph-snapshot-{cycle_id}-{graph_generation_id}-{checksum[:12]}",
-        graph_generation_id=graph_generation_id,
+    return _graph_snapshot_from_metrics(
+        cycle_id,
+        graph_generation_id,
         node_count=node_count,
         edge_count=edge_count,
         key_label_counts=key_label_counts,
         checksum=checksum,
-        created_at=datetime.now(timezone.utc),
     )
 
 
@@ -71,27 +76,46 @@ def compute_graph_snapshots(
     world_state_ref: str,
     *,
     client: Neo4jClient,
-    graph_generation_id: int,
+    graph_generation_id: int | None = None,
     regime_reader: RegimeContextReader,
     snapshot_writer: SnapshotWriter,
     graph_status: Neo4jGraphStatus | None = None,
+    status_reader: GraphStatusReader | None = None,
     graph_name: str | None = None,
 ) -> tuple[GraphSnapshot, GraphImpactSnapshot]:
     """Run fundamental propagation and write graph plus impact snapshots."""
 
+    ready_status = _resolve_ready_graph_status(graph_status, status_reader)
+    _validate_generation_input(graph_generation_id, ready_status)
+    node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
+    _validate_status_metrics(
+        ready_status,
+        node_count=node_count,
+        edge_count=edge_count,
+        key_label_counts=key_label_counts,
+        checksum=checksum,
+    )
+
     context = build_propagation_context(
         cycle_id,
         world_state_ref,
-        graph_generation_id,
+        ready_status.graph_generation_id,
         regime_reader=regime_reader,
-        graph_status=graph_status,
+        graph_status=ready_status,
     )
     propagation_result = run_fundamental_propagation(
         context,
         client,
         graph_name=graph_name,
     )
-    graph_snapshot = build_graph_snapshot(cycle_id, graph_generation_id, client)
+    graph_snapshot = _graph_snapshot_from_metrics(
+        cycle_id,
+        ready_status.graph_generation_id,
+        node_count=node_count,
+        edge_count=edge_count,
+        key_label_counts=key_label_counts,
+        checksum=checksum,
+    )
     impact_snapshot = build_graph_impact_snapshot(
         cycle_id,
         world_state_ref,
@@ -99,6 +123,93 @@ def compute_graph_snapshots(
     )
     snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
     return graph_snapshot, impact_snapshot
+
+
+def _resolve_ready_graph_status(
+    graph_status: Neo4jGraphStatus | None,
+    status_reader: GraphStatusReader | None,
+) -> Neo4jGraphStatus:
+    if graph_status is None:
+        if status_reader is None:
+            raise ValueError(
+                "formal snapshot computation requires graph_status or status_reader",
+            )
+        graph_status = status_reader.read_graph_status()
+
+    if graph_status.graph_status != "ready":
+        raise PermissionError(
+            "snapshot computation requires graph_status='ready'; "
+            f"received {graph_status.graph_status!r}",
+        )
+    return graph_status
+
+
+def _validate_generation_input(
+    graph_generation_id: int | None,
+    graph_status: Neo4jGraphStatus,
+) -> None:
+    if graph_generation_id is None:
+        return
+    if graph_generation_id != graph_status.graph_generation_id:
+        raise ValueError(
+            "graph_generation_id disagrees with Neo4jGraphStatus: "
+            f"received {graph_generation_id}, "
+            f"status has {graph_status.graph_generation_id}",
+        )
+
+
+def _validate_status_metrics(
+    graph_status: Neo4jGraphStatus,
+    *,
+    node_count: int,
+    edge_count: int,
+    key_label_counts: dict[str, int],
+    checksum: str,
+) -> None:
+    mismatches: list[str] = []
+    if graph_status.node_count != node_count:
+        mismatches.append(
+            f"node_count status={graph_status.node_count} live={node_count}",
+        )
+    if graph_status.edge_count != edge_count:
+        mismatches.append(
+            f"edge_count status={graph_status.edge_count} live={edge_count}",
+        )
+    if graph_status.key_label_counts != key_label_counts:
+        mismatches.append(
+            "key_label_counts "
+            f"status={graph_status.key_label_counts!r} live={key_label_counts!r}",
+        )
+    if graph_status.checksum != checksum:
+        mismatches.append(
+            f"checksum status={graph_status.checksum!r} live={checksum!r}",
+        )
+    if mismatches:
+        raise ValueError(
+            "live graph metrics disagree with Neo4jGraphStatus: "
+            + "; ".join(mismatches),
+        )
+
+
+def _graph_snapshot_from_metrics(
+    cycle_id: str,
+    graph_generation_id: int,
+    *,
+    node_count: int,
+    edge_count: int,
+    key_label_counts: dict[str, int],
+    checksum: str,
+) -> GraphSnapshot:
+    return GraphSnapshot(
+        cycle_id=cycle_id,
+        snapshot_id=f"graph-snapshot-{cycle_id}-{graph_generation_id}-{checksum[:12]}",
+        graph_generation_id=graph_generation_id,
+        node_count=node_count,
+        edge_count=edge_count,
+        key_label_counts=key_label_counts,
+        checksum=checksum,
+        created_at=datetime.now(timezone.utc),
+    )
 
 
 def _read_graph_metrics(client: Neo4jClient) -> tuple[int, int, dict[str, int], str]:
