@@ -94,13 +94,20 @@ class RaisingSnapshotWriter:
 
 
 class StaticStatusReader:
-    def __init__(self, graph_status: Neo4jGraphStatus) -> None:
-        self.graph_status = graph_status
+    def __init__(
+        self,
+        graph_status: Neo4jGraphStatus | list[Neo4jGraphStatus],
+    ) -> None:
+        if isinstance(graph_status, list):
+            self.graph_statuses = graph_status
+        else:
+            self.graph_statuses = [graph_status]
         self.calls = 0
 
     def read_graph_status(self) -> Neo4jGraphStatus:
         self.calls += 1
-        return self.graph_status
+        index = min(self.calls - 1, len(self.graph_statuses) - 1)
+        return self.graph_statuses[index]
 
 
 def test_build_graph_snapshot_reads_metrics_and_stable_checksum() -> None:
@@ -251,14 +258,14 @@ def test_compute_graph_snapshots_uses_status_reader_and_derives_generation(
         status_reader=status_reader,
     )
 
-    assert status_reader.calls == 1
+    assert status_reader.calls == 2
     assert graph_snapshot.graph_generation_id == 7
     assert graph_snapshot.node_count == 2
     assert graph_snapshot.edge_count == 1
     assert graph_snapshot.key_label_counts == {"Entity": 2}
     assert graph_snapshot.checksum == "abc123"
     assert impact_snapshot.regime_context_ref == "world-state-1"
-    assert events == ["metrics", "context:7", "propagation:7", "write"]
+    assert events == ["metrics", "context:7", "propagation:7", "metrics", "write"]
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
 
@@ -300,10 +307,35 @@ def test_compute_graph_snapshots_rejects_status_disagreements_before_propagation
             graph_generation_id=graph_generation_id,
             regime_reader=reader,
             snapshot_writer=writer,
-            graph_status=graph_status,
+            status_reader=StaticStatusReader(graph_status),
         )
 
     assert events == expected_events
+    assert reader.calls == []
+    assert writer.calls == []
+
+
+def test_compute_graph_snapshots_rejects_direct_ready_status_without_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    reader = StaticRegimeReader()
+    writer = RecordingSnapshotWriter()
+
+    _patch_metrics(monkeypatch, events)
+
+    with pytest.raises(ValueError, match="status_reader"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=MagicMock(),
+            graph_generation_id=1,
+            regime_reader=reader,
+            snapshot_writer=writer,
+            graph_status=_ready_status(),
+        )
+
+    assert events == []
     assert reader.calls == []
     assert writer.calls == []
 
@@ -339,7 +371,7 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
         graph_generation_id=1,
         regime_reader=StaticRegimeReader(),
         snapshot_writer=writer,
-        graph_status=_ready_status(),
+        status_reader=StaticStatusReader(_ready_status()),
     )
 
     graph_snapshot = result[0]
@@ -347,8 +379,95 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
     assert graph_snapshot.node_count == 2
     assert graph_snapshot.edge_count == 1
     assert graph_snapshot.checksum == "abc123"
-    assert events == ["metrics", "context", "propagation", "impact", "write"]
+    assert events == ["metrics", "context", "propagation", "impact", "metrics", "write"]
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
+
+
+def test_compute_graph_snapshots_rechecks_status_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    ready_status = _ready_status()
+    rebuilding_status = _ready_status(graph_status="rebuilding")
+    status_reader = StaticStatusReader([ready_status, rebuilding_status])
+    writer = RecordingSnapshotWriter(events)
+
+    _patch_metrics(monkeypatch, events)
+    monkeypatch.setattr(
+        snapshot_generator,
+        "build_propagation_context",
+        lambda *args, **kwargs: events.append("context") or _context(),
+    )
+    monkeypatch.setattr(
+        snapshot_generator,
+        "run_fundamental_propagation",
+        lambda *args, **kwargs: events.append("propagation") or _propagation_result(),
+    )
+    monkeypatch.setattr(
+        snapshot_generator,
+        "build_graph_impact_snapshot",
+        lambda *args, **kwargs: events.append("impact") or _impact_snapshot(),
+    )
+
+    with pytest.raises(RuntimeError, match="changed before snapshot publication"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=MagicMock(),
+            graph_generation_id=1,
+            regime_reader=StaticRegimeReader(),
+            snapshot_writer=writer,
+            status_reader=status_reader,
+        )
+
+    assert status_reader.calls == 2
+    assert events == ["metrics", "context", "propagation", "impact"]
+    assert writer.calls == []
+
+
+def test_compute_graph_snapshots_rechecks_live_metrics_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    writer = RecordingSnapshotWriter(events)
+
+    _patch_metrics(
+        monkeypatch,
+        events,
+        metrics_sequence=[
+            (2, 1, {"Entity": 2}, "abc123"),
+            (3, 1, {"Entity": 3}, "changed"),
+        ],
+    )
+    monkeypatch.setattr(
+        snapshot_generator,
+        "build_propagation_context",
+        lambda *args, **kwargs: events.append("context") or _context(),
+    )
+    monkeypatch.setattr(
+        snapshot_generator,
+        "run_fundamental_propagation",
+        lambda *args, **kwargs: events.append("propagation") or _propagation_result(),
+    )
+    monkeypatch.setattr(
+        snapshot_generator,
+        "build_graph_impact_snapshot",
+        lambda *args, **kwargs: events.append("impact") or _impact_snapshot(),
+    )
+
+    with pytest.raises(ValueError, match="live graph metrics disagree"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=MagicMock(),
+            graph_generation_id=1,
+            regime_reader=StaticRegimeReader(),
+            snapshot_writer=writer,
+            status_reader=StaticStatusReader(_ready_status()),
+        )
+
+    assert events == ["metrics", "context", "propagation", "impact", "metrics"]
+    assert writer.calls == []
 
 
 def test_compute_graph_snapshots_does_not_write_if_snapshot_build_fails(
@@ -385,7 +504,7 @@ def test_compute_graph_snapshots_does_not_write_if_snapshot_build_fails(
             graph_generation_id=1,
             regime_reader=StaticRegimeReader(),
             snapshot_writer=writer,
-            graph_status=_ready_status(),
+            status_reader=StaticStatusReader(_ready_status()),
         )
 
     assert writer.calls == []
@@ -419,18 +538,25 @@ def test_compute_graph_snapshots_surfaces_writer_errors(
             graph_generation_id=1,
             regime_reader=StaticRegimeReader(),
             snapshot_writer=RaisingSnapshotWriter(),
-            graph_status=_ready_status(),
+            status_reader=StaticStatusReader(_ready_status()),
         )
 
 
 def _patch_metrics(
     monkeypatch: pytest.MonkeyPatch,
     events: list[str] | None = None,
+    metrics_sequence: list[tuple[int, int, dict[str, int], str]] | None = None,
 ) -> None:
+    metrics = metrics_sequence or [(2, 1, {"Entity": 2}, "abc123")]
+    calls = 0
+
     def read_metrics(client: Any) -> tuple[int, int, dict[str, int], str]:
+        nonlocal calls
         if events is not None:
             events.append("metrics")
-        return 2, 1, {"Entity": 2}, "abc123"
+        index = min(calls, len(metrics) - 1)
+        calls += 1
+        return metrics[index]
 
     monkeypatch.setattr(snapshot_generator, "_read_graph_metrics", read_metrics)
 
@@ -482,19 +608,6 @@ def _propagation_result(graph_generation_id: int = 1) -> PropagationResult:
         ],
         impacted_entities=[{"node_id": "node-2", "score": 0.4}],
         channel_breakdown={"fundamental": {"path_count": 1}},
-    )
-
-
-def _graph_snapshot() -> GraphSnapshot:
-    return GraphSnapshot(
-        cycle_id="cycle-1",
-        snapshot_id="snapshot-1",
-        graph_generation_id=1,
-        node_count=2,
-        edge_count=1,
-        key_label_counts={"Entity": 2},
-        checksum="abc123",
-        created_at=NOW,
     )
 
 
