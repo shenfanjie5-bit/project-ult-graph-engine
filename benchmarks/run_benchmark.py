@@ -28,7 +28,6 @@ _CONNECTION_FAILURE_MARKERS = (
     "authentication",
 )
 _GDS_UNAVAILABLE_MARKERS = (
-    "gds",
     "no procedure",
     "not found",
     "not available",

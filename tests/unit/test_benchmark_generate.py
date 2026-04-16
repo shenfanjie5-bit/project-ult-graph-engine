@@ -55,11 +55,19 @@ def test_generate_synthetic_edges_returns_valid_references_and_weights() -> None
     ]
 
     edges = generate_synthetic_edges(nodes, 50, relationship_types)
-    node_ids = {node["node_id"] for node in nodes}
+    node_labels_by_id = {node["node_id"]: node["label"] for node in nodes}
 
     assert len(edges) == 50
-    assert all(edge["source_node_id"] in node_ids for edge in edges)
-    assert all(edge["target_node_id"] in node_ids for edge in edges)
+    assert all(edge["source_node_id"] in node_labels_by_id for edge in edges)
+    assert all(edge["target_node_id"] in node_labels_by_id for edge in edges)
+    assert all(
+        edge["source_label"] == node_labels_by_id[edge["source_node_id"]]
+        for edge in edges
+    )
+    assert all(
+        edge["target_label"] == node_labels_by_id[edge["target_node_id"]]
+        for edge in edges
+    )
     assert all(edge["relationship_type"] in relationship_types for edge in edges)
     assert all(0.1 <= edge["weight"] <= 1.0 for edge in edges)
 
@@ -108,7 +116,10 @@ def test_load_synthetic_graph_batches_nodes_and_edges_by_type() -> None:
     assert len(queries) == 3
     assert any("MERGE (n:`Entity`" in query for query in queries)
     assert any("MERGE (n:`Sector`" in query for query in queries)
-    assert any("[r:`SUPPLY_CHAIN`" in query for query in queries)
+    edge_queries = [query for query in queries if "[r:`SUPPLY_CHAIN`" in query]
+    assert len(edge_queries) == 1
+    assert "MATCH (source:`Entity`" in edge_queries[0]
+    assert "MATCH (target:`Sector`" in edge_queries[0]
 
 
 def test_load_synthetic_graph_rejects_invalid_batch_size() -> None:
@@ -116,12 +127,33 @@ def test_load_synthetic_graph_rejects_invalid_batch_size() -> None:
         load_synthetic_graph(MagicMock(), [], [], batch_size=0)
 
 
-def test_clear_graph_deletes_all_nodes() -> None:
+def test_clear_graph_deletes_only_synthetic_benchmark_data_in_batches() -> None:
     client = MagicMock()
+    client.execute_write.side_effect = [
+        [{"deleted": 10_000}],
+        [{"deleted": 3}],
+        [{"deleted": 2}],
+    ]
 
-    clear_graph(client)
+    clear_graph(client, batch_size=10_000)
 
-    client.execute_write.assert_called_once_with("MATCH (n) DETACH DELETE n")
+    queries = [call.args[0] for call in client.execute_write.call_args_list]
+    parameters = [call.args[1] for call in client.execute_write.call_args_list]
+
+    assert len(queries) == 3
+    assert all("synthetic_benchmark = true" in query for query in queries)
+    assert all("LIMIT $batch_size" in query for query in queries)
+    assert all("MATCH (n) DETACH DELETE n" not in query for query in queries)
+    assert parameters == [
+        {"batch_size": 10_000},
+        {"batch_size": 10_000},
+        {"batch_size": 10_000},
+    ]
+
+
+def test_clear_graph_rejects_invalid_batch_size() -> None:
+    with pytest.raises(ValueError, match="batch_size"):
+        clear_graph(MagicMock(), batch_size=0)
 
 
 def test_generate_text_report_includes_status_and_operation_names() -> None:
@@ -159,6 +191,14 @@ def test_benchmark_gds_projection_create_reports_missing_gds_plugin() -> None:
 
     with pytest.raises(RuntimeError, match="GDS plugin not available"):
         benchmark_gds_projection_create(client, "missing_gds")
+
+
+def test_benchmark_gds_projection_create_does_not_hide_gds_runtime_errors() -> None:
+    client = MagicMock()
+    client.execute_write.side_effect = RuntimeError("gds PageRank execution failed")
+
+    with pytest.raises(RuntimeError, match="PageRank execution failed"):
+        benchmark_gds_projection_create(client, "runtime_failure")
 
 
 def test_benchmark_consistency_check_normalizes_connection_failures() -> None:
