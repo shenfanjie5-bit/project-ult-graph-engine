@@ -218,6 +218,39 @@ def test_sync_live_graph_expands_only_safe_properties() -> None:
     assert "properties" not in rows[0]
 
 
+def test_sync_live_graph_routes_neo4j_incompatible_lists_to_json_only() -> None:
+    client = MagicMock(spec=Neo4jClient)
+    properties = {
+        "empty_list": [],
+        "string_aliases": ["ULT", "ULT-A"],
+        "int_scores": [1, 2],
+        "bool_flags": [True, False],
+        "mixed_aliases": ["ULT", 123],
+        "mixed_bool_int": [True, 1],
+        "nullable_aliases": ["ULT", None],
+    }
+    plan = _promotion_plan(
+        node_records=[
+            _node_record(
+                "node-1",
+                "entity-1",
+                properties=properties,
+            )
+        ],
+    )
+
+    sync_live_graph(plan, client)
+
+    row = client.execute_write.call_args.args[1]["node_rows_0"][0]
+    assert row["properties_json"] == _json_payload(properties)
+    assert row["safe_properties"] == {
+        "bool_flags": [True, False],
+        "empty_list": [],
+        "int_scores": [1, 2],
+        "string_aliases": ["ULT", "ULT-A"],
+    }
+
+
 def test_sync_live_graph_serializes_edge_properties_and_assertion_evidence() -> None:
     client = MagicMock(spec=Neo4jClient)
     edge_properties = {

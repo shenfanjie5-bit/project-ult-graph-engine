@@ -343,12 +343,36 @@ def _is_neo4j_property_value(value: Any) -> bool:
     if _is_neo4j_scalar_property_value(value):
         return True
     if isinstance(value, list):
-        return all(_is_neo4j_scalar_property_value(item) for item in value)
+        return _is_neo4j_scalar_list_property_value(value)
     return False
 
 
+def _is_neo4j_scalar_list_property_value(value: list[Any]) -> bool:
+    if not value:
+        return True
+
+    first_type = _neo4j_scalar_property_type(value[0])
+    if first_type is None:
+        return False
+    return all(_neo4j_scalar_property_type(item) is first_type for item in value)
+
+
 def _is_neo4j_scalar_property_value(value: Any) -> bool:
-    return isinstance(value, str | bool | int | float)
+    return _neo4j_scalar_property_type(value) is not None
+
+
+def _neo4j_scalar_property_type(
+    value: Any,
+) -> type[str] | type[bool] | type[int] | type[float] | None:
+    if isinstance(value, str):
+        return str
+    if isinstance(value, bool):
+        return bool
+    if isinstance(value, int):
+        return int
+    if isinstance(value, float):
+        return float
+    return None
 
 
 def _is_safe_property_name(property_name: str) -> bool:

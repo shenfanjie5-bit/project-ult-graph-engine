@@ -123,9 +123,11 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
         "node_properties_json": _json_payload(_node_properties(source_node_id)),
         "node_integration_prefix": source_node_id,
         "node_metadata": None,
+        "node_mixed_aliases": None,
         "edge_properties_json": _json_payload(_edge_properties(edge_id)),
         "edge_integration_prefix": edge_id,
         "edge_metadata": None,
+        "edge_mixed_aliases": None,
         "edge_properties": None,
         "assertion_evidence_json": _json_payload(_assertion_evidence()),
         "assertion_evidence": None,
@@ -179,9 +181,11 @@ MATCH (assertion:Assertion {node_id: $assertion_id})
 RETURN node.properties_json AS node_properties_json,
        node.integration_prefix AS node_integration_prefix,
        node.metadata AS node_metadata,
+       node.mixed_aliases AS node_mixed_aliases,
        edge.properties_json AS edge_properties_json,
        edge.integration_prefix AS edge_integration_prefix,
        edge.metadata AS edge_metadata,
+       edge.mixed_aliases AS edge_mixed_aliases,
        edge.properties AS edge_properties,
        assertion.evidence_json AS assertion_evidence_json,
        assertion.evidence AS assertion_evidence
@@ -277,6 +281,7 @@ def _assertion_delta(
 def _node_properties(node_id: str) -> dict[str, object]:
     return {
         "integration_prefix": node_id,
+        "mixed_aliases": ["ULT", 123],
         "metadata": {"tier": "critical"},
     }
 
@@ -284,6 +289,7 @@ def _node_properties(node_id: str) -> dict[str, object]:
 def _edge_properties(edge_id: str) -> dict[str, object]:
     return {
         "integration_prefix": edge_id,
+        "mixed_aliases": ["SUPPLY_CHAIN", 1],
         "metadata": {"source_system": "fixture"},
     }
 
