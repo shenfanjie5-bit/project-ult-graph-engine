@@ -19,7 +19,7 @@ from graph_engine.models import (
 )
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import SchemaManager
-from graph_engine.snapshots import compute_graph_snapshots
+from graph_engine.snapshots import build_graph_snapshot, compute_graph_snapshots
 from graph_engine.sync import sync_live_graph
 
 pytestmark = pytest.mark.skipif(
@@ -72,13 +72,14 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
 
         try:
             sync_live_graph(_promotion_plan(source_node_id, target_node_id, edge_id), client)
+            current_snapshot = build_graph_snapshot("cycle-1", 1, client)
             graph_status = Neo4jGraphStatus(
                 graph_status="ready",
-                graph_generation_id=1,
-                node_count=2,
-                edge_count=1,
-                key_label_counts={NodeLabel.ENTITY.value: 2},
-                checksum="integration",
+                graph_generation_id=current_snapshot.graph_generation_id,
+                node_count=current_snapshot.node_count,
+                edge_count=current_snapshot.edge_count,
+                key_label_counts=current_snapshot.key_label_counts,
+                checksum=current_snapshot.checksum,
                 last_verified_at=NOW,
                 last_reload_at=None,
             )
@@ -88,7 +89,6 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
                     "cycle-1",
                     "world-state-1",
                     client=client,
-                    graph_generation_id=1,
                     regime_reader=StaticRegimeReader(),
                     snapshot_writer=writer,
                     graph_status=graph_status,
