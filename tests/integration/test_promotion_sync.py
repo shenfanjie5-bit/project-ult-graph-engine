@@ -9,10 +9,11 @@ import pytest
 
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
-from graph_engine.models import CandidateGraphDelta, PromotionPlan
+from graph_engine.models import CandidateGraphDelta, GraphEdgeRecord, GraphNodeRecord, PromotionPlan
 from graph_engine.promotion import promote_graph_deltas
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import SchemaManager
+from graph_engine.sync import sync_live_graph
 
 pytestmark = pytest.mark.skipif(
     os.getenv("NEO4J_PASSWORD") is None,
@@ -134,6 +135,66 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
     }
 
 
+def test_sync_removes_stale_top_level_properties_when_payload_becomes_json_only() -> None:
+    pytest.importorskip("neo4j")
+    prefix = f"promotion-sync-stale-props-{uuid4().hex}"
+    source_node_id = f"{prefix}-source"
+    target_node_id = f"{prefix}-target"
+    edge_id = f"{prefix}-edge"
+    node_ids = [source_node_id, target_node_id]
+
+    scalar_plan = _direct_sync_plan(
+        source_node_id,
+        target_node_id,
+        edge_id,
+        node_properties={"score": 42},
+        edge_properties={"score": 0.7},
+    )
+    nested_plan = _direct_sync_plan(
+        source_node_id,
+        target_node_id,
+        edge_id,
+        node_properties={"score": {"breakdown": {"a": 10, "b": 32}}},
+        edge_properties={"score": {"breakdown": {"direct": 0.7}}},
+    )
+
+    with Neo4jClient(load_config_from_env()) as client:
+        if not client.verify_connectivity():
+            pytest.skip("Neo4j is not reachable with the configured environment.")
+
+        manager = SchemaManager(client)
+        manager.apply_schema()
+        assert manager.verify_schema() is True
+
+        try:
+            sync_live_graph(scalar_plan, client)
+            initial_payloads = _live_graph_score_payloads(client, source_node_id, edge_id)
+            sync_live_graph(nested_plan, client)
+            updated_payloads = _live_graph_score_payloads(client, source_node_id, edge_id)
+        finally:
+            client.execute_write(
+                "MATCH (n) WHERE n.node_id IN $node_ids DETACH DELETE n",
+                {"node_ids": node_ids},
+            )
+
+    assert initial_payloads == {
+        "node_score": 42,
+        "node_properties_json": _json_payload({"score": 42}),
+        "edge_score": 0.7,
+        "edge_properties_json": _json_payload({"score": 0.7}),
+    }
+    assert updated_payloads == {
+        "node_score": None,
+        "node_properties_json": _json_payload(
+            {"score": {"breakdown": {"a": 10, "b": 32}}},
+        ),
+        "edge_score": None,
+        "edge_properties_json": _json_payload(
+            {"score": {"breakdown": {"direct": 0.7}}},
+        ),
+    }
+
+
 def _live_graph_counts(
     client: Neo4jClient,
     node_ids: list[str],
@@ -197,6 +258,75 @@ RETURN node.properties_json AS node_properties_json,
         },
     )
     return rows[0]
+
+
+def _live_graph_score_payloads(
+    client: Neo4jClient,
+    source_node_id: str,
+    edge_id: str,
+) -> dict[str, object]:
+    rows = client.execute_read(
+        """
+MATCH (node {node_id: $source_node_id})
+MATCH ()-[edge:SUPPLY_CHAIN {edge_id: $edge_id}]->()
+RETURN node.score AS node_score,
+       node.properties_json AS node_properties_json,
+       edge.score AS edge_score,
+       edge.properties_json AS edge_properties_json
+""",
+        {
+            "source_node_id": source_node_id,
+            "edge_id": edge_id,
+        },
+    )
+    return rows[0]
+
+
+def _direct_sync_plan(
+    source_node_id: str,
+    target_node_id: str,
+    edge_id: str,
+    *,
+    node_properties: dict[str, object],
+    edge_properties: dict[str, object],
+) -> PromotionPlan:
+    return PromotionPlan(
+        cycle_id="cycle-1",
+        selection_ref="selection-1",
+        delta_ids=["delta-1"],
+        node_records=[
+            GraphNodeRecord(
+                node_id=source_node_id,
+                canonical_entity_id=f"{source_node_id}-entity",
+                label=NodeLabel.ENTITY.value,
+                properties=node_properties,
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            GraphNodeRecord(
+                node_id=target_node_id,
+                canonical_entity_id=f"{target_node_id}-entity",
+                label=NodeLabel.ENTITY.value,
+                properties={},
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        ],
+        edge_records=[
+            GraphEdgeRecord(
+                edge_id=edge_id,
+                source_node_id=source_node_id,
+                target_node_id=target_node_id,
+                relationship_type=RelationshipType.SUPPLY_CHAIN.value,
+                properties=edge_properties,
+                weight=0.7,
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        ],
+        assertion_records=[],
+        created_at=NOW,
+    )
 
 
 def _node_delta(

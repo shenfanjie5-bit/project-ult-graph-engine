@@ -46,6 +46,13 @@ def test_sync_live_graph_uses_idempotent_merge_queries() -> None:
     assert "n.properties_json = row.properties_json" in queries[0]
     assert "r.properties_json = row.properties_json" in queries[0]
     assert "assertion.evidence_json = row.evidence_json" in queries[0]
+    assert "SET n[stale_property_key] = null" in queries[0]
+    assert "SET r[stale_property_key] = null" in queries[0]
+    assert "NOT property_key IN row.safe_property_keys" in queries[0]
+
+    parameters = client.execute_write.call_args.args[1]
+    assert "node_id" in parameters["reserved_property_names"]
+    assert "properties_json" in parameters["reserved_property_names"]
 
 
 def test_sync_live_graph_batches_rows_by_node_label() -> None:
@@ -215,6 +222,7 @@ def test_sync_live_graph_expands_only_safe_properties() -> None:
         "tags": ["supply-chain", "issuer"],
         "ticker": "ULT",
     }
+    assert rows[0]["safe_property_keys"] == ["tags", "ticker"]
     assert "properties" not in rows[0]
 
 
@@ -249,6 +257,12 @@ def test_sync_live_graph_routes_neo4j_incompatible_lists_to_json_only() -> None:
         "int_scores": [1, 2],
         "string_aliases": ["ULT", "ULT-A"],
     }
+    assert row["safe_property_keys"] == [
+        "bool_flags",
+        "empty_list",
+        "int_scores",
+        "string_aliases",
+    ]
 
 
 def test_sync_live_graph_serializes_edge_properties_and_assertion_evidence() -> None:
@@ -278,6 +292,7 @@ def test_sync_live_graph_serializes_edge_properties_and_assertion_evidence() -> 
         "confidence_band": ["medium", "high"],
         "source": "filing",
     }
+    assert edge_row["safe_property_keys"] == ["confidence_band", "source"]
     assert "properties" not in edge_row
     assert assertion_row["evidence_json"] == _json_payload(assertion_evidence)
     assert "evidence" not in assertion_row
@@ -389,6 +404,7 @@ def _expected_node_row(node_id: str, canonical_entity_id: str) -> dict[str, obje
         "label": NodeLabel.ENTITY.value,
         "properties_json": _json_payload({"ticker": "ULT"}),
         "safe_properties": {"ticker": "ULT"},
+        "safe_property_keys": ["ticker"],
         "created_at": NOW,
         "updated_at": NOW,
     }
