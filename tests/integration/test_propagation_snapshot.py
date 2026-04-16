@@ -41,7 +41,8 @@ class StaticRegimeReader:
 
 
 class CapturingSnapshotWriter:
-    def __init__(self) -> None:
+    def __init__(self, status_reader: StaticGraphStatusReader) -> None:
+        self.status_reader = status_reader
         self.calls: list[tuple[GraphSnapshot, GraphImpactSnapshot]] = []
 
     def write_snapshots(
@@ -50,6 +51,20 @@ class CapturingSnapshotWriter:
         impact_snapshot: GraphImpactSnapshot,
     ) -> None:
         self.calls.append((graph_snapshot, impact_snapshot))
+
+    def write_snapshots_if_status_matches(
+        self,
+        graph_snapshot: GraphSnapshot,
+        impact_snapshot: GraphImpactSnapshot,
+        *,
+        expected_status: Neo4jGraphStatus,
+    ) -> bool:
+        if not self.status_reader.validate_ready_status_for_snapshot_publication(
+            expected_status,
+        ):
+            return False
+        self.write_snapshots(graph_snapshot, impact_snapshot)
+        return True
 
 
 class StaticGraphStatusReader:
@@ -74,7 +89,6 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
     target_node_id = f"{prefix}-target"
     edge_id = f"{prefix}-edge"
     node_ids = [source_node_id, target_node_id]
-    writer = CapturingSnapshotWriter()
 
     with Neo4jClient(load_config_from_env()) as client:
         if not client.verify_connectivity():
@@ -97,6 +111,8 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
                 last_verified_at=NOW,
                 last_reload_at=None,
             )
+            status_reader = StaticGraphStatusReader(graph_status)
+            writer = CapturingSnapshotWriter(status_reader)
 
             try:
                 graph_snapshot, impact_snapshot = compute_graph_snapshots(
@@ -105,7 +121,7 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
                     client=client,
                     regime_reader=StaticRegimeReader(),
                     snapshot_writer=writer,
-                    graph_status_reader=StaticGraphStatusReader(graph_status),
+                    graph_status_reader=status_reader,
                     graph_name=f"{prefix}-projection",
                 )
             except RuntimeError as exc:

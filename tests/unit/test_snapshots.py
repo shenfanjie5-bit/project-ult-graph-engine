@@ -101,9 +101,15 @@ class StaticGraphStatusReader:
 
 
 class RecordingSnapshotWriter:
-    def __init__(self, events: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        events: list[str] | None = None,
+        status_reader: StaticGraphStatusReader | None = None,
+    ) -> None:
         self.events = events
+        self.status_reader = status_reader
         self.calls: list[tuple[GraphSnapshot, GraphImpactSnapshot]] = []
+        self.expected_statuses: list[Neo4jGraphStatus] = []
 
     def write_snapshots(
         self,
@@ -114,6 +120,24 @@ class RecordingSnapshotWriter:
             self.events.append("write")
         self.calls.append((graph_snapshot, impact_snapshot))
 
+    def write_snapshots_if_status_matches(
+        self,
+        graph_snapshot: GraphSnapshot,
+        impact_snapshot: GraphImpactSnapshot,
+        *,
+        expected_status: Neo4jGraphStatus,
+    ) -> bool:
+        self.expected_statuses.append(expected_status)
+        if (
+            self.status_reader is not None
+            and not self.status_reader.validate_ready_status_for_snapshot_publication(
+                expected_status,
+            )
+        ):
+            return False
+        self.write_snapshots(graph_snapshot, impact_snapshot)
+        return True
+
 
 class RaisingSnapshotWriter:
     def write_snapshots(
@@ -121,6 +145,15 @@ class RaisingSnapshotWriter:
         graph_snapshot: GraphSnapshot,
         impact_snapshot: GraphImpactSnapshot,
     ) -> None:
+        raise RuntimeError("writer failed")
+
+    def write_snapshots_if_status_matches(
+        self,
+        graph_snapshot: GraphSnapshot,
+        impact_snapshot: GraphImpactSnapshot,
+        *,
+        expected_status: Neo4jGraphStatus,
+    ) -> bool:
         raise RuntimeError("writer failed")
 
 
@@ -347,8 +380,8 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
         "build_graph_impact_snapshot",
         lambda *args, **kwargs: events.append("impact") or impact_snapshot,
     )
-    writer = RecordingSnapshotWriter(events)
     status_reader = StaticGraphStatusReader(_ready_status(graph_snapshot))
+    writer = RecordingSnapshotWriter(events, status_reader)
 
     result = compute_graph_snapshots(
         "cycle-1",
@@ -363,6 +396,7 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
     assert result == (graph_snapshot, impact_snapshot)
     assert events == ["graph", "context", "propagation", "impact", "write"]
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
+    assert writer.expected_statuses == [_ready_status(graph_snapshot)]
 
 
 def test_compute_graph_snapshots_rechecks_status_before_write(
@@ -394,8 +428,8 @@ def test_compute_graph_snapshots_rechecks_status_before_write(
         "build_graph_impact_snapshot",
         lambda *args, **kwargs: events.append("impact") or _impact_snapshot(),
     )
-    writer = RecordingSnapshotWriter(events)
     status_reader = StaticGraphStatusReader([ready_status, rebuilding_status])
+    writer = RecordingSnapshotWriter(events, status_reader)
 
     with pytest.raises(RuntimeError, match="changed before snapshot publication"):
         compute_graph_snapshots(
@@ -410,6 +444,7 @@ def test_compute_graph_snapshots_rechecks_status_before_write(
     assert status_reader.calls == 2
     assert events == ["graph", "context", "propagation", "impact"]
     assert writer.calls == []
+    assert writer.expected_statuses == [ready_status]
 
 
 def test_compute_graph_snapshots_rejects_direct_ready_status_without_reader(

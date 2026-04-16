@@ -17,7 +17,6 @@ from graph_engine.models import (
 )
 from graph_engine.propagation.context import RegimeContextReader, build_propagation_context
 from graph_engine.propagation.fundamental import run_fundamental_propagation
-from graph_engine.snapshots.writer import SnapshotWriter
 
 
 class GraphStatusReader(Protocol):
@@ -32,6 +31,20 @@ class GraphStatusReader(Protocol):
         expected_status: Neo4jGraphStatus,
     ) -> bool:
         """Atomically confirm the graph is still ready for snapshot publication."""
+        ...
+
+
+class StatusGuardedSnapshotWriter(Protocol):
+    """Snapshot writer that guards persistence with a ready-status CAS check."""
+
+    def write_snapshots_if_status_matches(
+        self,
+        graph_snapshot: GraphSnapshot,
+        impact_snapshot: GraphImpactSnapshot,
+        *,
+        expected_status: Neo4jGraphStatus,
+    ) -> bool:
+        """Persist snapshots only if the status row still matches expected_status."""
         ...
 
 
@@ -87,7 +100,7 @@ def compute_graph_snapshots(
     *,
     client: Neo4jClient,
     regime_reader: RegimeContextReader,
-    snapshot_writer: SnapshotWriter,
+    snapshot_writer: StatusGuardedSnapshotWriter,
     graph_status: Neo4jGraphStatus | None = None,
     graph_status_reader: GraphStatusReader | None = None,
     graph_generation_id: int | None = None,
@@ -123,11 +136,12 @@ def compute_graph_snapshots(
         world_state_ref,
         propagation_result,
     )
-    _validate_publication_status_matches_ready_status(
+    _write_snapshots_if_status_matches(
+        snapshot_writer,
+        graph_snapshot,
+        impact_snapshot,
         ready_status,
-        graph_status_reader,
     )
-    snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
     return graph_snapshot, impact_snapshot
 
 
@@ -177,18 +191,16 @@ def _validate_generation_input(
         )
 
 
-def _validate_publication_status_matches_ready_status(
+def _write_snapshots_if_status_matches(
+    snapshot_writer: StatusGuardedSnapshotWriter,
+    graph_snapshot: GraphSnapshot,
+    impact_snapshot: GraphImpactSnapshot,
     ready_status: Neo4jGraphStatus,
-    graph_status_reader: GraphStatusReader | None,
 ) -> None:
-    if graph_status_reader is None:
-        raise ValueError(
-            "formal snapshot publication requires graph_status_reader "
-            "for write-boundary validation",
-        )
-
-    if not graph_status_reader.validate_ready_status_for_snapshot_publication(
-        ready_status,
+    if not snapshot_writer.write_snapshots_if_status_matches(
+        graph_snapshot,
+        impact_snapshot,
+        expected_status=ready_status,
     ):
         raise RuntimeError(
             "ready graph status changed before snapshot publication",
