@@ -1,0 +1,106 @@
+"""Persistent graph-domain records shared by graph-engine workflows."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class GraphNodeRecord(BaseModel):
+    """Canonical graph node persisted in Layer A."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    node_id: str = Field(min_length=1)
+    canonical_entity_id: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    properties: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class GraphEdgeRecord(BaseModel):
+    """Canonical graph relationship persisted in Layer A."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    edge_id: str = Field(min_length=1)
+    source_node_id: str = Field(min_length=1)
+    target_node_id: str = Field(min_length=1)
+    relationship_type: str = Field(min_length=1)
+    properties: dict[str, Any]
+    weight: float = Field(default=1.0, ge=0.0)
+    created_at: datetime
+    updated_at: datetime
+
+
+class GraphAssertionRecord(BaseModel):
+    """Canonical assertion and evidence record."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    assertion_id: str = Field(min_length=1)
+    source_node_id: str = Field(min_length=1)
+    target_node_id: str | None
+    assertion_type: str = Field(min_length=1)
+    evidence: dict[str, Any]
+    confidence: float = Field(ge=0.0, le=1.0)
+    created_at: datetime
+
+
+class CandidateGraphDelta(BaseModel):
+    """Validated or frozen candidate change waiting for graph promotion."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    delta_id: str = Field(min_length=1)
+    cycle_id: str = Field(min_length=1)
+    delta_type: Literal["node_add", "edge_add", "edge_update", "assertion_add"]
+    source_entity_ids: list[str] = Field(min_length=1)
+    payload: dict[str, Any]
+    validation_status: Literal["validated", "rejected", "frozen"]
+
+
+class GraphSnapshot(BaseModel):
+    """Structural snapshot of the promoted graph for a cycle."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    cycle_id: str = Field(min_length=1)
+    snapshot_id: str = Field(min_length=1)
+    graph_generation_id: int = Field(ge=0)
+    node_count: int = Field(ge=0)
+    edge_count: int = Field(ge=0)
+    key_label_counts: dict[str, int]
+    checksum: str = Field(min_length=1)
+    created_at: datetime
+
+
+class GraphImpactSnapshot(BaseModel):
+    """Propagation impact snapshot emitted for downstream read-only consumers."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    cycle_id: str = Field(min_length=1)
+    impact_snapshot_id: str = Field(min_length=1)
+    regime_context_ref: str = Field(min_length=1)
+    activated_paths: list[dict[str, Any]]
+    impacted_entities: list[dict[str, Any]]
+    channel_breakdown: dict[str, Any]
+
+
+class Neo4jGraphStatus(BaseModel):
+    """Current live graph status stored outside Neo4j."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    graph_status: Literal["ready", "rebuilding", "failed"]
+    graph_generation_id: int = Field(ge=0)
+    node_count: int = Field(ge=0)
+    edge_count: int = Field(ge=0)
+    key_label_counts: dict[str, int]
+    checksum: str = Field(min_length=1)
+    last_verified_at: datetime | None
+    last_reload_at: datetime | None
