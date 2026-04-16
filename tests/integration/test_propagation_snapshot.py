@@ -52,6 +52,16 @@ class CapturingSnapshotWriter:
         self.calls.append((graph_snapshot, impact_snapshot))
 
 
+class StaticGraphStatusReader:
+    def __init__(self, graph_status: Neo4jGraphStatus) -> None:
+        self.graph_status = graph_status
+        self.calls = 0
+
+    def read_graph_status(self) -> Neo4jGraphStatus:
+        self.calls += 1
+        return self.graph_status
+
+
 def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -> None:
     pytest.importorskip("neo4j")
 
@@ -83,6 +93,7 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
                 last_verified_at=NOW,
                 last_reload_at=None,
             )
+            status_reader = StaticGraphStatusReader(graph_status)
 
             try:
                 graph_snapshot, impact_snapshot = compute_graph_snapshots(
@@ -92,7 +103,7 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
                     graph_generation_id=1,
                     regime_reader=StaticRegimeReader(),
                     snapshot_writer=writer,
-                    graph_status=graph_status,
+                    graph_status_reader=status_reader,
                     graph_name=f"{prefix}-projection",
                 )
             except RuntimeError as exc:
@@ -111,6 +122,7 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
     assert impact_snapshot.impacted_entities
     assert any(path["edge_id"] == edge_id for path in impact_snapshot.activated_paths)
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
+    assert status_reader.calls == 2
 
 
 def _promotion_plan(

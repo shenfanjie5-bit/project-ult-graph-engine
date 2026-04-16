@@ -15,6 +15,7 @@ from graph_engine.models import (
     PropagationResult,
 )
 from graph_engine.snapshots import (
+    GraphStatusReader,
     build_graph_impact_snapshot,
     build_graph_snapshot,
     compute_graph_snapshots,
@@ -77,6 +78,18 @@ class RecordingGraphStatusReader:
     def read_graph_status(self) -> Neo4jGraphStatus:
         self.calls += 1
         return self.graph_status
+
+
+class SequenceGraphStatusReader:
+    def __init__(self, graph_statuses: list[Neo4jGraphStatus]) -> None:
+        self.graph_statuses = graph_statuses
+        self.calls = 0
+
+    def read_graph_status(self) -> Neo4jGraphStatus:
+        self.calls += 1
+        if self.calls <= len(self.graph_statuses):
+            return self.graph_statuses[self.calls - 1]
+        return self.graph_statuses[-1]
 
 
 class RecordingSnapshotWriter:
@@ -164,6 +177,10 @@ def test_build_graph_impact_snapshot_preserves_propagation_payload() -> None:
     assert impact_snapshot.channel_breakdown == propagation_result.channel_breakdown
 
 
+def test_snapshots_exports_graph_status_reader() -> None:
+    assert GraphStatusReader is snapshot_generator.GraphStatusReader
+
+
 def test_compute_graph_snapshots_requires_status_without_side_effects() -> None:
     client = MagicMock()
     reader = StaticRegimeReader()
@@ -240,6 +257,53 @@ def test_compute_graph_snapshots_rejects_generation_mismatch_without_side_effect
     client.execute_write.assert_not_called()
 
 
+def test_compute_graph_snapshots_rejects_ambiguous_status_sources_without_side_effects() -> None:
+    client = MagicMock()
+    reader = StaticRegimeReader()
+    writer = RecordingSnapshotWriter()
+    graph_status = _status_from_snapshot(_graph_snapshot())
+
+    with pytest.raises(ValueError, match="either graph_status or graph_status_reader"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=client,
+            graph_generation_id=1,
+            regime_reader=reader,
+            snapshot_writer=writer,
+            graph_status=graph_status,
+            graph_status_reader=RecordingGraphStatusReader(graph_status),
+        )
+
+    assert reader.calls == []
+    assert writer.calls == []
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_not_called()
+
+
+def test_compute_graph_snapshots_requires_status_reader_for_write_revalidation() -> None:
+    client = MagicMock()
+    reader = StaticRegimeReader()
+    writer = RecordingSnapshotWriter()
+    graph_status = _status_from_snapshot(_graph_snapshot())
+
+    with pytest.raises(ValueError, match="write-boundary status revalidation"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=client,
+            graph_generation_id=1,
+            regime_reader=reader,
+            snapshot_writer=writer,
+            graph_status=graph_status,
+        )
+
+    assert reader.calls == []
+    assert writer.calls == []
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_not_called()
+
+
 def test_compute_graph_snapshots_rejects_status_metric_mismatch_before_propagation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -277,7 +341,7 @@ def test_compute_graph_snapshots_rejects_status_metric_mismatch_before_propagati
             graph_generation_id=1,
             regime_reader=reader,
             snapshot_writer=writer,
-            graph_status=graph_status,
+            graph_status_reader=RecordingGraphStatusReader(graph_status),
         )
 
     assert len(client.read_calls) == 1
@@ -325,12 +389,126 @@ def test_compute_graph_snapshots_uses_status_reader_and_derives_generation(
         graph_status_reader=status_reader,
     )
 
-    assert status_reader.calls == 1
+    assert status_reader.calls == 2
     assert seen_generations == [7]
     assert graph_snapshot.graph_generation_id == 7
     assert graph_snapshot.checksum == expected_snapshot.checksum
     assert impact_snapshot.regime_context_ref == "world-state-1"
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
+
+
+def test_compute_graph_snapshots_rejects_status_change_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph_snapshot = _graph_snapshot()
+    initial_status = _status_from_snapshot(graph_snapshot)
+    changed_status = initial_status.model_copy(update={"checksum": "changed"})
+    status_reader = SequenceGraphStatusReader([initial_status, changed_status])
+    writer = RecordingSnapshotWriter()
+
+    monkeypatch.setattr(
+        snapshot_generator,
+        "build_graph_snapshot",
+        lambda *args, **kwargs: graph_snapshot,
+    )
+    monkeypatch.setattr(
+        snapshot_generator,
+        "run_fundamental_propagation",
+        lambda *args, **kwargs: _propagation_result(),
+    )
+
+    with pytest.raises(ValueError, match="Neo4jGraphStatus changed"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=MagicMock(),
+            graph_generation_id=1,
+            regime_reader=StaticRegimeReader(),
+            snapshot_writer=writer,
+            graph_status_reader=status_reader,
+        )
+
+    assert status_reader.calls == 2
+    assert writer.calls == []
+
+
+def test_compute_graph_snapshots_rejects_non_ready_status_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph_snapshot = _graph_snapshot()
+    initial_status = _status_from_snapshot(graph_snapshot)
+    rebuilding_status = initial_status.model_copy(update={"graph_status": "rebuilding"})
+    status_reader = SequenceGraphStatusReader([initial_status, rebuilding_status])
+    writer = RecordingSnapshotWriter()
+
+    monkeypatch.setattr(
+        snapshot_generator,
+        "build_graph_snapshot",
+        lambda *args, **kwargs: graph_snapshot,
+    )
+    monkeypatch.setattr(
+        snapshot_generator,
+        "run_fundamental_propagation",
+        lambda *args, **kwargs: _propagation_result(),
+    )
+
+    with pytest.raises(PermissionError, match="ready"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=MagicMock(),
+            graph_generation_id=1,
+            regime_reader=StaticRegimeReader(),
+            snapshot_writer=writer,
+            graph_status_reader=status_reader,
+        )
+
+    assert status_reader.calls == 2
+    assert writer.calls == []
+
+
+def test_compute_graph_snapshots_rejects_live_graph_change_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeSnapshotClient(
+        nodes=[
+            {
+                "labels": ["Entity"],
+                "node_id": "node-a",
+                "canonical_entity_id": "entity-a",
+                "properties": {"node_id": "node-a"},
+            }
+        ],
+        relationships=[],
+    )
+    initial_snapshot = build_graph_snapshot("cycle-1", 1, client)  # type: ignore[arg-type]
+    client.read_calls.clear()
+    status_reader = RecordingGraphStatusReader(_status_from_snapshot(initial_snapshot))
+    writer = RecordingSnapshotWriter()
+
+    def run_propagation(*args: Any, **kwargs: Any) -> PropagationResult:
+        client.nodes[0] = {
+            **client.nodes[0],
+            "properties": {"node_id": "node-a", "ticker": "changed"},
+        }
+        return _propagation_result()
+
+    monkeypatch.setattr(snapshot_generator, "run_fundamental_propagation", run_propagation)
+
+    with pytest.raises(ValueError, match="live graph snapshot disagrees"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=client,  # type: ignore[arg-type]
+            graph_generation_id=1,
+            regime_reader=StaticRegimeReader(),
+            snapshot_writer=writer,
+            graph_status_reader=status_reader,
+        )
+
+    assert status_reader.calls == 2
+    assert len(client.read_calls) == 2
+    assert writer.calls == []
 
 
 def test_compute_graph_snapshots_writes_once_after_both_snapshots(
@@ -339,6 +517,7 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
     events: list[str] = []
     graph_snapshot = _graph_snapshot()
     impact_snapshot = _impact_snapshot()
+    status_reader = RecordingGraphStatusReader(_status_from_snapshot(graph_snapshot))
 
     monkeypatch.setattr(
         snapshot_generator,
@@ -369,11 +548,12 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
         graph_generation_id=1,
         regime_reader=StaticRegimeReader(),
         snapshot_writer=writer,
-        graph_status=_status_from_snapshot(graph_snapshot),
+        graph_status_reader=status_reader,
     )
 
     assert result == (graph_snapshot, impact_snapshot)
-    assert events == ["graph", "context", "propagation", "impact", "write"]
+    assert events == ["graph", "context", "propagation", "impact", "graph", "write"]
+    assert status_reader.calls == 2
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
 
@@ -411,7 +591,9 @@ def test_compute_graph_snapshots_does_not_write_if_snapshot_build_fails(
             graph_generation_id=1,
             regime_reader=StaticRegimeReader(),
             snapshot_writer=writer,
-            graph_status=_status_from_snapshot(_graph_snapshot()),
+            graph_status_reader=RecordingGraphStatusReader(
+                _status_from_snapshot(_graph_snapshot()),
+            ),
         )
 
     assert writer.calls == []
@@ -445,7 +627,9 @@ def test_compute_graph_snapshots_surfaces_writer_errors(
             graph_generation_id=1,
             regime_reader=StaticRegimeReader(),
             snapshot_writer=RaisingSnapshotWriter(),
-            graph_status=_status_from_snapshot(_graph_snapshot()),
+            graph_status_reader=RecordingGraphStatusReader(
+                _status_from_snapshot(_graph_snapshot()),
+            ),
         )
 
 

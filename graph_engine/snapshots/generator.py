@@ -89,6 +89,11 @@ def compute_graph_snapshots(
 
     ready_status = _resolve_ready_graph_status(graph_status, graph_status_reader)
     _validate_requested_generation(graph_generation_id, ready_status)
+    if graph_status_reader is None:
+        raise ValueError(
+            "formal snapshot writes require graph_status_reader for "
+            "write-boundary status revalidation",
+        )
 
     graph_snapshot = build_graph_snapshot(
         cycle_id,
@@ -114,14 +119,27 @@ def compute_graph_snapshots(
         world_state_ref,
         propagation_result,
     )
-    snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
-    return graph_snapshot, impact_snapshot
+    write_status = _resolve_ready_graph_status(None, graph_status_reader)
+    _validate_status_unchanged(ready_status, write_status)
+    write_graph_snapshot = build_graph_snapshot(
+        cycle_id,
+        write_status.graph_generation_id,
+        client,
+    )
+    _validate_snapshot_matches_status(write_graph_snapshot, write_status)
+    _validate_snapshot_unchanged(graph_snapshot, write_graph_snapshot)
+
+    snapshot_writer.write_snapshots(write_graph_snapshot, impact_snapshot)
+    return write_graph_snapshot, impact_snapshot
 
 
 def _resolve_ready_graph_status(
     graph_status: Neo4jGraphStatus | None,
     graph_status_reader: GraphStatusReader | None,
 ) -> Neo4jGraphStatus:
+    if graph_status is not None and graph_status_reader is not None:
+        raise ValueError("pass either graph_status or graph_status_reader, not both")
+
     if graph_status is None:
         if graph_status_reader is None:
             raise ValueError(
@@ -136,6 +154,45 @@ def _resolve_ready_graph_status(
             f"received {graph_status.graph_status!r}",
         )
     return graph_status
+
+
+def _validate_status_unchanged(
+    initial_status: Neo4jGraphStatus,
+    write_status: Neo4jGraphStatus,
+) -> None:
+    mismatches: list[str] = []
+    if write_status.graph_generation_id != initial_status.graph_generation_id:
+        mismatches.append(
+            "graph_generation_id "
+            f"initial={initial_status.graph_generation_id} "
+            f"write={write_status.graph_generation_id}",
+        )
+    if write_status.node_count != initial_status.node_count:
+        mismatches.append(
+            f"node_count initial={initial_status.node_count} "
+            f"write={write_status.node_count}",
+        )
+    if write_status.edge_count != initial_status.edge_count:
+        mismatches.append(
+            f"edge_count initial={initial_status.edge_count} "
+            f"write={write_status.edge_count}",
+        )
+    if write_status.key_label_counts != initial_status.key_label_counts:
+        mismatches.append(
+            f"key_label_counts initial={initial_status.key_label_counts!r} "
+            f"write={write_status.key_label_counts!r}",
+        )
+    if write_status.checksum != initial_status.checksum:
+        mismatches.append(
+            f"checksum initial={initial_status.checksum!r} "
+            f"write={write_status.checksum!r}",
+        )
+
+    if mismatches:
+        raise ValueError(
+            "Neo4jGraphStatus changed before snapshot write: "
+            + "; ".join(mismatches),
+        )
 
 
 def _validate_requested_generation(
@@ -187,6 +244,45 @@ def _validate_snapshot_matches_status(
     if mismatches:
         raise ValueError(
             "live graph snapshot disagrees with Neo4jGraphStatus: "
+            + "; ".join(mismatches),
+        )
+
+
+def _validate_snapshot_unchanged(
+    initial_snapshot: GraphSnapshot,
+    write_snapshot: GraphSnapshot,
+) -> None:
+    mismatches: list[str] = []
+    if write_snapshot.graph_generation_id != initial_snapshot.graph_generation_id:
+        mismatches.append(
+            "graph_generation_id "
+            f"initial={initial_snapshot.graph_generation_id} "
+            f"write={write_snapshot.graph_generation_id}",
+        )
+    if write_snapshot.node_count != initial_snapshot.node_count:
+        mismatches.append(
+            f"node_count initial={initial_snapshot.node_count} "
+            f"write={write_snapshot.node_count}",
+        )
+    if write_snapshot.edge_count != initial_snapshot.edge_count:
+        mismatches.append(
+            f"edge_count initial={initial_snapshot.edge_count} "
+            f"write={write_snapshot.edge_count}",
+        )
+    if write_snapshot.key_label_counts != initial_snapshot.key_label_counts:
+        mismatches.append(
+            f"key_label_counts initial={initial_snapshot.key_label_counts!r} "
+            f"write={write_snapshot.key_label_counts!r}",
+        )
+    if write_snapshot.checksum != initial_snapshot.checksum:
+        mismatches.append(
+            f"checksum initial={initial_snapshot.checksum!r} "
+            f"write={write_snapshot.checksum!r}",
+        )
+
+    if mismatches:
+        raise ValueError(
+            "live graph changed before snapshot write: "
             + "; ".join(mismatches),
         )
 
