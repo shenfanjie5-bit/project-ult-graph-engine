@@ -69,6 +69,16 @@ class StaticRegimeReader:
         return {}
 
 
+class RecordingGraphStatusReader:
+    def __init__(self, graph_status: Neo4jGraphStatus) -> None:
+        self.graph_status = graph_status
+        self.calls = 0
+
+    def read_graph_status(self) -> Neo4jGraphStatus:
+        self.calls += 1
+        return self.graph_status
+
+
 class RecordingSnapshotWriter:
     def __init__(self, events: list[str] | None = None) -> None:
         self.events = events
@@ -154,6 +164,27 @@ def test_build_graph_impact_snapshot_preserves_propagation_payload() -> None:
     assert impact_snapshot.channel_breakdown == propagation_result.channel_breakdown
 
 
+def test_compute_graph_snapshots_requires_status_without_side_effects() -> None:
+    client = MagicMock()
+    reader = StaticRegimeReader()
+    writer = RecordingSnapshotWriter()
+
+    with pytest.raises(ValueError, match="Neo4jGraphStatus"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=client,
+            graph_generation_id=1,
+            regime_reader=reader,
+            snapshot_writer=writer,
+        )
+
+    assert reader.calls == []
+    assert writer.calls == []
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_not_called()
+
+
 def test_compute_graph_snapshots_rejects_non_ready_status_without_side_effects() -> None:
     client = MagicMock()
     reader = StaticRegimeReader()
@@ -184,6 +215,122 @@ def test_compute_graph_snapshots_rejects_non_ready_status_without_side_effects()
     assert writer.calls == []
     client.execute_read.assert_not_called()
     client.execute_write.assert_not_called()
+
+
+def test_compute_graph_snapshots_rejects_generation_mismatch_without_side_effects() -> None:
+    client = MagicMock()
+    reader = StaticRegimeReader()
+    writer = RecordingSnapshotWriter()
+    graph_status = _status_from_snapshot(_graph_snapshot())
+
+    with pytest.raises(ValueError, match="graph_generation_id disagrees"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=client,
+            graph_generation_id=2,
+            regime_reader=reader,
+            snapshot_writer=writer,
+            graph_status=graph_status,
+        )
+
+    assert reader.calls == []
+    assert writer.calls == []
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_not_called()
+
+
+def test_compute_graph_snapshots_rejects_status_metric_mismatch_before_propagation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeSnapshotClient(
+        nodes=[
+            {
+                "labels": ["Entity"],
+                "node_id": "node-a",
+                "canonical_entity_id": "entity-a",
+                "properties": {"node_id": "node-a"},
+            }
+        ],
+        relationships=[],
+    )
+    reader = StaticRegimeReader()
+    writer = RecordingSnapshotWriter()
+    graph_status = Neo4jGraphStatus(
+        graph_status="ready",
+        graph_generation_id=1,
+        node_count=2,
+        edge_count=0,
+        key_label_counts={"Entity": 2},
+        checksum="stale",
+        last_verified_at=NOW,
+        last_reload_at=None,
+    )
+    propagation = MagicMock()
+    monkeypatch.setattr(snapshot_generator, "run_fundamental_propagation", propagation)
+
+    with pytest.raises(ValueError, match="live graph snapshot disagrees"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=client,  # type: ignore[arg-type]
+            graph_generation_id=1,
+            regime_reader=reader,
+            snapshot_writer=writer,
+            graph_status=graph_status,
+        )
+
+    assert len(client.read_calls) == 1
+    assert reader.calls == []
+    assert writer.calls == []
+    propagation.assert_not_called()
+
+
+def test_compute_graph_snapshots_uses_status_reader_and_derives_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeSnapshotClient(
+        nodes=[
+            {
+                "labels": ["Entity"],
+                "node_id": "node-a",
+                "canonical_entity_id": "entity-a",
+                "properties": {"node_id": "node-a"},
+            }
+        ],
+        relationships=[],
+    )
+    expected_snapshot = build_graph_snapshot("cycle-1", 7, client)  # type: ignore[arg-type]
+    client.read_calls.clear()
+    status_reader = RecordingGraphStatusReader(_status_from_snapshot(expected_snapshot))
+    writer = RecordingSnapshotWriter()
+    seen_generations: list[int] = []
+
+    def run_propagation(
+        context: PropagationContext,
+        *args: Any,
+        **kwargs: Any,
+    ) -> PropagationResult:
+        seen_generations.append(context.graph_generation_id)
+        return _propagation_result(graph_generation_id=context.graph_generation_id)
+
+    monkeypatch.setattr(snapshot_generator, "run_fundamental_propagation", run_propagation)
+
+    graph_snapshot, impact_snapshot = compute_graph_snapshots(
+        "cycle-1",
+        "world-state-1",
+        client=client,  # type: ignore[arg-type]
+        regime_reader=StaticRegimeReader(),
+        snapshot_writer=writer,
+        graph_status_reader=status_reader,
+    )
+
+    assert status_reader.calls == 1
+    assert seen_generations == [7]
+    assert graph_snapshot.graph_generation_id == 7
+    assert graph_snapshot.checksum == expected_snapshot.checksum
+    assert impact_snapshot.regime_context_ref == "world-state-1"
+    assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
 
 def test_compute_graph_snapshots_writes_once_after_both_snapshots(
@@ -222,10 +369,11 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
         graph_generation_id=1,
         regime_reader=StaticRegimeReader(),
         snapshot_writer=writer,
+        graph_status=_status_from_snapshot(graph_snapshot),
     )
 
     assert result == (graph_snapshot, impact_snapshot)
-    assert events == ["context", "propagation", "graph", "impact", "write"]
+    assert events == ["graph", "context", "propagation", "impact", "write"]
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
 
@@ -263,6 +411,7 @@ def test_compute_graph_snapshots_does_not_write_if_snapshot_build_fails(
             graph_generation_id=1,
             regime_reader=StaticRegimeReader(),
             snapshot_writer=writer,
+            graph_status=_status_from_snapshot(_graph_snapshot()),
         )
 
     assert writer.calls == []
@@ -296,6 +445,7 @@ def test_compute_graph_snapshots_surfaces_writer_errors(
             graph_generation_id=1,
             regime_reader=StaticRegimeReader(),
             snapshot_writer=RaisingSnapshotWriter(),
+            graph_status=_status_from_snapshot(_graph_snapshot()),
         )
 
 
@@ -312,10 +462,10 @@ def _context() -> PropagationContext:
     )
 
 
-def _propagation_result() -> PropagationResult:
+def _propagation_result(graph_generation_id: int = 1) -> PropagationResult:
     return PropagationResult(
         cycle_id="cycle-1",
-        graph_generation_id=1,
+        graph_generation_id=graph_generation_id,
         activated_paths=[
             {
                 "source_node_id": "node-1",
@@ -349,4 +499,17 @@ def _impact_snapshot() -> GraphImpactSnapshot:
         activated_paths=[],
         impacted_entities=[],
         channel_breakdown={"fundamental": {}},
+    )
+
+
+def _status_from_snapshot(graph_snapshot: GraphSnapshot) -> Neo4jGraphStatus:
+    return Neo4jGraphStatus(
+        graph_status="ready",
+        graph_generation_id=graph_snapshot.graph_generation_id,
+        node_count=graph_snapshot.node_count,
+        edge_count=graph_snapshot.edge_count,
+        key_label_counts=graph_snapshot.key_label_counts,
+        checksum=graph_snapshot.checksum,
+        last_verified_at=NOW,
+        last_reload_at=None,
     )

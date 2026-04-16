@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol
 
 from graph_engine.client import Neo4jClient
 from graph_engine.models import (
@@ -18,6 +18,13 @@ from graph_engine.models import (
 from graph_engine.propagation.context import RegimeContextReader, build_propagation_context
 from graph_engine.propagation.fundamental import run_fundamental_propagation
 from graph_engine.snapshots.writer import SnapshotWriter
+
+
+class GraphStatusReader(Protocol):
+    """Read the current live graph status from the status store."""
+
+    def read_graph_status(self) -> Neo4jGraphStatus:
+        """Return the current Neo4j graph status."""
 
 
 def build_graph_snapshot(
@@ -71,27 +78,37 @@ def compute_graph_snapshots(
     world_state_ref: str,
     *,
     client: Neo4jClient,
-    graph_generation_id: int,
+    graph_generation_id: int | None = None,
     regime_reader: RegimeContextReader,
     snapshot_writer: SnapshotWriter,
     graph_status: Neo4jGraphStatus | None = None,
+    graph_status_reader: GraphStatusReader | None = None,
     graph_name: str | None = None,
 ) -> tuple[GraphSnapshot, GraphImpactSnapshot]:
     """Run fundamental propagation and write graph plus impact snapshots."""
 
+    ready_status = _resolve_ready_graph_status(graph_status, graph_status_reader)
+    _validate_requested_generation(graph_generation_id, ready_status)
+
+    graph_snapshot = build_graph_snapshot(
+        cycle_id,
+        ready_status.graph_generation_id,
+        client,
+    )
+    _validate_snapshot_matches_status(graph_snapshot, ready_status)
+
     context = build_propagation_context(
         cycle_id,
         world_state_ref,
-        graph_generation_id,
+        ready_status.graph_generation_id,
         regime_reader=regime_reader,
-        graph_status=graph_status,
+        graph_status=ready_status,
     )
     propagation_result = run_fundamental_propagation(
         context,
         client,
         graph_name=graph_name,
     )
-    graph_snapshot = build_graph_snapshot(cycle_id, graph_generation_id, client)
     impact_snapshot = build_graph_impact_snapshot(
         cycle_id,
         world_state_ref,
@@ -99,6 +116,79 @@ def compute_graph_snapshots(
     )
     snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
     return graph_snapshot, impact_snapshot
+
+
+def _resolve_ready_graph_status(
+    graph_status: Neo4jGraphStatus | None,
+    graph_status_reader: GraphStatusReader | None,
+) -> Neo4jGraphStatus:
+    if graph_status is None:
+        if graph_status_reader is None:
+            raise ValueError(
+                "formal snapshot computation requires Neo4jGraphStatus "
+                "or graph_status_reader",
+            )
+        graph_status = graph_status_reader.read_graph_status()
+
+    if graph_status.graph_status != "ready":
+        raise PermissionError(
+            "formal snapshot computation requires graph_status='ready'; "
+            f"received {graph_status.graph_status!r}",
+        )
+    return graph_status
+
+
+def _validate_requested_generation(
+    graph_generation_id: int | None,
+    graph_status: Neo4jGraphStatus,
+) -> None:
+    if graph_generation_id is None:
+        return
+    if graph_generation_id != graph_status.graph_generation_id:
+        raise ValueError(
+            "graph_generation_id disagrees with Neo4jGraphStatus: "
+            f"supplied={graph_generation_id} "
+            f"status={graph_status.graph_generation_id}",
+        )
+
+
+def _validate_snapshot_matches_status(
+    graph_snapshot: GraphSnapshot,
+    graph_status: Neo4jGraphStatus,
+) -> None:
+    mismatches: list[str] = []
+    if graph_snapshot.graph_generation_id != graph_status.graph_generation_id:
+        mismatches.append(
+            "graph_generation_id "
+            f"snapshot={graph_snapshot.graph_generation_id} "
+            f"status={graph_status.graph_generation_id}",
+        )
+    if graph_snapshot.node_count != graph_status.node_count:
+        mismatches.append(
+            f"node_count snapshot={graph_snapshot.node_count} "
+            f"status={graph_status.node_count}",
+        )
+    if graph_snapshot.edge_count != graph_status.edge_count:
+        mismatches.append(
+            f"edge_count snapshot={graph_snapshot.edge_count} "
+            f"status={graph_status.edge_count}",
+        )
+    if graph_snapshot.key_label_counts != graph_status.key_label_counts:
+        mismatches.append(
+            f"key_label_counts snapshot={graph_snapshot.key_label_counts!r} "
+            f"status={graph_status.key_label_counts!r}",
+        )
+    if graph_snapshot.checksum != graph_status.checksum:
+        mismatches.append(
+            f"checksum snapshot={graph_snapshot.checksum!r} "
+            f"status={graph_status.checksum!r}",
+        )
+
+    if mismatches:
+        raise ValueError(
+            "live graph snapshot disagrees with Neo4jGraphStatus: "
+            + "; ".join(mismatches),
+        )
 
 
 def _read_graph_metrics(client: Neo4jClient) -> tuple[int, int, dict[str, int], str]:
