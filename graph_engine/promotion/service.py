@@ -34,8 +34,7 @@ def promote_graph_deltas(
 
     canonical_writer.write_canonical_records(plan)
 
-    if sync_to_live_graph:
-        assert client is not None
+    if sync_to_live_graph and client is not None:
         sync_live_graph(plan, client)
 
     return plan

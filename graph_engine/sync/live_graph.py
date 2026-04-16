@@ -44,6 +44,11 @@ def sync_live_graph(
 
     _validate_dynamic_identifiers(promotion_batch)
     _sync_node_records(promotion_batch.node_records, client, batch_size)
+    _validate_referenced_nodes_exist(
+        _referenced_endpoint_node_ids(promotion_batch)
+        - {node_record.node_id for node_record in promotion_batch.node_records},
+        client,
+    )
     _sync_edge_records(promotion_batch.edge_records, client, batch_size)
     _sync_assertion_records(promotion_batch.assertion_records, client, batch_size)
 
@@ -86,6 +91,14 @@ def _sync_edge_records(
 
     for relationship_type, rows in rows_by_type.items():
         relationship_identifier = _quote_identifier(relationship_type.value)
+        stale_query = """
+UNWIND $rows AS row
+MATCH ()-[stale {edge_id: row.edge_id}]->()
+WHERE startNode(stale).node_id <> row.source_node_id
+   OR endNode(stale).node_id <> row.target_node_id
+   OR stale.relationship_type <> row.relationship_type
+DELETE stale
+"""
         query = f"""
 UNWIND $rows AS row
 MATCH (source {{node_id: row.source_node_id}})
@@ -97,8 +110,10 @@ SET r.relationship_type = row.relationship_type,
     r.created_at = row.created_at,
     r.updated_at = row.updated_at
 SET r += row.safe_properties
+RETURN count(r) AS synced_count
 """
         for batch in _batched(rows, batch_size):
+            client.execute_write(stale_query, {"rows": batch})
             client.execute_write(query, {"rows": batch})
 
 
@@ -131,6 +146,7 @@ MERGE (source)-[link:{assertion_link_type} {{
 SET link.assertion_id = row.assertion_id,
     link.role = "source",
     link.created_at = row.created_at
+RETURN count(assertion) AS synced_count
 """
     target_query = f"""
 UNWIND $rows AS row
@@ -143,6 +159,7 @@ MERGE (assertion)-[link:{assertion_link_type} {{
 SET link.assertion_id = row.assertion_id,
     link.role = "target",
     link.created_at = row.created_at
+RETURN count(link) AS synced_count
 """
 
     for batch in _batched(rows, batch_size):
@@ -151,6 +168,51 @@ SET link.assertion_id = row.assertion_id,
     target_rows = [row for row in rows if row["target_node_id"] is not None]
     for batch in _batched(target_rows, batch_size):
         client.execute_write(target_query, {"rows": batch})
+
+
+def _validate_referenced_nodes_exist(
+    node_ids: set[str],
+    client: Neo4jClient,
+) -> None:
+    if not node_ids:
+        return
+
+    rows = client.execute_read(
+        """
+UNWIND $node_ids AS node_id
+MATCH (n {node_id: node_id})
+RETURN collect(DISTINCT n.node_id) AS node_ids
+""",
+        {"node_ids": sorted(node_ids)},
+    )
+    existing_node_ids = _existing_node_ids(rows)
+    missing_node_ids = sorted(node_ids - existing_node_ids)
+    if missing_node_ids:
+        raise ValueError(
+            "live graph is missing endpoint nodes: "
+            + ", ".join(missing_node_ids),
+        )
+
+
+def _referenced_endpoint_node_ids(promotion_batch: PromotionPlan) -> set[str]:
+    node_ids: set[str] = set()
+    for edge_record in promotion_batch.edge_records:
+        node_ids.add(edge_record.source_node_id)
+        node_ids.add(edge_record.target_node_id)
+    for assertion_record in promotion_batch.assertion_records:
+        node_ids.add(assertion_record.source_node_id)
+        if assertion_record.target_node_id is not None:
+            node_ids.add(assertion_record.target_node_id)
+    return node_ids
+
+
+def _existing_node_ids(rows: list[dict[str, Any]]) -> set[str]:
+    if not rows:
+        return set()
+    raw_node_ids = rows[0].get("node_ids", ())
+    if not isinstance(raw_node_ids, list):
+        return set()
+    return {str(node_id) for node_id in raw_node_ids}
 
 
 def _node_row(node_record: GraphNodeRecord) -> dict[str, Any]:
