@@ -176,10 +176,29 @@ def _read_activated_paths(
     *,
     result_limit: int,
 ) -> list[dict[str, Any]]:
+    channel_multiplier = _context_multiplier(context.channel_multipliers)
+    regime_multiplier = _context_multiplier(context.regime_multipliers)
     rows = client.execute_read(
         """
 MATCH (source)-[relationship]->(target)
 WHERE type(relationship) IN $relationship_types
+WITH source,
+     relationship,
+     target,
+     coalesce(relationship.weight, 1.0) AS relation_weight,
+     coalesce(relationship.evidence_confidence, 1.0) AS evidence_confidence,
+     coalesce(relationship.recency_decay, 1.0) AS recency_decay
+WITH source,
+     relationship,
+     target,
+     relation_weight,
+     evidence_confidence,
+     recency_decay,
+     relation_weight
+         * evidence_confidence
+         * $channel_multiplier
+         * $regime_multiplier
+         * recency_decay AS path_score
 RETURN source.node_id AS source_node_id,
        source.canonical_entity_id AS source_entity_id,
        labels(source) AS source_labels,
@@ -188,20 +207,25 @@ RETURN source.node_id AS source_node_id,
        labels(target) AS target_labels,
        relationship.edge_id AS edge_id,
        type(relationship) AS relationship_type,
-       coalesce(relationship.weight, 1.0) AS relation_weight,
-       coalesce(relationship.evidence_confidence, 1.0) AS evidence_confidence,
-       coalesce(relationship.recency_decay, 1.0) AS recency_decay
-ORDER BY source_node_id ASC, relationship_type ASC, target_node_id ASC, edge_id ASC
+       relation_weight,
+       evidence_confidence,
+       recency_decay,
+       path_score
+ORDER BY path_score DESC,
+         source_node_id ASC,
+         relationship_type ASC,
+         target_node_id ASC,
+         edge_id ASC
 LIMIT $result_limit
 """,
         {
             "relationship_types": list(FUNDAMENTAL_RELATIONSHIP_TYPES),
             "result_limit": result_limit,
+            "channel_multiplier": channel_multiplier,
+            "regime_multiplier": regime_multiplier,
         },
     )
 
-    channel_multiplier = _context_multiplier(context.channel_multipliers)
-    regime_multiplier = _context_multiplier(context.regime_multipliers)
     activated_paths = [
         _activated_path(row, channel_multiplier, regime_multiplier)
         for row in rows

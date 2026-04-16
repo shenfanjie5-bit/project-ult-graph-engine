@@ -72,7 +72,27 @@ class FakeGDSClient:
             ]
         if "MATCH (source)-[relationship]->(target)" in query:
             if self.path_rows is not None:
-                return self.path_rows
+                rows = list(self.path_rows)
+                if "ORDER BY path_score DESC" in query:
+                    rows.sort(
+                        key=lambda row: (
+                            -_path_score(row, params),
+                            str(row["source_node_id"]),
+                            str(row["relationship_type"]),
+                            str(row["target_node_id"]),
+                            str(row["edge_id"]),
+                        ),
+                    )
+                else:
+                    rows.sort(
+                        key=lambda row: (
+                            str(row["source_node_id"]),
+                            str(row["relationship_type"]),
+                            str(row["target_node_id"]),
+                            str(row["edge_id"]),
+                        ),
+                    )
+                return rows[: int(params.get("result_limit", len(rows)))]
             return [
                 {
                     "source_node_id": "node-a",
@@ -293,6 +313,75 @@ def test_impacted_entities_use_five_factor_path_scores() -> None:
     assert result.impacted_entities[1]["score"] == pytest.approx(0.0)
 
 
+def test_activated_paths_limit_applies_after_five_factor_scoring() -> None:
+    client = FakeGDSClient(
+        path_rows=[
+            {
+                "source_node_id": "node-a",
+                "source_entity_id": "entity-a",
+                "source_labels": ["Entity"],
+                "target_node_id": "node-low-1",
+                "target_entity_id": "entity-low-1",
+                "target_labels": ["Entity"],
+                "edge_id": "edge-low-1",
+                "relationship_type": "OWNERSHIP",
+                "relation_weight": 0.1,
+                "evidence_confidence": 1.0,
+                "recency_decay": 1.0,
+            },
+            {
+                "source_node_id": "node-b",
+                "source_entity_id": "entity-b",
+                "source_labels": ["Entity"],
+                "target_node_id": "node-low-2",
+                "target_entity_id": "entity-low-2",
+                "target_labels": ["Entity"],
+                "edge_id": "edge-low-2",
+                "relationship_type": "OWNERSHIP",
+                "relation_weight": 0.2,
+                "evidence_confidence": 1.0,
+                "recency_decay": 1.0,
+            },
+            {
+                "source_node_id": "node-z",
+                "source_entity_id": "entity-z",
+                "source_labels": ["Entity"],
+                "target_node_id": "node-top",
+                "target_entity_id": "entity-top",
+                "target_labels": ["Entity"],
+                "edge_id": "edge-top",
+                "relationship_type": "SUPPLY_CHAIN",
+                "relation_weight": 99.0,
+                "evidence_confidence": 1.0,
+                "recency_decay": 1.0,
+            },
+        ],
+    )
+
+    result = run_fundamental_propagation(
+        _context(),
+        client,  # type: ignore[arg-type]
+        graph_name="unit-fundamental",
+        result_limit=2,
+    )
+
+    activated_edge_ids = [path["edge_id"] for path in result.activated_paths]
+    assert activated_edge_ids == ["edge-top", "edge-low-2"]
+    assert [entity["node_id"] for entity in result.impacted_entities] == [
+        "node-top",
+        "node-low-2",
+    ]
+
+    path_query, path_params = next(
+        (query, params)
+        for query, params in client.read_calls
+        if "MATCH (source)-[relationship]->(target)" in query
+    )
+    assert "ORDER BY path_score DESC" in path_query
+    assert path_params["channel_multiplier"] == pytest.approx(2.0)
+    assert path_params["regime_multiplier"] == pytest.approx(0.5)
+
+
 def test_run_fundamental_propagation_cleans_up_projection_on_exception() -> None:
     client = FakeGDSClient(exists_results=[False, True], fail_on_pagerank=True)
 
@@ -319,3 +408,19 @@ def _context() -> PropagationContext:
         decay_policy={},
         regime_context={},
     )
+
+
+def _path_score(row: dict[str, Any], params: dict[str, Any]) -> float:
+    return (
+        _float_or_default(row.get("relation_weight"))
+        * _float_or_default(row.get("evidence_confidence"))
+        * float(params.get("channel_multiplier", 1.0))
+        * float(params.get("regime_multiplier", 1.0))
+        * _float_or_default(row.get("recency_decay"))
+    )
+
+
+def _float_or_default(value: Any, default: float = 1.0) -> float:
+    if value is None:
+        return default
+    return float(value)
