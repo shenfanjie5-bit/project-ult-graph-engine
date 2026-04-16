@@ -14,6 +14,7 @@ from graph_engine.models import (
     GraphNodeRecord,
     GraphSnapshot,
     Neo4jGraphStatus,
+    PromotionPlan,
 )
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
@@ -103,6 +104,27 @@ def _model_payloads() -> list[tuple[type[BaseModel], dict[str, Any]]]:
                 "checksum": "abc123",
                 "last_verified_at": NOW,
                 "last_reload_at": None,
+            },
+        ),
+        (
+            PromotionPlan,
+            {
+                "cycle_id": "cycle-1",
+                "selection_ref": "selection-1",
+                "delta_ids": ["delta-1"],
+                "node_records": [
+                    {
+                        "node_id": "node-1",
+                        "canonical_entity_id": "entity-1",
+                        "label": "Entity",
+                        "properties": {"ticker": "ULT"},
+                        "created_at": NOW,
+                        "updated_at": NOW,
+                    }
+                ],
+                "edge_records": [],
+                "assertion_records": [],
+                "created_at": NOW,
             },
         ),
     ]

@@ -63,6 +63,20 @@ class CandidateGraphDelta(BaseModel):
     validation_status: Literal["validated", "rejected", "frozen"]
 
 
+class PromotionPlan(BaseModel):
+    """Runtime plan for promoting frozen graph deltas into the canonical graph."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    cycle_id: str = Field(min_length=1)
+    selection_ref: str = Field(min_length=1)
+    delta_ids: list[str]
+    node_records: list[GraphNodeRecord]
+    edge_records: list[GraphEdgeRecord]
+    assertion_records: list[GraphAssertionRecord]
+    created_at: datetime
+
+
 class GraphSnapshot(BaseModel):
     """Structural snapshot of the promoted graph for a cycle."""
 
