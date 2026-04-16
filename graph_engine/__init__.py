@@ -10,6 +10,7 @@ from graph_engine.models import (
     GraphNodeRecord,
     GraphSnapshot,
     Neo4jGraphStatus,
+    PromotionPlan,
 )
 from graph_engine.schema import (
     NodeLabel,
@@ -32,6 +33,7 @@ __all__ = [
     "Neo4jConfig",
     "Neo4jGraphStatus",
     "NodeLabel",
+    "PromotionPlan",
     "RelationshipType",
     "SchemaManager",
     "__version__",
