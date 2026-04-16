@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from uuid import uuid4
 
 from graph_engine.client import Neo4jClient
 from graph_engine.models import PropagationContext, PropagationResult
@@ -22,7 +24,7 @@ def run_fundamental_propagation(
     context: PropagationContext,
     client: Neo4jClient,
     *,
-    graph_name: str = "graph_engine_fundamental",
+    graph_name: str | None = None,
     max_iterations: int = 20,
     result_limit: int = 100,
 ) -> PropagationResult:
@@ -35,12 +37,13 @@ def run_fundamental_propagation(
     if result_limit < 1:
         raise ValueError("result_limit must be greater than zero")
 
-    _drop_projection_if_exists(client, graph_name)
+    projection_name = graph_name or _default_projection_name(context)
+    _drop_projection_if_exists(client, projection_name)
     try:
-        _create_projection(client, graph_name)
-        impacted_entities = _stream_pagerank(
+        _create_projection(client, projection_name)
+        pagerank_entities = _stream_pagerank(
             client,
-            graph_name,
+            projection_name,
             max_iterations=max_iterations,
             result_limit=result_limit,
         )
@@ -50,7 +53,15 @@ def run_fundamental_propagation(
             result_limit=result_limit,
         )
     finally:
-        _drop_projection_if_exists(client, graph_name)
+        _drop_projection_if_exists(client, projection_name)
+
+    # Keep PageRank as the GDS topology pass, but rank persisted impacts by the
+    # documented five-factor path scores so the snapshot outputs stay coherent.
+    impacted_entities = _impacted_entities_from_paths(
+        activated_paths,
+        pagerank_entities,
+        result_limit=result_limit,
+    )
 
     channel_breakdown: dict[str, Any] = {
         _FUNDAMENTAL_CHANNEL: {
@@ -83,6 +94,12 @@ def _drop_projection_if_exists(client: Neo4jClient, graph_name: str) -> None:
             "CALL gds.graph.drop($graph_name) YIELD graphName RETURN graphName",
             {"graph_name": graph_name},
         )
+
+
+def _default_projection_name(context: PropagationContext) -> str:
+    cycle_component = re.sub(r"[^A-Za-z0-9_]", "_", context.cycle_id).strip("_")
+    cycle_component = (cycle_component or "cycle")[:64]
+    return f"graph_engine_fundamental_{cycle_component}_{uuid4().hex[:8]}"
 
 
 def _create_projection(client: Neo4jClient, graph_name: str) -> None:
@@ -242,6 +259,53 @@ def _impacted_entity(row: dict[str, Any]) -> dict[str, Any]:
         "score": _float_value(row.get("score"), default=0.0),
         "stable_node_id": stable_node_id,
     }
+
+
+def _impacted_entities_from_paths(
+    activated_paths: list[dict[str, Any]],
+    pagerank_entities: list[dict[str, Any]],
+    *,
+    result_limit: int,
+) -> list[dict[str, Any]]:
+    pagerank_by_node_id = {
+        str(entity.get("node_id")): _float_value(entity.get("score"), default=0.0)
+        for entity in pagerank_entities
+        if entity.get("node_id") is not None
+    }
+    impacted_by_node_id: dict[str, dict[str, Any]] = {}
+    for path in activated_paths:
+        target_node_id = path.get("target_node_id")
+        if target_node_id is None:
+            continue
+
+        node_id = str(target_node_id)
+        impact = impacted_by_node_id.setdefault(
+            node_id,
+            {
+                "channel": _FUNDAMENTAL_CHANNEL,
+                "node_id": target_node_id,
+                "canonical_entity_id": path.get("target_entity_id"),
+                "labels": _string_list(path.get("target_labels")),
+                "score": 0.0,
+                "stable_node_id": node_id,
+                "pagerank_score": pagerank_by_node_id.get(node_id, 0.0),
+                "path_count": 0,
+            },
+        )
+        impact["score"] = float(impact["score"]) + _float_value(
+            path.get("score"),
+            default=0.0,
+        )
+        impact["path_count"] = int(impact["path_count"]) + 1
+
+    impacted_entities = list(impacted_by_node_id.values())
+    impacted_entities.sort(
+        key=lambda entity: (
+            -float(entity["score"]),
+            str(entity["stable_node_id"]),
+        ),
+    )
+    return impacted_entities[:result_limit]
 
 
 def _context_multiplier(multipliers: dict[str, float]) -> float:

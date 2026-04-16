@@ -33,9 +33,11 @@ class FakeGDSClient:
         *,
         exists_results: list[bool] | None = None,
         fail_on_pagerank: bool = False,
+        path_rows: list[dict[str, Any]] | None = None,
     ) -> None:
         self.exists_results = exists_results or [False, True]
         self.fail_on_pagerank = fail_on_pagerank
+        self.path_rows = path_rows
         self.read_calls: list[tuple[str, dict[str, Any]]] = []
         self.write_calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -69,6 +71,8 @@ class FakeGDSClient:
                 },
             ]
         if "MATCH (source)-[relationship]->(target)" in query:
+            if self.path_rows is not None:
+                return self.path_rows
             return [
                 {
                     "source_node_id": "node-a",
@@ -199,9 +203,14 @@ def test_run_fundamental_propagation_uses_gds_projection_and_explains_paths() ->
     assert pagerank_call[1]["result_limit"] == 10
 
     assert [entity["node_id"] for entity in result.impacted_entities] == [
-        "node-a",
         "node-b",
+        "node-c",
     ]
+    assert [entity["score"] for entity in result.impacted_entities] == [
+        pytest.approx(0.5),
+        pytest.approx(0.2),
+    ]
+    assert result.impacted_entities[0]["pagerank_score"] == pytest.approx(0.2)
     assert result.activated_paths[0]["edge_id"] == "edge-1"
     assert result.activated_paths[0]["score"] == pytest.approx(0.5)
     assert result.activated_paths[0]["explanation"] == {
@@ -213,6 +222,75 @@ def test_run_fundamental_propagation_uses_gds_projection_and_explains_paths() ->
         "score": 0.5,
     }
     assert result.channel_breakdown["fundamental"]["path_count"] == 2
+
+
+def test_run_fundamental_propagation_generates_unique_default_projection_names() -> None:
+    first_client = FakeGDSClient()
+    second_client = FakeGDSClient()
+
+    run_fundamental_propagation(_context(), first_client)  # type: ignore[arg-type]
+    run_fundamental_propagation(_context(), second_client)  # type: ignore[arg-type]
+
+    first_project = next(
+        params["graph_name"]
+        for query, params in first_client.write_calls
+        if "gds.graph.project" in query
+    )
+    second_project = next(
+        params["graph_name"]
+        for query, params in second_client.write_calls
+        if "gds.graph.project" in query
+    )
+
+    assert first_project.startswith("graph_engine_fundamental_cycle_1_")
+    assert second_project.startswith("graph_engine_fundamental_cycle_1_")
+    assert first_project != second_project
+
+
+def test_impacted_entities_use_five_factor_path_scores() -> None:
+    client = FakeGDSClient(
+        path_rows=[
+            {
+                "source_node_id": "node-a",
+                "source_entity_id": "entity-a",
+                "source_labels": ["Entity"],
+                "target_node_id": "node-zero",
+                "target_entity_id": "entity-zero",
+                "target_labels": ["Entity"],
+                "edge_id": "edge-zero",
+                "relationship_type": "SUPPLY_CHAIN",
+                "relation_weight": 100.0,
+                "evidence_confidence": 0.0,
+                "recency_decay": 1.0,
+            },
+            {
+                "source_node_id": "node-a",
+                "source_entity_id": "entity-a",
+                "source_labels": ["Entity"],
+                "target_node_id": "node-small",
+                "target_entity_id": "entity-small",
+                "target_labels": ["Entity"],
+                "edge_id": "edge-small",
+                "relationship_type": "SUPPLY_CHAIN",
+                "relation_weight": 0.1,
+                "evidence_confidence": 1.0,
+                "recency_decay": 1.0,
+            },
+        ],
+    )
+
+    result = run_fundamental_propagation(
+        _context(),
+        client,  # type: ignore[arg-type]
+        graph_name="unit-fundamental",
+    )
+
+    assert [entity["node_id"] for entity in result.impacted_entities] == [
+        "node-small",
+        "node-zero",
+    ]
+    assert result.impacted_entities[0]["score"] == pytest.approx(0.1)
+    assert result.impacted_entities[1]["score"] == pytest.approx(0.0)
 
 
 def test_run_fundamental_propagation_cleans_up_projection_on_exception() -> None:

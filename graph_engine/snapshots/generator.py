@@ -27,9 +27,7 @@ def build_graph_snapshot(
 ) -> GraphSnapshot:
     """Read live graph metrics and return a deterministic structural snapshot."""
 
-    node_count, edge_count = _read_graph_counts(client)
-    key_label_counts = _read_key_label_counts(client)
-    checksum = _read_graph_checksum(client, node_count, edge_count)
+    node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
     return GraphSnapshot(
         cycle_id=cycle_id,
         snapshot_id=f"graph-snapshot-{cycle_id}-{graph_generation_id}-{checksum[:12]}",
@@ -77,7 +75,7 @@ def compute_graph_snapshots(
     regime_reader: RegimeContextReader,
     snapshot_writer: SnapshotWriter,
     graph_status: Neo4jGraphStatus | None = None,
-    graph_name: str = "graph_engine_fundamental",
+    graph_name: str | None = None,
 ) -> tuple[GraphSnapshot, GraphImpactSnapshot]:
     """Run fundamental propagation and write graph plus impact snapshots."""
 
@@ -103,87 +101,85 @@ def compute_graph_snapshots(
     return graph_snapshot, impact_snapshot
 
 
-def _read_graph_counts(client: Neo4jClient) -> tuple[int, int]:
+def _read_graph_metrics(client: Neo4jClient) -> tuple[int, int, dict[str, int], str]:
     rows = client.execute_read(
         """
-MATCH (node)
-WITH count(node) AS node_count
-OPTIONAL MATCH ()-[relationship]->()
-RETURN node_count, count(relationship) AS edge_count
+CALL {
+    MATCH (node)
+    WITH node
+    ORDER BY coalesce(node.node_id, elementId(node)) ASC
+    RETURN count(node) AS node_count,
+           collect({
+               labels: labels(node),
+               node_id: node.node_id,
+               canonical_entity_id: node.canonical_entity_id,
+               properties: properties(node)
+           }) AS nodes
+}
+CALL {
+    MATCH (node)
+    UNWIND labels(node) AS label
+    WITH label, count(*) AS count
+    ORDER BY label ASC
+    RETURN collect({label: label, count: count}) AS label_counts
+}
+CALL {
+    MATCH (source)-[relationship]->(target)
+    WITH source, relationship, target
+    ORDER BY coalesce(relationship.edge_id, elementId(relationship)) ASC
+    RETURN count(relationship) AS edge_count,
+           collect({
+               source_node_id: source.node_id,
+               target_node_id: target.node_id,
+               relationship_type: type(relationship),
+               edge_id: relationship.edge_id,
+               properties: properties(relationship)
+           }) AS relationships
+}
+RETURN node_count, edge_count, label_counts, nodes, relationships
 """,
     )
     if not rows:
-        return 0, 0
-    row = rows[0]
-    return int(row.get("node_count", 0)), int(row.get("edge_count", 0))
+        node_count = 0
+        edge_count = 0
+        key_label_counts: dict[str, int] = {}
+        nodes: list[Any] = []
+        relationships: list[Any] = []
+    else:
+        row = rows[0]
+        node_count = int(row.get("node_count", 0))
+        edge_count = int(row.get("edge_count", 0))
+        key_label_counts = _label_counts(row.get("label_counts"))
+        nodes = _list_value(row.get("nodes"))
+        relationships = _list_value(row.get("relationships"))
 
-
-def _read_key_label_counts(client: Neo4jClient) -> dict[str, int]:
-    rows = client.execute_read(
-        """
-MATCH (node)
-UNWIND labels(node) AS label
-RETURN label, count(*) AS count
-ORDER BY label ASC
-""",
-    )
-    return {
-        str(row["label"]): int(row["count"])
-        for row in rows
-        if row.get("label") is not None
-    }
-
-
-def _read_graph_checksum(
-    client: Neo4jClient,
-    node_count: int,
-    edge_count: int,
-) -> str:
-    node_rows = client.execute_read(
-        """
-MATCH (node)
-WITH node
-ORDER BY coalesce(node.node_id, elementId(node)) ASC
-RETURN collect({
-    labels: labels(node),
-    node_id: node.node_id,
-    canonical_entity_id: node.canonical_entity_id,
-    properties: properties(node)
-}) AS nodes
-""",
-    )
-    relationship_rows = client.execute_read(
-        """
-MATCH (source)-[relationship]->(target)
-WITH source, relationship, target
-ORDER BY coalesce(relationship.edge_id, elementId(relationship)) ASC
-RETURN collect({
-    source_node_id: source.node_id,
-    target_node_id: target.node_id,
-    relationship_type: type(relationship),
-    edge_id: relationship.edge_id,
-    properties: properties(relationship)
-}) AS relationships
-""",
-    )
     payload = {
         "node_count": node_count,
         "edge_count": edge_count,
-        "nodes": _sorted_payload_list(_first_list(node_rows, "nodes")),
-        "relationships": _sorted_payload_list(
-            _first_list(relationship_rows, "relationships"),
-        ),
+        "nodes": _sorted_payload_list(nodes),
+        "relationships": _sorted_payload_list(relationships),
     }
-    return _checksum_payload(payload)
+    return node_count, edge_count, key_label_counts, _checksum_payload(payload)
 
 
-def _first_list(rows: list[dict[str, Any]], key: str) -> list[Any]:
-    if not rows:
-        return []
-    value = rows[0].get(key)
+def _list_value(value: Any) -> list[Any]:
     if not isinstance(value, list):
         return []
     return value
+
+
+def _label_counts(value: Any) -> dict[str, int]:
+    if not isinstance(value, list):
+        return {}
+    counts: dict[str, int] = {}
+    for row in value:
+        if not isinstance(row, Mapping):
+            continue
+        label = row.get("label")
+        if label is None:
+            continue
+        counts[str(label)] = int(row.get("count", 0))
+    return counts
 
 
 def _sorted_payload_list(values: list[Any]) -> list[Any]:

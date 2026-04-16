@@ -40,26 +40,23 @@ class FakeSnapshotClient:
         parameters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         self.read_calls.append(query)
-        if "RETURN node_count, count(relationship) AS edge_count" in query:
-            return [
-                {
-                    "node_count": len(self.nodes),
-                    "edge_count": len(self.relationships),
-                }
-            ]
-        if "UNWIND labels(node) AS label" in query:
+        if "RETURN node_count, edge_count, label_counts, nodes, relationships" in query:
             counts: dict[str, int] = {}
             for node in self.nodes:
                 for label in node["labels"]:
                     counts[label] = counts.get(label, 0) + 1
             return [
-                {"label": label, "count": count}
-                for label, count in sorted(counts.items())
+                {
+                    "node_count": len(self.nodes),
+                    "edge_count": len(self.relationships),
+                    "label_counts": [
+                        {"label": label, "count": count}
+                        for label, count in sorted(counts.items())
+                    ],
+                    "nodes": list(self.nodes),
+                    "relationships": list(self.relationships),
+                }
             ]
-        if "AS nodes" in query:
-            return [{"nodes": list(self.nodes)}]
-        if "AS relationships" in query:
-            return [{"relationships": list(self.relationships)}]
         return []
 
 
@@ -131,6 +128,7 @@ def test_build_graph_snapshot_reads_metrics_and_stable_checksum() -> None:
     assert first.key_label_counts == {"Entity": 2, "Sector": 1}
     assert first.checksum == second.checksum
     assert first.snapshot_id == second.snapshot_id
+    assert len(client.read_calls) == 2
 
     client.relationships[0] = {
         **client.relationships[0],
@@ -138,6 +136,7 @@ def test_build_graph_snapshot_reads_metrics_and_stable_checksum() -> None:
     }
     changed = build_graph_snapshot("cycle-1", 3, client)  # type: ignore[arg-type]
     assert changed.checksum != first.checksum
+    assert len(client.read_calls) == 3
 
 
 def test_build_graph_impact_snapshot_preserves_propagation_payload() -> None:
