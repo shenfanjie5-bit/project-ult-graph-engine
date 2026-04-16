@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "project-ult-graph-engine"
+version = "0.1.0"
+description = "Scaffold workspace for graph-engine."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools]
+packages = []
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
