@@ -14,6 +14,8 @@ from graph_engine.models import (
     GraphNodeRecord,
     GraphSnapshot,
     Neo4jGraphStatus,
+    PropagationContext,
+    PropagationResult,
     PromotionPlan,
 )
 
@@ -80,6 +82,29 @@ def _model_payloads() -> list[tuple[type[BaseModel], dict[str, Any]]]:
                 "key_label_counts": {"Entity": 10},
                 "checksum": "abc123",
                 "created_at": NOW,
+            },
+        ),
+        (
+            PropagationContext,
+            {
+                "cycle_id": "cycle-1",
+                "world_state_ref": "world-state-1",
+                "graph_generation_id": 1,
+                "enabled_channels": ["fundamental"],
+                "channel_multipliers": {"fundamental": 1.0},
+                "regime_multipliers": {"fundamental": 1.0},
+                "decay_policy": {"default": 1.0},
+                "regime_context": {"risk_regime": "baseline"},
+            },
+        ),
+        (
+            PropagationResult,
+            {
+                "cycle_id": "cycle-1",
+                "graph_generation_id": 1,
+                "activated_paths": [{"path": ["node-1", "node-2"]}],
+                "impacted_entities": [{"entity_id": "entity-2", "score": 0.5}],
+                "channel_breakdown": {"fundamental": {"score": 0.5}},
             },
         ),
         (
@@ -201,6 +226,20 @@ def test_graph_snapshot_rejects_negative_counts() -> None:
             key_label_counts={},
             checksum="abc123",
             created_at=NOW,
+        )
+
+
+def test_propagation_context_requires_fundamental_channel() -> None:
+    with pytest.raises(ValidationError):
+        PropagationContext(
+            cycle_id="cycle-1",
+            world_state_ref="world-state-1",
+            graph_generation_id=1,
+            enabled_channels=[],
+            channel_multipliers={"fundamental": 1.0},
+            regime_multipliers={"fundamental": 1.0},
+            decay_policy={},
+            regime_context={},
         )
 
 
