@@ -52,6 +52,20 @@ class CapturingSnapshotWriter:
         self.calls.append((graph_snapshot, impact_snapshot))
 
 
+class StaticGraphStatusReader:
+    def __init__(self, graph_status: Neo4jGraphStatus) -> None:
+        self.graph_status = graph_status
+
+    def read_graph_status(self) -> Neo4jGraphStatus:
+        return self.graph_status
+
+    def validate_ready_status_for_snapshot_publication(
+        self,
+        expected_status: Neo4jGraphStatus,
+    ) -> bool:
+        return self.graph_status == expected_status
+
+
 def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -> None:
     pytest.importorskip("neo4j")
 
@@ -91,7 +105,7 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
                     client=client,
                     regime_reader=StaticRegimeReader(),
                     snapshot_writer=writer,
-                    graph_status=graph_status,
+                    graph_status_reader=StaticGraphStatusReader(graph_status),
                     graph_name=f"{prefix}-projection",
                 )
             except RuntimeError as exc:

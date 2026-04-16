@@ -27,6 +27,13 @@ class GraphStatusReader(Protocol):
         """Return the current Neo4j live graph status."""
         ...
 
+    def validate_ready_status_for_snapshot_publication(
+        self,
+        expected_status: Neo4jGraphStatus,
+    ) -> bool:
+        """Atomically confirm the graph is still ready for snapshot publication."""
+        ...
+
 
 def build_graph_snapshot(
     cycle_id: str,
@@ -89,6 +96,7 @@ def compute_graph_snapshots(
     """Run fundamental propagation and write graph plus impact snapshots."""
 
     ready_status = _resolve_ready_graph_status(graph_status, graph_status_reader)
+    _require_publication_status_reader(graph_status_reader)
     _validate_generation_input(graph_generation_id, ready_status)
 
     graph_snapshot = build_graph_snapshot(
@@ -115,6 +123,10 @@ def compute_graph_snapshots(
         world_state_ref,
         propagation_result,
     )
+    _validate_publication_status_matches_ready_status(
+        ready_status,
+        graph_status_reader,
+    )
     snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
     return graph_snapshot, impact_snapshot
 
@@ -123,6 +135,9 @@ def _resolve_ready_graph_status(
     graph_status: Neo4jGraphStatus | None,
     graph_status_reader: GraphStatusReader | None,
 ) -> Neo4jGraphStatus:
+    if graph_status is not None and graph_status_reader is not None:
+        raise ValueError("pass either graph_status or graph_status_reader, not both")
+
     if graph_status is None:
         if graph_status_reader is None:
             raise ValueError(
@@ -138,6 +153,16 @@ def _resolve_ready_graph_status(
     return graph_status
 
 
+def _require_publication_status_reader(
+    graph_status_reader: GraphStatusReader | None,
+) -> None:
+    if graph_status_reader is None:
+        raise ValueError(
+            "formal snapshot publication requires graph_status_reader "
+            "for write-boundary validation",
+        )
+
+
 def _validate_generation_input(
     graph_generation_id: int | None,
     graph_status: Neo4jGraphStatus,
@@ -149,6 +174,24 @@ def _validate_generation_input(
             "graph_generation_id disagrees with ready graph status: "
             f"received {graph_generation_id}, "
             f"status has {graph_status.graph_generation_id}",
+        )
+
+
+def _validate_publication_status_matches_ready_status(
+    ready_status: Neo4jGraphStatus,
+    graph_status_reader: GraphStatusReader | None,
+) -> None:
+    if graph_status_reader is None:
+        raise ValueError(
+            "formal snapshot publication requires graph_status_reader "
+            "for write-boundary validation",
+        )
+
+    if not graph_status_reader.validate_ready_status_for_snapshot_publication(
+        ready_status,
+    ):
+        raise RuntimeError(
+            "ready graph status changed before snapshot publication",
         )
 
 
