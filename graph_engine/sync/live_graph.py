@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from typing import Any
 
 from graph_engine.client import Neo4jClient
@@ -43,131 +43,174 @@ def sync_live_graph(
         raise ValueError("batch_size must be greater than zero")
 
     _validate_dynamic_identifiers(promotion_batch)
-    _sync_node_records(promotion_batch.node_records, client, batch_size)
     _validate_referenced_nodes_exist(
         _referenced_endpoint_node_ids(promotion_batch)
         - {node_record.node_id for node_record in promotion_batch.node_records},
         client,
     )
-    _sync_edge_records(promotion_batch.edge_records, client, batch_size)
-    _sync_assertion_records(promotion_batch.assertion_records, client, batch_size)
+    query, parameters = _sync_query_and_parameters(promotion_batch, batch_size)
+    if query:
+        client.execute_write(query, parameters)
 
 
-def _sync_node_records(
-    node_records: Iterable[GraphNodeRecord],
-    client: Neo4jClient,
+def _sync_query_and_parameters(
+    promotion_batch: PromotionPlan,
     batch_size: int,
-) -> None:
+) -> tuple[str, dict[str, Any]]:
+    clauses: list[str] = []
+    parameters: dict[str, Any] = {}
+    clause_index = 0
+
     rows_by_label: dict[NodeLabel, list[dict[str, Any]]] = defaultdict(list)
-    for node_record in node_records:
+    for node_record in promotion_batch.node_records:
         label = _node_label(node_record.label)
         rows_by_label[label].append(_node_row(node_record))
 
     for label, rows in rows_by_label.items():
         label_identifier = _quote_identifier(label.value)
-        query = f"""
-UNWIND $rows AS row
-MERGE (n:{label_identifier} {{node_id: row.node_id}})
-SET n.canonical_entity_id = row.canonical_entity_id,
-    n.label = row.label,
-    n.properties = row.properties,
-    n.created_at = row.created_at,
-    n.updated_at = row.updated_at
-SET n += row.safe_properties
-"""
         for batch in _batched(rows, batch_size):
-            client.execute_write(query, {"rows": batch})
+            parameter_name = f"node_rows_{clause_index}"
+            result_name = f"synced_nodes_{clause_index}"
+            parameters[parameter_name] = batch
+            clauses.append(_node_sync_clause(label_identifier, parameter_name, result_name))
+            clause_index += 1
 
-
-def _sync_edge_records(
-    edge_records: Iterable[GraphEdgeRecord],
-    client: Neo4jClient,
-    batch_size: int,
-) -> None:
     rows_by_type: dict[RelationshipType, list[dict[str, Any]]] = defaultdict(list)
-    for edge_record in edge_records:
+    for edge_record in promotion_batch.edge_records:
         relationship_type = _relationship_type(edge_record.relationship_type)
         rows_by_type[relationship_type].append(_edge_row(edge_record))
 
     for relationship_type, rows in rows_by_type.items():
         relationship_identifier = _quote_identifier(relationship_type.value)
-        stale_query = """
-UNWIND $rows AS row
-MATCH ()-[stale {edge_id: row.edge_id}]->()
-WHERE startNode(stale).node_id <> row.source_node_id
-   OR endNode(stale).node_id <> row.target_node_id
-   OR stale.relationship_type <> row.relationship_type
-DELETE stale
-"""
-        query = f"""
-UNWIND $rows AS row
-MATCH (source {{node_id: row.source_node_id}})
-MATCH (target {{node_id: row.target_node_id}})
-MERGE (source)-[r:{relationship_identifier} {{edge_id: row.edge_id}}]->(target)
-SET r.relationship_type = row.relationship_type,
-    r.weight = row.weight,
-    r.properties = row.properties,
-    r.created_at = row.created_at,
-    r.updated_at = row.updated_at
-SET r += row.safe_properties
-RETURN count(r) AS synced_count
-"""
         for batch in _batched(rows, batch_size):
-            client.execute_write(stale_query, {"rows": batch})
-            client.execute_write(query, {"rows": batch})
+            parameter_name = f"edge_rows_{clause_index}"
+            result_name = f"synced_edges_{clause_index}"
+            parameters[parameter_name] = batch
+            clauses.append(_edge_sync_clause(relationship_identifier, parameter_name, result_name))
+            clause_index += 1
+
+    assertion_rows = [
+        _assertion_row(assertion_record)
+        for assertion_record in promotion_batch.assertion_records
+    ]
+    for batch in _batched(assertion_rows, batch_size):
+        parameter_name = f"assertion_source_rows_{clause_index}"
+        result_name = f"synced_assertions_{clause_index}"
+        parameters[parameter_name] = batch
+        clauses.append(_assertion_source_sync_clause(parameter_name, result_name))
+        clause_index += 1
+
+    assertion_target_rows = [
+        row for row in assertion_rows if row["target_node_id"] is not None
+    ]
+    for batch in _batched(assertion_target_rows, batch_size):
+        parameter_name = f"assertion_target_rows_{clause_index}"
+        result_name = f"synced_assertion_targets_{clause_index}"
+        parameters[parameter_name] = batch
+        clauses.append(_assertion_target_sync_clause(parameter_name, result_name))
+        clause_index += 1
+
+    if not clauses:
+        return "", {}
+    return "\n".join(clauses) + "\nRETURN 1 AS synced_count\n", parameters
 
 
-def _sync_assertion_records(
-    assertion_records: Iterable[GraphAssertionRecord],
-    client: Neo4jClient,
-    batch_size: int,
-) -> None:
-    rows = [_assertion_row(assertion_record) for assertion_record in assertion_records]
-    if not rows:
-        return
+def _node_sync_clause(
+    label_identifier: str,
+    parameter_name: str,
+    result_name: str,
+) -> str:
+    return f"""
+CALL {{
+    UNWIND ${parameter_name} AS row
+    MERGE (n:{label_identifier} {{node_id: row.node_id}})
+    SET n.canonical_entity_id = row.canonical_entity_id,
+        n.label = row.label,
+        n.properties = row.properties,
+        n.created_at = row.created_at,
+        n.updated_at = row.updated_at
+    SET n += row.safe_properties
+    RETURN count(n) AS {result_name}
+}}
+"""
 
+
+def _edge_sync_clause(
+    relationship_identifier: str,
+    parameter_name: str,
+    result_name: str,
+) -> str:
+    return f"""
+CALL {{
+    UNWIND ${parameter_name} AS row
+    CALL {{
+        WITH row
+        MATCH ()-[stale {{edge_id: row.edge_id}}]->()
+        WHERE startNode(stale).node_id <> row.source_node_id
+           OR endNode(stale).node_id <> row.target_node_id
+           OR stale.relationship_type <> row.relationship_type
+        DELETE stale
+        RETURN count(*) AS stale_deleted_count
+    }}
+    MATCH (source {{node_id: row.source_node_id}})
+    MATCH (target {{node_id: row.target_node_id}})
+    MERGE (source)-[r:{relationship_identifier} {{edge_id: row.edge_id}}]->(target)
+    SET r.relationship_type = row.relationship_type,
+        r.weight = row.weight,
+        r.properties = row.properties,
+        r.created_at = row.created_at,
+        r.updated_at = row.updated_at
+    SET r += row.safe_properties
+    RETURN count(r) AS {result_name}
+}}
+"""
+
+
+def _assertion_source_sync_clause(parameter_name: str, result_name: str) -> str:
     assertion_label = _quote_identifier(NodeLabel.ASSERTION.value)
     assertion_link_type = _quote_identifier(RelationshipType.ASSERTION_LINK.value)
-    source_query = f"""
-UNWIND $rows AS row
-MATCH (source {{node_id: row.source_node_id}})
-MERGE (assertion:{assertion_label} {{node_id: row.assertion_id}})
-SET assertion.assertion_id = row.assertion_id,
-    assertion.assertion_type = row.assertion_type,
-    assertion.confidence = row.confidence,
-    assertion.evidence = row.evidence,
-    assertion.source_node_id = row.source_node_id,
-    assertion.target_node_id = row.target_node_id,
-    assertion.created_at = row.created_at
-MERGE (source)-[link:{assertion_link_type} {{
-    assertion_id: row.assertion_id,
-    role: "source"
-}}]->(assertion)
-SET link.assertion_id = row.assertion_id,
-    link.role = "source",
-    link.created_at = row.created_at
-RETURN count(assertion) AS synced_count
-"""
-    target_query = f"""
-UNWIND $rows AS row
-MATCH (assertion:{assertion_label} {{node_id: row.assertion_id}})
-MATCH (target {{node_id: row.target_node_id}})
-MERGE (assertion)-[link:{assertion_link_type} {{
-    assertion_id: row.assertion_id,
-    role: "target"
-}}]->(target)
-SET link.assertion_id = row.assertion_id,
-    link.role = "target",
-    link.created_at = row.created_at
-RETURN count(link) AS synced_count
+    return f"""
+CALL {{
+    UNWIND ${parameter_name} AS row
+    MATCH (source {{node_id: row.source_node_id}})
+    MERGE (assertion:{assertion_label} {{node_id: row.assertion_id}})
+    SET assertion.assertion_id = row.assertion_id,
+        assertion.assertion_type = row.assertion_type,
+        assertion.confidence = row.confidence,
+        assertion.evidence = row.evidence,
+        assertion.source_node_id = row.source_node_id,
+        assertion.target_node_id = row.target_node_id,
+        assertion.created_at = row.created_at
+    MERGE (source)-[link:{assertion_link_type} {{
+        assertion_id: row.assertion_id,
+        role: "source"
+    }}]->(assertion)
+    SET link.assertion_id = row.assertion_id,
+        link.role = "source",
+        link.created_at = row.created_at
+    RETURN count(assertion) AS {result_name}
+}}
 """
 
-    for batch in _batched(rows, batch_size):
-        client.execute_write(source_query, {"rows": batch})
 
-    target_rows = [row for row in rows if row["target_node_id"] is not None]
-    for batch in _batched(target_rows, batch_size):
-        client.execute_write(target_query, {"rows": batch})
+def _assertion_target_sync_clause(parameter_name: str, result_name: str) -> str:
+    assertion_label = _quote_identifier(NodeLabel.ASSERTION.value)
+    assertion_link_type = _quote_identifier(RelationshipType.ASSERTION_LINK.value)
+    return f"""
+CALL {{
+    UNWIND ${parameter_name} AS row
+    MATCH (assertion:{assertion_label} {{node_id: row.assertion_id}})
+    MATCH (target {{node_id: row.target_node_id}})
+    MERGE (assertion)-[link:{assertion_link_type} {{
+        assertion_id: row.assertion_id,
+        role: "target"
+    }}]->(target)
+    SET link.assertion_id = row.assertion_id,
+        link.role = "target",
+        link.created_at = row.created_at
+    RETURN count(link) AS {result_name}
+}}
+"""
 
 
 def _validate_referenced_nodes_exist(
