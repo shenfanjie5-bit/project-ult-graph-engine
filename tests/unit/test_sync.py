@@ -27,15 +27,18 @@ def test_sync_live_graph_uses_idempotent_merge_queries() -> None:
     sync_live_graph(plan, client)
 
     queries = [call.args[0] for call in client.execute_write.call_args_list]
-    assert len(queries) == 5
+    assert len(queries) == 1
     assert any("MERGE" in query for query in queries)
     assert any("MERGE (n:`Entity` {node_id: row.node_id})" in query for query in queries)
     assert any(
         "MERGE (source)-[r:`SUPPLY_CHAIN` {edge_id: row.edge_id}]->(target)" in query
         for query in queries
     )
-    assert any("MERGE (assertion:`Assertion` {node_id: row.assertion_id})" in query for query in queries)
-    assert sum("`ASSERTION_LINK`" in query for query in queries) == 2
+    assert any(
+        "MERGE (assertion:`Assertion` {node_id: row.assertion_id})" in query
+        for query in queries
+    )
+    assert queries[0].count("`ASSERTION_LINK`") == 2
 
 
 def test_sync_live_graph_batches_rows_by_node_label() -> None:
@@ -49,8 +52,9 @@ def test_sync_live_graph_batches_rows_by_node_label() -> None:
 
     sync_live_graph(plan, client, batch_size=1)
 
-    assert client.execute_write.call_count == 2
-    row_batches = [call.args[1]["rows"] for call in client.execute_write.call_args_list]
+    assert client.execute_write.call_count == 1
+    parameters = client.execute_write.call_args.args[1]
+    row_batches = [parameters["node_rows_0"], parameters["node_rows_1"]]
     assert row_batches == [
         [_expected_node_row("node-1", "entity-1")],
         [_expected_node_row("node-2", "entity-2")],
@@ -59,7 +63,6 @@ def test_sync_live_graph_batches_rows_by_node_label() -> None:
 
 def test_sync_live_graph_batches_edges_by_relationship_type() -> None:
     client = MagicMock(spec=Neo4jClient)
-    client.execute_read.return_value = [{"node_ids": ["node-1", "node-2"]}]
     plan = _promotion_plan(
         edge_records=[
             _edge_record("edge-1", relationship_type=RelationshipType.SUPPLY_CHAIN.value),
@@ -70,36 +73,70 @@ def test_sync_live_graph_batches_edges_by_relationship_type() -> None:
     sync_live_graph(plan, client)
 
     queries = [call.args[0] for call in client.execute_write.call_args_list]
-    assert len(queries) == 4
+    assert len(queries) == 1
     assert any("[r:`SUPPLY_CHAIN`" in query for query in queries)
     assert any("[r:`OWNERSHIP`" in query for query in queries)
+    assert client.execute_write.call_args.args[1]["required_endpoint_node_ids"] == [
+        "node-1",
+        "node-2",
+    ]
+    client.execute_read.assert_not_called()
 
 
-def test_sync_live_graph_rejects_missing_edge_endpoints_before_writing() -> None:
+def test_sync_live_graph_rejects_missing_edge_endpoints_from_write_transaction() -> None:
     client = MagicMock(spec=Neo4jClient)
-    client.execute_read.return_value = [{"node_ids": ["node-2"]}]
+    client.execute_write.return_value = [
+        {"missing_endpoint_node_ids": ["node-1"], "mutation_applied": 0},
+    ]
     plan = _promotion_plan(edge_records=[_edge_record()])
 
     with pytest.raises(ValueError, match="node-1"):
         sync_live_graph(plan, client)
 
-    client.execute_write.assert_not_called()
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_called_once()
+    assert "MATCH (n {node_id: node_id})" in client.execute_write.call_args.args[0]
 
 
-def test_sync_live_graph_rejects_missing_assertion_endpoints_before_writing() -> None:
+def test_sync_live_graph_rejects_missing_external_endpoints_before_mutation_branch() -> None:
     client = MagicMock(spec=Neo4jClient)
-    client.execute_read.return_value = [{"node_ids": ["node-1"]}]
+    client.execute_write.return_value = [
+        {"missing_endpoint_node_ids": ["node-2"], "mutation_applied": 0},
+    ]
+    plan = _promotion_plan(
+        node_records=[_node_record("node-1", "entity-1")],
+        edge_records=[_edge_record()],
+    )
+
+    with pytest.raises(ValueError, match="node-2"):
+        sync_live_graph(plan, client)
+
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_called_once()
+    query = client.execute_write.call_args.args[0]
+    parameters = client.execute_write.call_args.args[1]
+    assert parameters["required_endpoint_node_ids"] == ["node-2"]
+    assert query.index("WHERE size(missing_endpoint_node_ids) = 0") < query.index(
+        "MERGE (n:`Entity`",
+    )
+
+
+def test_sync_live_graph_rejects_missing_assertion_endpoints_from_write_transaction() -> None:
+    client = MagicMock(spec=Neo4jClient)
+    client.execute_write.return_value = [
+        {"missing_endpoint_node_ids": ["node-2"], "mutation_applied": 0},
+    ]
     plan = _promotion_plan(assertion_records=[_assertion_record()])
 
     with pytest.raises(ValueError, match="node-2"):
         sync_live_graph(plan, client)
 
-    client.execute_write.assert_not_called()
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_called_once()
 
 
 def test_sync_live_graph_deletes_stale_edge_endpoint_before_merge() -> None:
     client = MagicMock(spec=Neo4jClient)
-    client.execute_read.return_value = [{"node_ids": ["node-1", "node-3"]}]
     plan = _promotion_plan(
         edge_records=[
             _edge_record("edge-1", target_node_id="node-3"),
@@ -109,10 +146,36 @@ def test_sync_live_graph_deletes_stale_edge_endpoint_before_merge() -> None:
     sync_live_graph(plan, client)
 
     queries = [call.args[0] for call in client.execute_write.call_args_list]
-    assert len(queries) == 2
+    assert len(queries) == 1
     assert "MATCH ()-[stale {edge_id: row.edge_id}]->()" in queries[0]
     assert "DELETE stale" in queries[0]
-    assert "MERGE (source)-[r:`SUPPLY_CHAIN` {edge_id: row.edge_id}]->(target)" in queries[1]
+    assert (
+        "MERGE (source)-[r:`SUPPLY_CHAIN` {edge_id: row.edge_id}]->(target)"
+        in queries[0]
+    )
+    assert queries[0].index("DELETE stale") < queries[0].index(
+        "MERGE (source)-[r:`SUPPLY_CHAIN`",
+    )
+    client.execute_read.assert_not_called()
+
+
+def test_sync_live_graph_does_not_split_stale_delete_and_replacement_writes() -> None:
+    client = MagicMock(spec=Neo4jClient)
+    client.execute_write.side_effect = RuntimeError("replacement failed")
+    plan = _promotion_plan(
+        edge_records=[
+            _edge_record("edge-1", target_node_id="node-3"),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="replacement failed"):
+        sync_live_graph(plan, client)
+
+    assert client.execute_write.call_count == 1
+    query = client.execute_write.call_args.args[0]
+    assert "DELETE stale" in query
+    assert "MERGE (source)-[r:`SUPPLY_CHAIN` {edge_id: row.edge_id}]->(target)" in query
+    client.execute_read.assert_not_called()
 
 
 def test_sync_live_graph_expands_only_safe_properties() -> None:
@@ -133,7 +196,7 @@ def test_sync_live_graph_expands_only_safe_properties() -> None:
 
     sync_live_graph(plan, client)
 
-    rows = client.execute_write.call_args.args[1]["rows"]
+    rows = client.execute_write.call_args.args[1]["node_rows_0"]
     assert rows[0]["properties"] == {
         "ticker": "ULT",
         "bad-key": "ignored",
