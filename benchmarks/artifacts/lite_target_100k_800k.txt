@@ -1,0 +1,16 @@
+Graph Engine GDS Benchmark Report
+
+Budgets:
+- propagation < 60.0s
+- consistency_check < 5.0s
+- cold_reload < 90.0s
+- cold_reload_hard < 300.0s
+
+Results:
+- PASS consistency_check: 0.412s, nodes=100000, edges=800000, memory=n/a, budget=consistency_check<5.0s
+- PASS gds_projection_create: 7.842s, nodes=100000, edges=800000, memory=n/a, budget=n/a
+- PASS pagerank: 23.518s, nodes=100000, edges=800000, memory=n/a, budget=propagation<60.0s
+- PASS path_traversal: 1.734s, nodes=100000, edges=800000, memory=n/a, budget=propagation<60.0s
+- PASS cold_reload: 74.903s, nodes=100000, edges=800000, memory=n/a, budget=cold_reload<90.0s (hard<300.0s)
+
+Overall: PASS

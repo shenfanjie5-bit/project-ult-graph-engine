@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from benchmarks.generate_synthetic import (
@@ -19,6 +22,18 @@ from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import SchemaManager
 
 _DEFAULT_GRAPH_NAME = "graph_engine_benchmark"
+_LITE_TARGET_NODE_COUNT = 100_000
+_LITE_TARGET_MIN_EDGE_COUNT = 500_000
+_LITE_TARGET_MAX_EDGE_COUNT = 1_000_000
+_REQUIRED_LITE_TARGET_OPERATIONS = frozenset(
+    {
+        "consistency_check",
+        "gds_projection_create",
+        "pagerank",
+        "path_traversal",
+        "cold_reload",
+    }
+)
 _CONNECTION_FAILURE_MARKERS = (
     "connection",
     "connect",
@@ -48,6 +63,131 @@ class BenchmarkResult:
     duration_seconds: float
     memory_mb: float | None
     passed: bool
+
+
+def write_benchmark_artifacts(
+    results: list[BenchmarkResult],
+    json_path: Path | str,
+    text_report_path: Path | str,
+    *,
+    target_nodes: int,
+    target_edge_factor: int,
+    command: str,
+) -> None:
+    """Persist machine-readable and human-readable benchmark run artifacts."""
+
+    from benchmarks.report import DEFAULT_BUDGETS, generate_text_report
+
+    record = build_benchmark_run_record(
+        results,
+        target_nodes=target_nodes,
+        target_edge_factor=target_edge_factor,
+        command=command,
+    )
+
+    json_output_path = Path(json_path)
+    text_output_path = Path(text_report_path)
+    json_output_path.parent.mkdir(parents=True, exist_ok=True)
+    text_output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_output_path.write_text(
+        json.dumps(record, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    text_output_path.write_text(
+        generate_text_report(results, DEFAULT_BUDGETS) + "\n",
+        encoding="utf-8",
+    )
+
+
+def build_benchmark_run_record(
+    results: list[BenchmarkResult],
+    *,
+    target_nodes: int,
+    target_edge_factor: int,
+    command: str,
+) -> dict[str, Any]:
+    """Build the committed JSON shape for a Lite target benchmark run."""
+
+    from benchmarks.report import DEFAULT_BUDGETS, check_budgets
+
+    target_edge_count = target_nodes * target_edge_factor
+    return {
+        "schema_version": 1,
+        "suite": "graph_engine_lite_target_budget",
+        "record_type": "target_scale_budget_validation",
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "command": command,
+        "validation_command": (
+            "python -m benchmarks.run_benchmark "
+            "--validate-artifact benchmarks/artifacts/lite_target_100k_800k.json"
+        ),
+        "target": {
+            "node_count": target_nodes,
+            "edge_count": target_edge_count,
+            "edge_factor": target_edge_factor,
+        },
+        "budget_seconds": DEFAULT_BUDGETS,
+        "results": [_benchmark_result_to_dict(result) for result in results],
+        "overall_passed": check_budgets(results, DEFAULT_BUDGETS),
+    }
+
+
+def load_benchmark_run_record(path: Path | str) -> dict[str, Any]:
+    """Load a machine-readable benchmark run record from disk."""
+
+    loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError("benchmark run record must be a JSON object")
+    return loaded
+
+
+def validate_benchmark_artifact(path: Path | str) -> bool:
+    """Return whether a committed Lite target artifact satisfies the budget gate."""
+
+    try:
+        record = load_benchmark_run_record(path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return validate_benchmark_run_record(record)
+
+
+def validate_benchmark_run_record(record: dict[str, Any]) -> bool:
+    """Validate a Lite target run record without opening a Neo4j connection."""
+
+    from benchmarks.report import DEFAULT_BUDGETS, check_budgets
+
+    if record.get("schema_version") != 1:
+        return False
+    if record.get("record_type") != "target_scale_budget_validation":
+        return False
+
+    target = record.get("target")
+    if not isinstance(target, dict):
+        return False
+
+    try:
+        target_node_count = _target_int(target, "node_count")
+        target_edge_count = _target_int(target, "edge_count")
+    except (TypeError, ValueError):
+        return False
+    if target_node_count != _LITE_TARGET_NODE_COUNT:
+        return False
+    if not _LITE_TARGET_MIN_EDGE_COUNT <= target_edge_count <= _LITE_TARGET_MAX_EDGE_COUNT:
+        return False
+
+    try:
+        results = _benchmark_results_from_record(record)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    operations = {result.operation for result in results}
+    if not _REQUIRED_LITE_TARGET_OPERATIONS.issubset(operations):
+        return False
+    if record.get("overall_passed") is not True:
+        return False
+    if not _recorded_counts_match_target(results, target_node_count, target_edge_count):
+        return False
+    return check_budgets(results, DEFAULT_BUDGETS)
 
 
 def benchmark_gds_projection_create(client: Neo4jClient, graph_name: str) -> BenchmarkResult:
@@ -260,9 +400,33 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-nodes", type=int, default=100_000)
     parser.add_argument("--target-edge-factor", type=int, default=8)
+    parser.add_argument(
+        "--record-json",
+        type=Path,
+        help="Write a machine-readable benchmark run record to this JSON path.",
+    )
+    parser.add_argument(
+        "--record-report",
+        type=Path,
+        help="Write the generated human-readable benchmark report to this text path.",
+    )
+    parser.add_argument(
+        "--validate-artifact",
+        type=Path,
+        help="Validate a committed Lite target JSON artifact without connecting to Neo4j.",
+    )
     args = parser.parse_args(argv)
 
+    if (args.record_json is None) != (args.record_report is None):
+        parser.error("--record-json and --record-report must be provided together")
+
     from benchmarks.report import DEFAULT_BUDGETS, check_budgets, generate_text_report
+
+    if args.validate_artifact is not None:
+        passed = validate_benchmark_artifact(args.validate_artifact)
+        status = "PASS" if passed else "FAIL"
+        print(f"Benchmark artifact budget gate: {status} ({args.validate_artifact})")
+        return 0 if passed else 1
 
     with Neo4jClient(load_config_from_env()) as client:
         results = run_full_benchmark_suite(
@@ -271,8 +435,87 @@ def main(argv: list[str] | None = None) -> int:
             target_edge_factor=args.target_edge_factor,
         )
 
-    print(generate_text_report(results, DEFAULT_BUDGETS))
+    report = generate_text_report(results, DEFAULT_BUDGETS)
+    if args.record_json is not None and args.record_report is not None:
+        write_benchmark_artifacts(
+            results,
+            args.record_json,
+            args.record_report,
+            target_nodes=args.target_nodes,
+            target_edge_factor=args.target_edge_factor,
+            command=_benchmark_command(args),
+        )
+
+    print(report)
     return 0 if check_budgets(results, DEFAULT_BUDGETS) else 1
+
+
+def _benchmark_command(args: argparse.Namespace) -> str:
+    parts = [
+        "python -m benchmarks.run_benchmark",
+        f"--target-nodes {args.target_nodes}",
+        f"--target-edge-factor {args.target_edge_factor}",
+    ]
+    if args.record_json is not None:
+        parts.append(f"--record-json {args.record_json}")
+    if args.record_report is not None:
+        parts.append(f"--record-report {args.record_report}")
+    return " ".join(parts)
+
+
+def _benchmark_result_to_dict(result: BenchmarkResult) -> dict[str, Any]:
+    return {
+        "operation": result.operation,
+        "node_count": result.node_count,
+        "edge_count": result.edge_count,
+        "duration_seconds": result.duration_seconds,
+        "memory_mb": result.memory_mb,
+        "passed": result.passed,
+    }
+
+
+def _benchmark_results_from_record(record: dict[str, Any]) -> list[BenchmarkResult]:
+    rows = record.get("results")
+    if not isinstance(rows, list):
+        raise ValueError("benchmark run record results must be a list")
+    return [_benchmark_result_from_dict(row) for row in rows]
+
+
+def _benchmark_result_from_dict(row: Any) -> BenchmarkResult:
+    if not isinstance(row, dict):
+        raise ValueError("benchmark result must be a JSON object")
+
+    passed = row.get("passed")
+    if not isinstance(passed, bool):
+        raise ValueError("benchmark result passed field must be a boolean")
+
+    memory_value = row.get("memory_mb")
+    memory_mb = None if memory_value is None else float(memory_value)
+    return BenchmarkResult(
+        operation=str(row["operation"]),
+        node_count=int(row["node_count"]),
+        edge_count=int(row["edge_count"]),
+        duration_seconds=float(row["duration_seconds"]),
+        memory_mb=memory_mb,
+        passed=passed,
+    )
+
+
+def _recorded_counts_match_target(
+    results: list[BenchmarkResult],
+    target_node_count: int,
+    target_edge_count: int,
+) -> bool:
+    return all(
+        result.node_count == target_node_count and result.edge_count == target_edge_count
+        for result in results
+        if result.operation in _REQUIRED_LITE_TARGET_OPERATIONS
+    )
+
+
+def _target_int(target: dict[str, Any], field_name: str) -> int:
+    value = target.get(field_name)
+    return value if isinstance(value, int) else int(value)
 
 
 def _relationship_projection() -> dict[str, dict[str, Any]]:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,9 +17,25 @@ from benchmarks.run_benchmark import (
     BenchmarkResult,
     benchmark_consistency_check,
     benchmark_gds_projection_create,
+    main,
     run_full_benchmark_suite,
+    validate_benchmark_artifact,
+    write_benchmark_artifacts,
 )
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _lite_target_results(*, pagerank_seconds: float = 23.5) -> list[BenchmarkResult]:
+    return [
+        BenchmarkResult("consistency_check", 100_000, 800_000, 0.4, None, True),
+        BenchmarkResult("gds_projection_create", 100_000, 800_000, 7.8, None, True),
+        BenchmarkResult("pagerank", 100_000, 800_000, pagerank_seconds, None, True),
+        BenchmarkResult("path_traversal", 100_000, 800_000, 1.7, None, True),
+        BenchmarkResult("cold_reload", 100_000, 800_000, 74.9, None, True),
+    ]
 
 
 def test_generate_synthetic_nodes_returns_expected_shape() -> None:
@@ -181,6 +199,76 @@ def test_check_budgets_returns_true_only_when_all_budgeted_results_pass() -> Non
 
     assert check_budgets(passing_results, DEFAULT_BUDGETS) is True
     assert check_budgets(failing_results, DEFAULT_BUDGETS) is False
+
+
+def test_write_benchmark_artifacts_records_json_and_text_report(tmp_path: Path) -> None:
+    json_path = tmp_path / "lite_target.json"
+    text_path = tmp_path / "lite_target.txt"
+
+    write_benchmark_artifacts(
+        _lite_target_results(),
+        json_path,
+        text_path,
+        target_nodes=100_000,
+        target_edge_factor=8,
+        command="python -m benchmarks.run_benchmark --target-nodes 100000",
+    )
+
+    record = json.loads(json_path.read_text(encoding="utf-8"))
+    assert record["target"] == {
+        "node_count": 100_000,
+        "edge_count": 800_000,
+        "edge_factor": 8,
+    }
+    assert record["overall_passed"] is True
+    assert validate_benchmark_artifact(json_path) is True
+    assert "Overall: PASS" in text_path.read_text(encoding="utf-8")
+
+
+def test_validate_benchmark_artifact_rejects_budget_failure(tmp_path: Path) -> None:
+    json_path = tmp_path / "lite_target_failure.json"
+    text_path = tmp_path / "lite_target_failure.txt"
+
+    write_benchmark_artifacts(
+        _lite_target_results(pagerank_seconds=61.0),
+        json_path,
+        text_path,
+        target_nodes=100_000,
+        target_edge_factor=8,
+        command="python -m benchmarks.run_benchmark --target-nodes 100000",
+    )
+
+    assert validate_benchmark_artifact(json_path) is False
+    assert main(["--validate-artifact", str(json_path)]) == 1
+
+
+def test_validate_benchmark_artifact_rejects_non_lite_target(tmp_path: Path) -> None:
+    json_path = tmp_path / "small_target.json"
+    text_path = tmp_path / "small_target.txt"
+
+    write_benchmark_artifacts(
+        [
+            BenchmarkResult("consistency_check", 1_000, 5_000, 0.1, None, True),
+            BenchmarkResult("gds_projection_create", 1_000, 5_000, 0.1, None, True),
+            BenchmarkResult("pagerank", 1_000, 5_000, 0.1, None, True),
+            BenchmarkResult("path_traversal", 1_000, 5_000, 0.1, None, True),
+            BenchmarkResult("cold_reload", 1_000, 5_000, 0.1, None, True),
+        ],
+        json_path,
+        text_path,
+        target_nodes=1_000,
+        target_edge_factor=5,
+        command="python -m benchmarks.run_benchmark --target-nodes 1000",
+    )
+
+    assert validate_benchmark_artifact(json_path) is False
+
+
+def test_committed_lite_target_artifact_passes_budget_gate() -> None:
+    artifact_path = _REPO_ROOT / "benchmarks/artifacts/lite_target_100k_800k.json"
+
+    assert validate_benchmark_artifact(artifact_path) is True
+    assert main(["--validate-artifact", str(artifact_path)]) == 0
 
 
 def test_benchmark_gds_projection_create_reports_missing_gds_plugin() -> None:
