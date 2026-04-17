@@ -41,6 +41,7 @@ RETURN [node IN nodes WHERE node IS NOT NULL | {
            properties: properties(relationship)
        }] AS subgraph_edges
 """
+MAX_QUERY_DEPTH = 10
 
 
 def query_subgraph(
@@ -52,13 +53,15 @@ def query_subgraph(
 ) -> dict[str, Any]:
     """Return a local subgraph only when the live graph is ready."""
 
-    ready_status = _require_ready(status_manager, "subgraph query")
-    return _query_subgraph_after_ready(
-        seed_entities,
-        depth,
-        client=client,
-        ready_status=ready_status,
-    )
+    if status_manager is None:
+        raise ValueError("subgraph query requires status_manager")
+    with status_manager.ready_read() as ready_status:
+        return _query_subgraph_after_ready(
+            seed_entities,
+            depth,
+            client=client,
+            ready_status=ready_status,
+        )
 
 
 def simulate_readonly_impact(
@@ -70,20 +73,22 @@ def simulate_readonly_impact(
 ) -> dict[str, Any]:
     """Run the read-only local simulation boundary behind the ready gate."""
 
-    ready_status = _require_ready(status_manager, "readonly simulation")
-    depth = _context_int(context, "depth", default=1)
-    subgraph = _query_subgraph_after_ready(
-        seed_entities,
-        depth,
-        client=client,
-        ready_status=ready_status,
-    )
-    return {
-        "graph_generation_id": ready_status.graph_generation_id,
-        "seed_entities": list(seed_entities),
-        "impacted_subgraph": subgraph,
-        "status": "ready",
-    }
+    if status_manager is None:
+        raise ValueError("readonly simulation requires status_manager")
+    with status_manager.ready_read() as ready_status:
+        depth = _context_int(context, "depth", default=1)
+        subgraph = _query_subgraph_after_ready(
+            seed_entities,
+            depth,
+            client=client,
+            ready_status=ready_status,
+        )
+        return {
+            "graph_generation_id": ready_status.graph_generation_id,
+            "seed_entities": list(seed_entities),
+            "impacted_subgraph": subgraph,
+            "status": "ready",
+        }
 
 
 def _query_subgraph_after_ready(
@@ -108,15 +113,6 @@ def _query_subgraph_after_ready(
     }
 
 
-def _require_ready(
-    status_manager: GraphStatusManager | None,
-    operation_name: str,
-) -> Neo4jGraphStatus:
-    if status_manager is None:
-        raise ValueError(f"{operation_name} requires status_manager")
-    return status_manager.require_ready()
-
-
 def _validated_seed_entities(seed_entities: Sequence[str]) -> list[str]:
     seeds = [seed for seed in seed_entities if isinstance(seed, str) and seed.strip()]
     if not seeds:
@@ -129,6 +125,8 @@ def _validated_depth(depth: int) -> int:
         raise ValueError("depth must be an integer")
     if depth < 0:
         raise ValueError("depth must be non-negative")
+    if depth > MAX_QUERY_DEPTH:
+        raise ValueError(f"depth must be <= {MAX_QUERY_DEPTH}")
     return depth
 
 

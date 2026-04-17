@@ -34,7 +34,6 @@ def run_fundamental_propagation(
 
     if status_manager is None:
         raise ValueError("fundamental propagation requires status_manager")
-    status_manager.require_ready()
 
     if _FUNDAMENTAL_CHANNEL not in context.enabled_channels:
         raise PermissionError("fundamental propagation requires the fundamental channel")
@@ -43,23 +42,24 @@ def run_fundamental_propagation(
     if result_limit < 1:
         raise ValueError("result_limit must be greater than zero")
 
-    projection_name = graph_name or _default_projection_name(context)
-    _drop_projection_if_exists(client, projection_name)
-    try:
-        _create_projection(client, projection_name)
-        pagerank_entities = _stream_pagerank(
-            client,
-            projection_name,
-            max_iterations=max_iterations,
-            result_limit=result_limit,
-        )
-        activated_paths = _read_activated_paths(
-            context,
-            client,
-            result_limit=result_limit,
-        )
-    finally:
+    with status_manager.ready_read():
+        projection_name = graph_name or _default_projection_name(context)
         _drop_projection_if_exists(client, projection_name)
+        try:
+            _create_projection(client, projection_name)
+            pagerank_entities = _stream_pagerank(
+                client,
+                projection_name,
+                max_iterations=max_iterations,
+                result_limit=result_limit,
+            )
+            activated_paths = _read_activated_paths(
+                context,
+                client,
+                result_limit=result_limit,
+            )
+        finally:
+            _drop_projection_if_exists(client, projection_name)
 
     # Keep PageRank as the GDS topology pass, but rank persisted impacts by the
     # documented five-factor path scores so the snapshot outputs stay coherent.

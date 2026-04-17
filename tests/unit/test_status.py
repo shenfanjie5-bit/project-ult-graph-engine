@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Any, Literal
 from unittest.mock import MagicMock
@@ -373,6 +374,37 @@ def test_require_ready_returns_ready_status() -> None:
 
     assert require_ready_status(ready_status) is ready_status
     assert GraphStatusManager(InMemoryStatusStore(ready_status)).require_ready() is ready_status
+
+
+def test_ready_read_lease_blocks_rebuilding_transition_until_released() -> None:
+    store = InMemoryStatusStore(_status(graph_status="ready", graph_generation_id=8))
+    manager = GraphStatusManager(store, clock=lambda: NOW)
+    transition_started = threading.Event()
+    transition_finished = threading.Event()
+    transition_errors: list[BaseException] = []
+
+    def transition() -> None:
+        transition_started.set()
+        try:
+            manager.mark_rebuilding()
+        except BaseException as exc:  # pragma: no cover - asserted after join.
+            transition_errors.append(exc)
+        finally:
+            transition_finished.set()
+
+    with manager.ready_read() as ready_status:
+        assert ready_status.graph_status == "ready"
+        thread = threading.Thread(target=transition)
+        thread.start()
+        assert transition_started.wait(timeout=1)
+        assert not transition_finished.wait(timeout=0.05)
+        assert store.status == ready_status
+
+    assert transition_finished.wait(timeout=1)
+    thread.join(timeout=1)
+    assert transition_errors == []
+    assert store.status is not None
+    assert store.status.graph_status == "rebuilding"
 
 
 @pytest.mark.parametrize("graph_status", ["syncing", "rebuilding", "failed"])

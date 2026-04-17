@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from threading import Condition, RLock
 from typing import Literal
 
 from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
@@ -32,6 +34,10 @@ class GraphStatusManager:
     ) -> None:
         self.store = store
         self._clock = clock or _utc_now
+        self._transition_lock = RLock()
+        self._transition_condition = Condition(self._transition_lock)
+        self._active_read_leases = 0
+        self._pending_transitions = 0
 
     def get_status(self) -> Neo4jGraphStatus:
         """Return the current status or raise when the status row is missing."""
@@ -45,6 +51,23 @@ class GraphStatusManager:
         """Return the current ready status or block non-ready graph reads."""
 
         return require_ready_status(self.get_status())
+
+    @contextmanager
+    def ready_read(self) -> Iterator[Neo4jGraphStatus]:
+        """Hold a ready read lease across live Neo4j reads."""
+
+        with self._transition_condition:
+            while self._pending_transitions > 0:
+                self._transition_condition.wait()
+            status = require_ready_status(self.get_status())
+            self._active_read_leases += 1
+        try:
+            yield status
+        finally:
+            with self._transition_condition:
+                self._active_read_leases -= 1
+                if self._active_read_leases == 0:
+                    self._transition_condition.notify_all()
 
     def mark_rebuilding(self) -> Neo4jGraphStatus:
         """Move an empty, ready, or failed status into rebuilding."""
@@ -228,13 +251,21 @@ class GraphStatusManager:
         expected_status: Neo4jGraphStatus | None,
         next_status: Neo4jGraphStatus,
     ) -> None:
-        if not self.store.compare_and_write_current_status(
-            expected_status=expected_status,
-            next_status=next_status,
-        ):
-            raise RuntimeError(
-                "stale graph_status transition rejected because current status changed",
-            )
+        with self._transition_condition:
+            self._pending_transitions += 1
+            try:
+                while self._active_read_leases > 0:
+                    self._transition_condition.wait()
+                if not self.store.compare_and_write_current_status(
+                    expected_status=expected_status,
+                    next_status=next_status,
+                ):
+                    raise RuntimeError(
+                        "stale graph_status transition rejected because current status changed",
+                    )
+            finally:
+                self._pending_transitions -= 1
+                self._transition_condition.notify_all()
 
 
 def _utc_now() -> datetime:

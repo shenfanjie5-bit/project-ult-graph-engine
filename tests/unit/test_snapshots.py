@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timezone
 from typing import Any, Literal
 from unittest.mock import MagicMock
@@ -370,29 +371,12 @@ def test_compute_graph_snapshots_rejects_status_disagreements_before_propagation
     assert writer.calls == []
 
 
-def test_compute_graph_snapshots_rejects_direct_ready_status_without_manager(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-    reader = StaticRegimeReader()
-    writer = RecordingSnapshotWriter()
+def test_compute_graph_snapshots_only_accepts_status_manager_gate() -> None:
+    parameters = inspect.signature(compute_graph_snapshots).parameters
 
-    _patch_metrics(monkeypatch, events)
-
-    with pytest.raises(ValueError, match="status_manager"):
-        compute_graph_snapshots(
-            "cycle-1",
-            "world-state-1",
-            client=MagicMock(),
-            graph_generation_id=1,
-            regime_reader=reader,
-            snapshot_writer=writer,
-            graph_status=_ready_status(),
-        )
-
-    assert events == []
-    assert reader.calls == []
-    assert writer.calls == []
+    assert "status_manager" in parameters
+    assert "graph_status" not in parameters
+    assert "status_reader" not in parameters
 
 
 def test_compute_graph_snapshots_writes_once_after_both_snapshots(

@@ -6,7 +6,7 @@ from typing import Any, Literal
 import pytest
 
 from graph_engine.models import Neo4jGraphStatus
-from graph_engine.query import query_subgraph, simulate_readonly_impact
+from graph_engine.query import MAX_QUERY_DEPTH, query_subgraph, simulate_readonly_impact
 from graph_engine.status import GraphStatusManager
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
@@ -112,6 +112,21 @@ def test_query_subgraph_returns_ready_result() -> None:
     assert client.write_calls == []
 
 
+def test_query_subgraph_rejects_depth_above_supported_bound_before_reads() -> None:
+    client = FakeQueryClient()
+
+    with pytest.raises(ValueError, match=f"<= {MAX_QUERY_DEPTH}"):
+        query_subgraph(
+            ["entity-a"],
+            MAX_QUERY_DEPTH + 1,
+            client=client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
+        )
+
+    assert client.read_calls == []
+    assert client.write_calls == []
+
+
 @pytest.mark.parametrize("graph_status", ["syncing", "rebuilding", "failed"])
 def test_simulate_readonly_impact_blocks_non_ready_status_before_reads(
     graph_status: Literal["syncing", "rebuilding", "failed"],
@@ -144,6 +159,21 @@ def test_simulate_readonly_impact_uses_ready_gated_subgraph_read() -> None:
     assert result["status"] == "ready"
     assert result["impacted_subgraph"]["subgraph_nodes"][0]["node_id"] == "node-a"
     assert "[*0..2]" in client.read_calls[0][0]
+    assert client.write_calls == []
+
+
+def test_simulate_readonly_impact_rejects_depth_above_supported_bound_before_reads() -> None:
+    client = FakeQueryClient()
+
+    with pytest.raises(ValueError, match=f"<= {MAX_QUERY_DEPTH}"):
+        simulate_readonly_impact(
+            ["entity-a"],
+            {"depth": MAX_QUERY_DEPTH + 1},
+            client=client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
+        )
+
+    assert client.read_calls == []
     assert client.write_calls == []
 
 

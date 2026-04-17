@@ -30,7 +30,34 @@ def check_live_graph_consistency(
 ) -> bool:
     """Return whether live Neo4j metrics match the canonical graph snapshot."""
 
-    status = _resolve_status(status_manager, require_ready=require_ready)
+    if require_ready:
+        if status_manager is None:
+            raise ValueError("status_manager is required when require_ready=True")
+        with status_manager.ready_read() as status:
+            return _check_live_graph_consistency_after_status(
+                snapshot_ref,
+                client=client,
+                snapshot_reader=snapshot_reader,
+                status=status,
+            )
+
+    status = _resolve_status(status_manager, require_ready=False)
+    return _check_live_graph_consistency_after_status(
+        snapshot_ref,
+        client=client,
+        snapshot_reader=snapshot_reader,
+        status=status,
+    )
+
+
+def _check_live_graph_consistency_after_status(
+    snapshot_ref: str,
+    *,
+    client: Neo4jClient,
+    snapshot_reader: CanonicalSnapshotReader,
+    status: Neo4jGraphStatus | None,
+) -> bool:
+    """Run consistency reads after the caller has established status safety."""
 
     try:
         snapshot = snapshot_reader.read_graph_snapshot(snapshot_ref)
