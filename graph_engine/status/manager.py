@@ -5,11 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from threading import Condition, RLock
+from threading import Condition, RLock, get_ident
 from typing import Literal
 
 from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
 from graph_engine.status.store import StatusStore
+
+_STORE_BARRIER_ATTR = "_graph_engine_status_read_barrier"
+_BARRIER_REGISTRY_LOCK = RLock()
+_BARRIER_REGISTRY: dict[int, "_ReadyReadBarrier"] = {}
 
 
 def require_ready_status(graph_status: Neo4jGraphStatus) -> Neo4jGraphStatus:
@@ -34,10 +38,7 @@ class GraphStatusManager:
     ) -> None:
         self.store = store
         self._clock = clock or _utc_now
-        self._transition_lock = RLock()
-        self._transition_condition = Condition(self._transition_lock)
-        self._active_read_leases = 0
-        self._pending_transitions = 0
+        self._read_barrier = _barrier_for_store(store)
 
     def get_status(self) -> Neo4jGraphStatus:
         """Return the current status or raise when the status row is missing."""
@@ -56,18 +57,8 @@ class GraphStatusManager:
     def ready_read(self) -> Iterator[Neo4jGraphStatus]:
         """Hold a ready read lease across live Neo4j reads."""
 
-        with self._transition_condition:
-            while self._pending_transitions > 0:
-                self._transition_condition.wait()
-            status = require_ready_status(self.get_status())
-            self._active_read_leases += 1
-        try:
+        with self._read_barrier.ready_read(self.get_status) as status:
             yield status
-        finally:
-            with self._transition_condition:
-                self._active_read_leases -= 1
-                if self._active_read_leases == 0:
-                    self._transition_condition.notify_all()
 
     def mark_rebuilding(self) -> Neo4jGraphStatus:
         """Move an empty, ready, or failed status into rebuilding."""
@@ -251,21 +242,88 @@ class GraphStatusManager:
         expected_status: Neo4jGraphStatus | None,
         next_status: Neo4jGraphStatus,
     ) -> None:
-        with self._transition_condition:
+        with self._read_barrier.transition():
+            if not self.store.compare_and_write_current_status(
+                expected_status=expected_status,
+                next_status=next_status,
+            ):
+                raise RuntimeError(
+                    "stale graph_status transition rejected because current status changed",
+                )
+
+
+class _ReadyReadBarrier:
+    """Coordinate ready reads and status transitions for one status store."""
+
+    def __init__(self) -> None:
+        self._condition = Condition(RLock())
+        self._active_read_leases = 0
+        self._pending_transitions = 0
+        self._read_depth_by_thread: dict[int, int] = {}
+
+    @contextmanager
+    def ready_read(
+        self,
+        read_status: Callable[[], Neo4jGraphStatus],
+    ) -> Iterator[Neo4jGraphStatus]:
+        thread_id = get_ident()
+        acquired_outer_lease = False
+        with self._condition:
+            depth = self._read_depth_by_thread.get(thread_id, 0)
+            if depth > 0:
+                status = require_ready_status(read_status())
+                self._read_depth_by_thread[thread_id] = depth + 1
+            else:
+                while self._pending_transitions > 0:
+                    self._condition.wait()
+                status = require_ready_status(read_status())
+                self._active_read_leases += 1
+                self._read_depth_by_thread[thread_id] = 1
+                acquired_outer_lease = True
+        try:
+            yield status
+        finally:
+            with self._condition:
+                depth = self._read_depth_by_thread[thread_id]
+                if depth > 1:
+                    self._read_depth_by_thread[thread_id] = depth - 1
+                else:
+                    del self._read_depth_by_thread[thread_id]
+                    if acquired_outer_lease:
+                        self._active_read_leases -= 1
+                        if self._active_read_leases == 0:
+                            self._condition.notify_all()
+
+    @contextmanager
+    def transition(self) -> Iterator[None]:
+        with self._condition:
             self._pending_transitions += 1
-            try:
-                while self._active_read_leases > 0:
-                    self._transition_condition.wait()
-                if not self.store.compare_and_write_current_status(
-                    expected_status=expected_status,
-                    next_status=next_status,
-                ):
-                    raise RuntimeError(
-                        "stale graph_status transition rejected because current status changed",
-                    )
-            finally:
+            while self._active_read_leases > 0:
+                self._condition.wait()
+        try:
+            yield
+        finally:
+            with self._condition:
                 self._pending_transitions -= 1
-                self._transition_condition.notify_all()
+                self._condition.notify_all()
+
+
+def _barrier_for_store(store: StatusStore) -> _ReadyReadBarrier:
+    with _BARRIER_REGISTRY_LOCK:
+        barrier = getattr(store, _STORE_BARRIER_ATTR, None)
+        if isinstance(barrier, _ReadyReadBarrier):
+            return barrier
+
+        barrier = _BARRIER_REGISTRY.get(id(store))
+        if barrier is None:
+            barrier = _ReadyReadBarrier()
+            _BARRIER_REGISTRY[id(store)] = barrier
+
+        try:
+            setattr(store, _STORE_BARRIER_ATTR, barrier)
+        except Exception:
+            return barrier
+        return barrier
 
 
 def _utc_now() -> datetime:

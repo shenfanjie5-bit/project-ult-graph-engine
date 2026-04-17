@@ -407,6 +407,96 @@ def test_ready_read_lease_blocks_rebuilding_transition_until_released() -> None:
     assert store.status.graph_status == "rebuilding"
 
 
+def test_ready_read_is_reentrant_while_transition_waits() -> None:
+    store = InMemoryStatusStore(_status(graph_status="ready", graph_generation_id=8))
+    manager = GraphStatusManager(store, clock=lambda: NOW)
+    nested_acquired = threading.Event()
+    scenario_finished = threading.Event()
+    scenario_errors: list[BaseException] = []
+
+    def scenario() -> None:
+        transition_started = threading.Event()
+        transition_finished = threading.Event()
+        transition_errors: list[BaseException] = []
+
+        def transition() -> None:
+            transition_started.set()
+            try:
+                manager.mark_rebuilding()
+            except BaseException as exc:  # pragma: no cover - asserted after join.
+                transition_errors.append(exc)
+            finally:
+                transition_finished.set()
+
+        try:
+            with manager.ready_read() as ready_status:
+                thread = threading.Thread(target=transition, daemon=True)
+                thread.start()
+                assert transition_started.wait(timeout=1)
+                with manager.ready_read() as nested_status:
+                    nested_acquired.set()
+                    assert nested_status == ready_status
+                assert not transition_finished.wait(timeout=0.05)
+
+            assert transition_finished.wait(timeout=1)
+            thread.join(timeout=1)
+            assert transition_errors == []
+        except BaseException as exc:  # pragma: no cover - asserted by parent thread.
+            scenario_errors.append(exc)
+        finally:
+            scenario_finished.set()
+
+    scenario_thread = threading.Thread(target=scenario, daemon=True)
+    scenario_thread.start()
+
+    assert scenario_finished.wait(timeout=2)
+    assert scenario_errors == []
+    assert nested_acquired.is_set()
+    assert store.status is not None
+    assert store.status.graph_status == "rebuilding"
+
+
+@pytest.mark.parametrize(
+    ("transition_name", "expected_status"),
+    [("mark_rebuilding", "rebuilding"), ("begin_sync", "syncing")],
+)
+def test_ready_read_barrier_is_shared_by_managers_using_same_store(
+    transition_name: str,
+    expected_status: str,
+) -> None:
+    store = InMemoryStatusStore(_status(graph_status="ready", graph_generation_id=8))
+    read_manager = GraphStatusManager(store, clock=lambda: NOW)
+    transition_manager = GraphStatusManager(store, clock=lambda: NOW)
+    transition_started = threading.Event()
+    transition_finished = threading.Event()
+    transition_errors: list[BaseException] = []
+
+    def transition() -> None:
+        transition_started.set()
+        try:
+            if transition_name == "mark_rebuilding":
+                transition_manager.mark_rebuilding()
+            else:
+                transition_manager.begin_sync()
+        except BaseException as exc:  # pragma: no cover - asserted after join.
+            transition_errors.append(exc)
+        finally:
+            transition_finished.set()
+
+    with read_manager.ready_read() as ready_status:
+        thread = threading.Thread(target=transition)
+        thread.start()
+        assert transition_started.wait(timeout=1)
+        assert not transition_finished.wait(timeout=0.05)
+        assert store.status == ready_status
+
+    assert transition_finished.wait(timeout=1)
+    thread.join(timeout=1)
+    assert transition_errors == []
+    assert store.status is not None
+    assert store.status.graph_status == expected_status
+
+
 @pytest.mark.parametrize("graph_status", ["syncing", "rebuilding", "failed"])
 def test_require_ready_rejects_non_ready_status(
     graph_status: Literal["syncing", "rebuilding", "failed"],
