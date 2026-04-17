@@ -251,6 +251,17 @@ class GraphStatusManager:
             )
 
 
+def require_ready_read(
+    status_manager: GraphStatusManager | None,
+    operation: str,
+) -> Neo4jGraphStatus:
+    """Return the ready status required before a public Neo4j read operation."""
+
+    if status_manager is None:
+        raise ValueError(f"{operation} requires status_manager")
+    return status_manager.require_ready()
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 

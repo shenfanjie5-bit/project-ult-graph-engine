@@ -114,6 +114,18 @@ class PropagationResult(BaseModel):
     channel_breakdown: dict[str, Any]
 
 
+class ReadonlySimulationRequest(BaseModel):
+    """Runtime request for one read-only local impact simulation."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    cycle_id: str = Field(min_length=1)
+    world_state_ref: str = Field(min_length=1)
+    graph_generation_id: int = Field(ge=0)
+    depth: int = Field(default=1, ge=0)
+    result_limit: int = Field(default=100, ge=1)
+
+
 class GraphSnapshot(BaseModel):
     """Structural snapshot of the promoted graph for a cycle."""
 

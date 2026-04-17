@@ -20,6 +20,7 @@ from graph_engine.models import (
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import SchemaManager
 from graph_engine.snapshots import build_graph_snapshot, compute_graph_snapshots
+from graph_engine.status import GraphStatusManager
 from graph_engine.sync import sync_live_graph
 
 pytestmark = pytest.mark.skipif(
@@ -52,12 +53,26 @@ class CapturingSnapshotWriter:
         self.calls.append((graph_snapshot, impact_snapshot))
 
 
-class StaticStatusReader:
+class InMemoryStatusStore:
     def __init__(self, graph_status: Neo4jGraphStatus) -> None:
         self.graph_status = graph_status
 
-    def read_graph_status(self) -> Neo4jGraphStatus:
+    def read_current_status(self) -> Neo4jGraphStatus | None:
         return self.graph_status
+
+    def write_current_status(self, status: Neo4jGraphStatus) -> None:
+        self.graph_status = status
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        if self.graph_status != expected_status:
+            return False
+        self.write_current_status(next_status)
+        return True
 
 
 def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -> None:
@@ -80,7 +95,14 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
 
         try:
             sync_live_graph(_promotion_plan(source_node_id, target_node_id, edge_id), client)
-            live_snapshot = build_graph_snapshot("cycle-1", 1, client)
+            live_snapshot = build_graph_snapshot(
+                "cycle-1",
+                1,
+                client,
+                status_manager=GraphStatusManager(
+                    InMemoryStatusStore(_status_for_generation(1)),
+                ),
+            )
             graph_status = Neo4jGraphStatus(
                 graph_status="ready",
                 graph_generation_id=live_snapshot.graph_generation_id,
@@ -91,6 +113,7 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
                 last_verified_at=NOW,
                 last_reload_at=None,
             )
+            status_manager = GraphStatusManager(InMemoryStatusStore(graph_status))
 
             try:
                 graph_snapshot, impact_snapshot = compute_graph_snapshots(
@@ -100,7 +123,7 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
                     graph_generation_id=1,
                     regime_reader=StaticRegimeReader(),
                     snapshot_writer=writer,
-                    status_reader=StaticStatusReader(graph_status),
+                    status_manager=status_manager,
                     graph_name=f"{prefix}-projection",
                 )
             except RuntimeError as exc:
@@ -137,6 +160,19 @@ def _promotion_plan(
         edge_records=[_edge_record(source_node_id, target_node_id, edge_id)],
         assertion_records=[],
         created_at=NOW,
+    )
+
+
+def _status_for_generation(graph_generation_id: int) -> Neo4jGraphStatus:
+    return Neo4jGraphStatus(
+        graph_status="ready",
+        graph_generation_id=graph_generation_id,
+        node_count=0,
+        edge_count=0,
+        key_label_counts={},
+        checksum="pending",
+        last_verified_at=NOW,
+        last_reload_at=None,
     )
 
 

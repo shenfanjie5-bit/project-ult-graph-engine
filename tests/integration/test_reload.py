@@ -95,7 +95,14 @@ def test_cold_reload_rebuilds_live_graph_and_gds_projection() -> None:
 
         try:
             sync_live_graph(promotion_plan, client)
-            expected_snapshot = build_graph_snapshot("cycle-reload", 7, client)
+            expected_snapshot = build_graph_snapshot(
+                "cycle-reload",
+                7,
+                client,
+                status_manager=GraphStatusManager(
+                    InMemoryStatusStore(_status(graph_generation_id=7)),
+                ),
+            )
             plan = ColdReloadPlan(
                 snapshot_ref="snapshot-ref-reload",
                 cycle_id="cycle-reload",

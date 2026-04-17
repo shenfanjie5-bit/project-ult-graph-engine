@@ -10,6 +10,7 @@ from graph_engine.client import Neo4jClient
 from graph_engine.models import PropagationContext, PropagationResult
 from graph_engine.propagation.scoring import build_score_explanation
 from graph_engine.schema.definitions import RelationshipType
+from graph_engine.status import GraphStatusManager, require_ready_read
 
 FUNDAMENTAL_RELATIONSHIP_TYPES = (
     RelationshipType.SUPPLY_CHAIN.value,
@@ -24,6 +25,7 @@ def run_fundamental_propagation(
     context: PropagationContext,
     client: Neo4jClient,
     *,
+    status_manager: GraphStatusManager | None = None,
     graph_name: str | None = None,
     max_iterations: int = 20,
     result_limit: int = 100,
@@ -36,6 +38,14 @@ def run_fundamental_propagation(
         raise ValueError("max_iterations must be greater than zero")
     if result_limit < 1:
         raise ValueError("result_limit must be greater than zero")
+
+    ready_status = require_ready_read(status_manager, "fundamental propagation")
+    if ready_status.graph_generation_id != context.graph_generation_id:
+        raise ValueError(
+            "PropagationContext graph_generation_id disagrees with Neo4jGraphStatus: "
+            f"context={context.graph_generation_id}, "
+            f"status={ready_status.graph_generation_id}",
+        )
 
     projection_name = graph_name or _default_projection_name(context)
     _drop_projection_if_exists(client, projection_name)
