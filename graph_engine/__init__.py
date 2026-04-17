@@ -4,6 +4,7 @@ from graph_engine.client import Neo4jClient
 from graph_engine.config import Neo4jConfig, load_config_from_env
 from graph_engine.models import (
     CandidateGraphDelta,
+    ColdReloadPlan,
     GraphAssertionRecord,
     GraphEdgeRecord,
     GraphImpactSnapshot,
@@ -13,6 +14,12 @@ from graph_engine.models import (
     PropagationContext,
     PropagationResult,
     PromotionPlan,
+)
+from graph_engine.reload import (
+    CanonicalReader,
+    ColdReloadTimeoutError,
+    cold_reload,
+    rebuild_gds_projection,
 )
 from graph_engine.schema import (
     NodeLabel,
@@ -33,7 +40,10 @@ __version__ = "0.1.0"
 
 __all__ = [
     "CandidateGraphDelta",
+    "CanonicalReader",
     "CanonicalSnapshotReader",
+    "ColdReloadPlan",
+    "ColdReloadTimeoutError",
     "GraphAssertionRecord",
     "GraphEdgeRecord",
     "GraphImpactSnapshot",
@@ -52,8 +62,10 @@ __all__ = [
     "StatusStore",
     "__version__",
     "check_live_graph_consistency",
+    "cold_reload",
     "get_constraint_statements",
     "get_index_statements",
     "load_config_from_env",
+    "rebuild_gds_projection",
     "require_ready_status",
 ]

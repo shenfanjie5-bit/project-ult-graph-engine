@@ -10,7 +10,7 @@ from graph_engine.config import Neo4jConfig
 try:  # pragma: no cover - exercised when the optional runtime dependency is unavailable.
     from neo4j import GraphDatabase  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # pragma: no cover
-    GraphDatabase = None  # type: ignore[assignment]
+    GraphDatabase = None  # type: ignore[assignment,misc]
 
 
 class Neo4jClient:

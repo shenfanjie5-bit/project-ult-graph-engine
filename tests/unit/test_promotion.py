@@ -9,10 +9,11 @@ import pytest
 
 import graph_engine.promotion.service as service_module
 from graph_engine.client import Neo4jClient
-from graph_engine.models import CandidateGraphDelta, PromotionPlan
+from graph_engine.models import CandidateGraphDelta, Neo4jGraphStatus, PromotionPlan
 from graph_engine.promotion import build_promotion_plan, promote_graph_deltas
 from graph_engine.promotion.planner import validate_entity_anchors
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
+from graph_engine.status import GraphStatusManager
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 
@@ -52,6 +53,69 @@ class FakeCanonicalWriter:
         self.plans.append(plan)
         if self.fail:
             raise RuntimeError("canonical write failed")
+
+
+class InMemoryStatusStore:
+    def __init__(self, status: Neo4jGraphStatus | None = None) -> None:
+        self.status = status
+        self.compare_calls: list[tuple[Neo4jGraphStatus | None, Neo4jGraphStatus]] = []
+
+    def read_current_status(self) -> Neo4jGraphStatus | None:
+        return self.status
+
+    def write_current_status(self, status: Neo4jGraphStatus) -> None:
+        self.status = status
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        self.compare_calls.append((expected_status, next_status))
+        if self.status != expected_status:
+            return False
+        self.write_current_status(next_status)
+        return True
+
+
+class StaleBarrierStatusStore(InMemoryStatusStore):
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        self.status = _status(graph_status="rebuilding")
+        return super().compare_and_write_current_status(
+            expected_status=expected_status,
+            next_status=next_status,
+        )
+
+
+class RebuildAfterSyncAcquireStore(InMemoryStatusStore):
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        result = super().compare_and_write_current_status(
+            expected_status=expected_status,
+            next_status=next_status,
+        )
+        if (
+            result
+            and expected_status is not None
+            and expected_status.graph_status == "ready"
+            and next_status.graph_status == "syncing"
+        ):
+            self.status = _status(graph_status="rebuilding")
+        return result
+
+
+def _status_manager_from_store(store: InMemoryStatusStore) -> GraphStatusManager:
+    return GraphStatusManager(store)
 
 
 def test_validate_entity_anchors_checks_all_source_entities_once() -> None:
@@ -149,6 +213,7 @@ def test_promote_graph_deltas_writes_canonical_before_live_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
+    store = InMemoryStatusStore(_status())
 
     def fake_sync_live_graph(plan: PromotionPlan, client: Neo4jClient) -> None:
         assert plan.delta_ids == ["delta-1"]
@@ -168,10 +233,16 @@ def test_promote_graph_deltas_writes_canonical_before_live_graph(
         entity_reader=FakeEntityReader({"entity-1"}),
         canonical_writer=writer,
         client=mock_client,
+        status_manager=_status_manager_from_store(store),
     )
 
     assert calls == ["canonical", "sync"]
     assert writer.plans == [plan]
+    assert store.compare_calls == [
+        (_status(), _status(graph_status="syncing")),
+        (_status(graph_status="syncing"), _status()),
+    ]
+    assert store.status == _status()
 
 
 def test_promote_graph_deltas_does_not_sync_when_canonical_write_fails(
@@ -190,9 +261,161 @@ def test_promote_graph_deltas_does_not_sync_when_canonical_write_fails(
             entity_reader=FakeEntityReader({"entity-1"}),
             canonical_writer=FakeCanonicalWriter(fail=True),
             client=MagicMock(spec=Neo4jClient),
+            status_manager=_status_manager(),
         )
 
     sync_live_graph.assert_not_called()
+
+
+def test_promote_graph_deltas_requires_status_manager_for_live_sync() -> None:
+    writer = FakeCanonicalWriter()
+    reader = FakeCandidateReader([
+        _delta("delta-1", "node_add", {"node": _node_payload()}),
+    ])
+
+    with pytest.raises(ValueError, match="status_manager"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=reader,
+            entity_reader=FakeEntityReader({"entity-1"}),
+            canonical_writer=writer,
+            client=MagicMock(spec=Neo4jClient),
+        )
+
+    assert reader.calls == []
+    assert writer.plans == []
+
+
+def test_promote_graph_deltas_blocks_live_sync_when_graph_is_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync_live_graph = MagicMock()
+    monkeypatch.setattr(service_module, "sync_live_graph", sync_live_graph)
+    writer = FakeCanonicalWriter()
+
+    with pytest.raises(PermissionError, match="ready"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([
+                _delta("delta-1", "node_add", {"node": _node_payload()}),
+            ]),
+            entity_reader=FakeEntityReader({"entity-1"}),
+            canonical_writer=writer,
+            client=MagicMock(spec=Neo4jClient),
+            status_manager=_status_manager(graph_status="rebuilding"),
+        )
+
+    assert writer.plans == []
+    sync_live_graph.assert_not_called()
+
+
+def test_promote_graph_deltas_rejects_stale_status_before_live_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync_live_graph = MagicMock()
+    monkeypatch.setattr(service_module, "sync_live_graph", sync_live_graph)
+    writer = FakeCanonicalWriter()
+    status_manager = _status_manager_from_store(StaleBarrierStatusStore(_status()))
+
+    with pytest.raises(RuntimeError, match="stale graph_status transition"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([
+                _delta("delta-1", "node_add", {"node": _node_payload()}),
+            ]),
+            entity_reader=FakeEntityReader({"entity-1"}),
+            canonical_writer=writer,
+            client=MagicMock(spec=Neo4jClient),
+            status_manager=status_manager,
+        )
+
+    assert len(writer.plans) == 1
+    sync_live_graph.assert_not_called()
+
+
+def test_promote_graph_deltas_does_not_sync_if_rebuild_starts_after_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync_live_graph = MagicMock()
+    monkeypatch.setattr(service_module, "sync_live_graph", sync_live_graph)
+    store = RebuildAfterSyncAcquireStore(_status())
+
+    with pytest.raises(RuntimeError, match="before promotion live sync"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([
+                _delta("delta-1", "node_add", {"node": _node_payload()}),
+            ]),
+            entity_reader=FakeEntityReader({"entity-1"}),
+            canonical_writer=FakeCanonicalWriter(),
+            client=MagicMock(spec=Neo4jClient),
+            status_manager=_status_manager_from_store(store),
+        )
+
+    assert sync_live_graph.call_count == 0
+    assert store.status == _status(graph_status="rebuilding")
+
+
+def test_promote_graph_deltas_detects_status_change_during_live_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    store = InMemoryStatusStore(_status())
+
+    def fake_sync_live_graph(plan: PromotionPlan, client: Neo4jClient) -> None:
+        assert plan.delta_ids == ["delta-1"]
+        calls.append("sync")
+        store.status = _status(graph_status="rebuilding")
+
+    monkeypatch.setattr(service_module, "sync_live_graph", fake_sync_live_graph)
+    writer = FakeCanonicalWriter()
+
+    with pytest.raises(RuntimeError, match="after promotion live sync"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([
+                _delta("delta-1", "node_add", {"node": _node_payload()}),
+            ]),
+            entity_reader=FakeEntityReader({"entity-1"}),
+            canonical_writer=writer,
+            client=MagicMock(spec=Neo4jClient),
+            status_manager=_status_manager_from_store(store),
+        )
+
+    assert len(writer.plans) == 1
+    assert calls == ["sync"]
+    assert store.status == _status(graph_status="rebuilding")
+
+
+def test_promote_graph_deltas_marks_status_failed_when_live_sync_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_sync_live_graph(plan: PromotionPlan, client: Neo4jClient) -> None:
+        raise RuntimeError("sync failed")
+
+    store = InMemoryStatusStore(_status())
+    monkeypatch.setattr(service_module, "sync_live_graph", fake_sync_live_graph)
+
+    with pytest.raises(RuntimeError, match="sync failed"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([
+                _delta("delta-1", "node_add", {"node": _node_payload()}),
+            ]),
+            entity_reader=FakeEntityReader({"entity-1"}),
+            canonical_writer=FakeCanonicalWriter(),
+            client=MagicMock(spec=Neo4jClient),
+            status_manager=_status_manager_from_store(store),
+        )
+
+    assert store.status is not None
+    assert store.status.graph_status == "failed"
 
 
 def test_promote_graph_deltas_can_skip_live_graph_sync() -> None:
@@ -210,6 +433,29 @@ def test_promote_graph_deltas_can_skip_live_graph_sync() -> None:
     )
 
     assert writer.plans == [plan]
+
+
+def _status_manager(
+    *,
+    graph_status: str = "ready",
+) -> GraphStatusManager:
+    return GraphStatusManager(InMemoryStatusStore(_status(graph_status=graph_status)))
+
+
+def _status(
+    *,
+    graph_status: str = "ready",
+) -> Neo4jGraphStatus:
+    return Neo4jGraphStatus(
+        graph_status=graph_status,
+        graph_generation_id=3,
+        node_count=2,
+        edge_count=1,
+        key_label_counts={"Entity": 2},
+        checksum="abc123",
+        last_verified_at=NOW if graph_status == "ready" else None,
+        last_reload_at=None,
+    )
 
 
 def _delta(

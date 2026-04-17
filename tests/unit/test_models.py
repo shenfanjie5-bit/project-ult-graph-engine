@@ -8,6 +8,7 @@ from pydantic import BaseModel, ValidationError
 
 from graph_engine.models import (
     CandidateGraphDelta,
+    ColdReloadPlan,
     GraphAssertionRecord,
     GraphEdgeRecord,
     GraphImpactSnapshot,
@@ -116,6 +117,37 @@ def _model_payloads() -> list[tuple[type[BaseModel], dict[str, Any]]]:
                 "activated_paths": [{"path": ["node-1", "node-2"]}],
                 "impacted_entities": [{"entity_id": "entity-2", "score": 0.5}],
                 "channel_breakdown": {"fundamental": {"score": 0.5}},
+            },
+        ),
+        (
+            ColdReloadPlan,
+            {
+                "snapshot_ref": "snapshot-ref-1",
+                "cycle_id": "cycle-1",
+                "expected_snapshot": {
+                    "cycle_id": "cycle-1",
+                    "snapshot_id": "snapshot-1",
+                    "graph_generation_id": 1,
+                    "node_count": 1,
+                    "edge_count": 0,
+                    "key_label_counts": {"Entity": 1},
+                    "checksum": "abc123",
+                    "created_at": NOW,
+                },
+                "node_records": [
+                    {
+                        "node_id": "node-1",
+                        "canonical_entity_id": "entity-1",
+                        "label": "Entity",
+                        "properties": {"ticker": "ULT"},
+                        "created_at": NOW,
+                        "updated_at": NOW,
+                    }
+                ],
+                "edge_records": [],
+                "assertion_records": [],
+                "projection_name": "graph_engine_reload_cycle_1",
+                "created_at": NOW,
             },
         ),
         (

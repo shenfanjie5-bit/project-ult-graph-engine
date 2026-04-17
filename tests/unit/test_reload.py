@@ -1,0 +1,625 @@
+from __future__ import annotations
+
+import threading
+from datetime import datetime, timezone
+from typing import Any, Literal
+from unittest.mock import MagicMock
+
+import pytest
+
+from graph_engine.client import Neo4jClient
+from graph_engine.models import (
+    ColdReloadPlan,
+    GraphEdgeRecord,
+    GraphNodeRecord,
+    GraphSnapshot,
+    Neo4jGraphStatus,
+    PromotionPlan,
+)
+from graph_engine.reload import service as reload_service
+from graph_engine.reload.projection import rebuild_gds_projection
+from graph_engine.schema.definitions import NodeLabel, RelationshipType
+from graph_engine.schema.manager import DROP_ALL_CONFIRMATION_TOKEN
+from graph_engine.status import GraphStatusManager
+
+NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
+
+
+class InMemoryStatusStore:
+    def __init__(self, status: Neo4jGraphStatus | None = None) -> None:
+        self.status = status
+        self.writes: list[Neo4jGraphStatus] = []
+
+    def read_current_status(self) -> Neo4jGraphStatus | None:
+        return self.status
+
+    def write_current_status(self, status: Neo4jGraphStatus) -> None:
+        self.status = status
+        self.writes.append(status)
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        if self.status != expected_status:
+            return False
+        self.write_current_status(next_status)
+        return True
+
+
+class RecordingStatusManager(GraphStatusManager):
+    def __init__(
+        self,
+        store: InMemoryStatusStore,
+        order: list[str],
+    ) -> None:
+        super().__init__(store, clock=lambda: NOW)
+        self.order = order
+
+    def mark_rebuilding(self) -> Neo4jGraphStatus:
+        self.order.append("mark_rebuilding")
+        return super().mark_rebuilding()
+
+    def mark_ready(
+        self,
+        *,
+        node_count: int,
+        edge_count: int,
+        key_label_counts: dict[str, int],
+        checksum: str,
+        graph_generation_id: int | None = None,
+        reload_completed: bool = False,
+    ) -> Neo4jGraphStatus:
+        self.order.append("mark_ready")
+        return super().mark_ready(
+            node_count=node_count,
+            edge_count=edge_count,
+            key_label_counts=key_label_counts,
+            checksum=checksum,
+            graph_generation_id=graph_generation_id,
+            reload_completed=reload_completed,
+        )
+
+    def mark_failed(
+        self,
+        *,
+        node_count: int = 0,
+        edge_count: int = 0,
+        key_label_counts: dict[str, int] | None = None,
+        checksum: str = "failed",
+    ) -> Neo4jGraphStatus:
+        self.order.append("mark_failed")
+        return super().mark_failed(
+            node_count=node_count,
+            edge_count=edge_count,
+            key_label_counts=key_label_counts,
+            checksum=checksum,
+        )
+
+
+class StaticCanonicalReader:
+    def __init__(
+        self,
+        plan: ColdReloadPlan | None = None,
+        *,
+        error: Exception | None = None,
+        order: list[str] | None = None,
+    ) -> None:
+        self.plan = plan
+        self.error = error
+        self.order = order
+        self.calls: list[str] = []
+
+    def read_cold_reload_plan(self, snapshot_ref: str) -> ColdReloadPlan:
+        if self.order is not None:
+            self.order.append("read_cold_reload_plan")
+        self.calls.append(snapshot_ref)
+        if self.error is not None:
+            raise self.error
+        if self.plan is None:
+            raise RuntimeError("reload plan not configured")
+        return self.plan
+
+
+class RecordingSchemaManager:
+    def __init__(
+        self,
+        order: list[str],
+        *,
+        verify_result: bool = True,
+        apply_error: Exception | None = None,
+        drop_error: Exception | None = None,
+    ) -> None:
+        self.order = order
+        self.verify_result = verify_result
+        self.apply_error = apply_error
+        self.drop_error = drop_error
+        self.drop_calls: list[dict[str, Any]] = []
+
+    def drop_all(
+        self,
+        *,
+        confirmation_token: str | None = None,
+        graph_status: object | None = None,
+        test_mode: bool = False,
+    ) -> None:
+        self.order.append("drop_all")
+        self.drop_calls.append(
+            {
+                "confirmation_token": confirmation_token,
+                "graph_status": graph_status,
+                "test_mode": test_mode,
+            },
+        )
+        if self.drop_error is not None:
+            raise self.drop_error
+
+    def apply_schema(self) -> None:
+        self.order.append("apply_schema")
+        if self.apply_error is not None:
+            raise self.apply_error
+
+    def verify_schema(self) -> bool:
+        self.order.append("verify_schema")
+        return self.verify_result
+
+
+def test_cold_reload_success_path_uses_required_order_and_ready_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    plan = _reload_plan()
+    store = InMemoryStatusStore(_status(graph_generation_id=3))
+    status_manager = RecordingStatusManager(store, order)
+    schema_manager = RecordingSchemaManager(order)
+    client = MagicMock(spec=Neo4jClient)
+    captured_sync: dict[str, object] = {}
+
+    def fake_sync_live_graph(
+        promotion_batch: PromotionPlan,
+        sync_client: Neo4jClient,
+        *,
+        batch_size: int,
+    ) -> None:
+        order.append("sync_live_graph")
+        captured_sync["promotion_batch"] = promotion_batch
+        captured_sync["client"] = sync_client
+        captured_sync["batch_size"] = batch_size
+
+    def fake_rebuild_gds_projection(
+        projection_client: Neo4jClient,
+        projection_name: str,
+    ) -> None:
+        order.append("rebuild_gds_projection")
+        assert projection_client is client
+        assert projection_name == plan.projection_name
+
+    def fake_check_live_graph_consistency(
+        snapshot_ref: str,
+        *,
+        client: Neo4jClient,
+        snapshot_reader: object,
+        status_manager: object | None = None,
+        require_ready: bool = True,
+    ) -> bool:
+        order.append("check_live_graph_consistency")
+        assert snapshot_ref == plan.snapshot_ref
+        assert client is not None
+        assert status_manager is None
+        assert require_ready is False
+        assert snapshot_reader.read_graph_snapshot(snapshot_ref) == plan.expected_snapshot
+        return True
+
+    monkeypatch.setattr(reload_service, "sync_live_graph", fake_sync_live_graph)
+    monkeypatch.setattr(reload_service, "rebuild_gds_projection", fake_rebuild_gds_projection)
+    monkeypatch.setattr(
+        reload_service,
+        "check_live_graph_consistency",
+        fake_check_live_graph_consistency,
+    )
+
+    status = reload_service.cold_reload(
+        plan.snapshot_ref,
+        client=client,
+        canonical_reader=StaticCanonicalReader(plan, order=order),
+        status_manager=status_manager,
+        schema_manager=schema_manager,  # type: ignore[arg-type]
+        batch_size=17,
+    )
+
+    assert order == [
+        "mark_rebuilding",
+        "read_cold_reload_plan",
+        "drop_all",
+        "sync_live_graph",
+        "apply_schema",
+        "verify_schema",
+        "rebuild_gds_projection",
+        "check_live_graph_consistency",
+        "mark_ready",
+    ]
+    assert schema_manager.drop_calls == [
+        {
+            "confirmation_token": DROP_ALL_CONFIRMATION_TOKEN,
+            "graph_status": store.writes[0],
+            "test_mode": False,
+        },
+    ]
+    assert store.writes[0].graph_status == "rebuilding"
+    assert status.graph_status == "ready"
+    assert status.graph_generation_id == plan.expected_snapshot.graph_generation_id
+    assert status.node_count == plan.expected_snapshot.node_count
+    assert status.edge_count == plan.expected_snapshot.edge_count
+    assert status.key_label_counts == plan.expected_snapshot.key_label_counts
+    assert status.checksum == plan.expected_snapshot.checksum
+    assert status.last_verified_at == NOW
+    assert status.last_reload_at == NOW
+    promotion_batch = captured_sync["promotion_batch"]
+    assert isinstance(promotion_batch, PromotionPlan)
+    assert promotion_batch.selection_ref == f"cold-reload:{plan.snapshot_ref}"
+    assert promotion_batch.delta_ids == []
+    assert promotion_batch.node_records == plan.node_records
+    assert promotion_batch.edge_records == plan.edge_records
+    assert captured_sync["client"] is client
+    assert captured_sync["batch_size"] == 17
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"batch_size": 0}, "batch_size"),
+        ({"timeout_seconds": 0.0}, "timeout_seconds"),
+    ],
+)
+def test_cold_reload_rejects_invalid_parameters_before_destructive_clear(
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    order: list[str] = []
+    store = InMemoryStatusStore(_status())
+    reader = StaticCanonicalReader(_reload_plan())
+    schema_manager = RecordingSchemaManager(order)
+
+    with pytest.raises(ValueError, match=message):
+        reload_service.cold_reload(
+            "snapshot-ref-1",
+            client=MagicMock(spec=Neo4jClient),
+            canonical_reader=reader,
+            status_manager=RecordingStatusManager(store, order),
+            schema_manager=schema_manager,  # type: ignore[arg-type]
+            **kwargs,
+        )
+
+    assert order == []
+    assert reader.calls == []
+    assert schema_manager.drop_calls == []
+    assert store.status == _status()
+
+
+def test_cold_reload_sync_failure_marks_failed_and_preserves_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    store = InMemoryStatusStore(_status(graph_generation_id=3))
+
+    def fake_sync_live_graph(
+        promotion_batch: PromotionPlan,
+        sync_client: Neo4jClient,
+        *,
+        batch_size: int,
+    ) -> None:
+        order.append("sync_live_graph")
+        raise RuntimeError("sync failed")
+
+    monkeypatch.setattr(reload_service, "sync_live_graph", fake_sync_live_graph)
+
+    with pytest.raises(RuntimeError, match="sync failed"):
+        reload_service.cold_reload(
+            "snapshot-ref-1",
+            client=MagicMock(spec=Neo4jClient),
+            canonical_reader=StaticCanonicalReader(_reload_plan()),
+            status_manager=RecordingStatusManager(store, order),
+            schema_manager=RecordingSchemaManager(order),  # type: ignore[arg-type]
+        )
+
+    assert store.status is not None
+    assert store.status.graph_status == "failed"
+    assert "mark_failed" in order
+    assert "mark_ready" not in order
+
+
+def test_cold_reload_schema_verify_failure_marks_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    store = InMemoryStatusStore(_status(graph_generation_id=3))
+    monkeypatch.setattr(reload_service, "sync_live_graph", _ordered_sync(order))
+
+    with pytest.raises(RuntimeError, match="schema verification failed"):
+        reload_service.cold_reload(
+            "snapshot-ref-1",
+            client=MagicMock(spec=Neo4jClient),
+            canonical_reader=StaticCanonicalReader(_reload_plan()),
+            status_manager=RecordingStatusManager(store, order),
+            schema_manager=RecordingSchemaManager(order, verify_result=False),  # type: ignore[arg-type]
+        )
+
+    assert store.status is not None
+    assert store.status.graph_status == "failed"
+    assert "rebuild_gds_projection" not in order
+    assert "mark_ready" not in order
+
+
+def test_cold_reload_consistency_mismatch_marks_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    store = InMemoryStatusStore(_status(graph_generation_id=3))
+    monkeypatch.setattr(reload_service, "sync_live_graph", _ordered_sync(order))
+    monkeypatch.setattr(reload_service, "rebuild_gds_projection", _ordered_projection(order))
+
+    def fake_check_live_graph_consistency(*args: object, **kwargs: object) -> bool:
+        order.append("check_live_graph_consistency")
+        return False
+
+    monkeypatch.setattr(
+        reload_service,
+        "check_live_graph_consistency",
+        fake_check_live_graph_consistency,
+    )
+
+    with pytest.raises(RuntimeError, match="consistency check failed"):
+        reload_service.cold_reload(
+            "snapshot-ref-1",
+            client=MagicMock(spec=Neo4jClient),
+            canonical_reader=StaticCanonicalReader(_reload_plan()),
+            status_manager=RecordingStatusManager(store, order),
+            schema_manager=RecordingSchemaManager(order),  # type: ignore[arg-type]
+        )
+
+    assert store.status is not None
+    assert store.status.graph_status == "failed"
+    assert "mark_ready" not in order
+
+
+def test_cold_reload_gds_missing_marks_failed_and_preserves_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    store = InMemoryStatusStore(_status(graph_generation_id=3))
+    monkeypatch.setattr(reload_service, "sync_live_graph", _ordered_sync(order))
+
+    def fake_rebuild_gds_projection(
+        projection_client: Neo4jClient,
+        projection_name: str,
+    ) -> None:
+        order.append("rebuild_gds_projection")
+        raise RuntimeError("GDS plugin not available")
+
+    monkeypatch.setattr(reload_service, "rebuild_gds_projection", fake_rebuild_gds_projection)
+
+    with pytest.raises(RuntimeError, match="^GDS plugin not available$"):
+        reload_service.cold_reload(
+            "snapshot-ref-1",
+            client=MagicMock(spec=Neo4jClient),
+            canonical_reader=StaticCanonicalReader(_reload_plan()),
+            status_manager=RecordingStatusManager(store, order),
+            schema_manager=RecordingSchemaManager(order),  # type: ignore[arg-type]
+        )
+
+    assert store.status is not None
+    assert store.status.graph_status == "failed"
+    assert "mark_ready" not in order
+
+
+def test_cold_reload_timeout_after_rebuilding_marks_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    store = InMemoryStatusStore(_status(graph_generation_id=3))
+    times = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(reload_service, "monotonic", lambda: next(times))
+
+    with pytest.raises(reload_service.ColdReloadTimeoutError, match="read_cold_reload_plan"):
+        reload_service.cold_reload(
+            "snapshot-ref-1",
+            client=MagicMock(spec=Neo4jClient),
+            canonical_reader=StaticCanonicalReader(_reload_plan()),
+            status_manager=RecordingStatusManager(store, order),
+            schema_manager=RecordingSchemaManager(order),  # type: ignore[arg-type]
+            timeout_seconds=1.0,
+        )
+
+    assert store.status is not None
+    assert store.status.graph_status == "failed"
+    assert order == ["mark_rebuilding", "mark_failed"]
+
+
+def test_cold_reload_timeout_during_blocking_stage_marks_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    store = InMemoryStatusStore(_status(graph_generation_id=3))
+    unblock_sync = threading.Event()
+
+    def blocking_sync_live_graph(
+        promotion_batch: PromotionPlan,
+        sync_client: Neo4jClient,
+        *,
+        batch_size: int,
+    ) -> None:
+        order.append("sync_live_graph")
+        unblock_sync.wait()
+
+    monkeypatch.setattr(reload_service, "sync_live_graph", blocking_sync_live_graph)
+
+    try:
+        with pytest.raises(
+            reload_service.ColdReloadTimeoutError,
+            match="during sync_live_graph",
+        ):
+            reload_service.cold_reload(
+                "snapshot-ref-1",
+                client=MagicMock(spec=Neo4jClient),
+                canonical_reader=StaticCanonicalReader(_reload_plan()),
+                status_manager=RecordingStatusManager(store, order),
+                schema_manager=RecordingSchemaManager(order),  # type: ignore[arg-type]
+                timeout_seconds=0.1,
+            )
+    finally:
+        unblock_sync.set()
+
+    assert store.status is not None
+    assert store.status.graph_status == "failed"
+    assert "sync_live_graph" in order
+    assert "mark_failed" in order
+    assert "mark_ready" not in order
+
+
+def test_rebuild_gds_projection_drops_existing_projection_and_creates_full_projection() -> None:
+    client = MagicMock(spec=Neo4jClient)
+    client.execute_read.return_value = [{"exists": True}]
+
+    rebuild_gds_projection(client, "graph_engine_reload")
+
+    client.execute_read.assert_called_once()
+    assert "gds.graph.exists" in client.execute_read.call_args.args[0]
+    assert client.execute_read.call_args.args[1] == {"projection_name": "graph_engine_reload"}
+    assert client.execute_write.call_count == 2
+    drop_query, drop_parameters = client.execute_write.call_args_list[0].args
+    create_query, create_parameters = client.execute_write.call_args_list[1].args
+    assert "gds.graph.drop" in drop_query
+    assert drop_parameters == {"projection_name": "graph_engine_reload"}
+    assert "gds.graph.project" in create_query
+    assert create_parameters["node_projection"] == [label.value for label in NodeLabel]
+    assert set(create_parameters["relationship_projection"]) == {
+        relationship_type.value for relationship_type in RelationshipType
+    }
+    assert create_parameters["relationship_projection"]["SUPPLY_CHAIN"]["properties"] == {
+        "weight": {"property": "weight", "defaultValue": 1.0},
+    }
+
+
+def test_rebuild_gds_projection_creates_without_drop_when_projection_absent() -> None:
+    client = MagicMock(spec=Neo4jClient)
+    client.execute_read.return_value = [{"exists": False}]
+
+    rebuild_gds_projection(client, "graph_engine_reload")
+
+    assert client.execute_write.call_count == 1
+    assert "gds.graph.project" in client.execute_write.call_args.args[0]
+
+
+def test_rebuild_gds_projection_normalizes_missing_gds_errors() -> None:
+    client = MagicMock(spec=Neo4jClient)
+    client.execute_read.side_effect = RuntimeError(
+        "There is no procedure with the name `gds.graph.exists` registered",
+    )
+
+    with pytest.raises(RuntimeError, match="^GDS plugin not available$"):
+        rebuild_gds_projection(client, "graph_engine_reload")
+
+    client.execute_write.assert_not_called()
+
+
+def test_rebuild_gds_projection_preserves_non_missing_gds_runtime_errors() -> None:
+    client = MagicMock(spec=Neo4jClient)
+    client.execute_read.return_value = [{"exists": False}]
+    client.execute_write.side_effect = RuntimeError("gds.graph.project failed at runtime")
+
+    with pytest.raises(RuntimeError, match="failed at runtime"):
+        rebuild_gds_projection(client, "graph_engine_reload")
+
+
+def _ordered_sync(order: list[str]) -> object:
+    def fake_sync_live_graph(
+        promotion_batch: PromotionPlan,
+        sync_client: Neo4jClient,
+        *,
+        batch_size: int,
+    ) -> None:
+        order.append("sync_live_graph")
+
+    return fake_sync_live_graph
+
+
+def _ordered_projection(order: list[str]) -> object:
+    def fake_rebuild_gds_projection(
+        projection_client: Neo4jClient,
+        projection_name: str,
+    ) -> None:
+        order.append("rebuild_gds_projection")
+
+    return fake_rebuild_gds_projection
+
+
+def _reload_plan() -> ColdReloadPlan:
+    return ColdReloadPlan(
+        snapshot_ref="snapshot-ref-1",
+        cycle_id="cycle-1",
+        expected_snapshot=_snapshot(graph_generation_id=4),
+        node_records=[
+            _node_record("node-1", "entity-1"),
+            _node_record("node-2", "entity-2"),
+        ],
+        edge_records=[_edge_record()],
+        assertion_records=[],
+        projection_name="graph_engine_reload_cycle_1",
+        created_at=NOW,
+    )
+
+
+def _status(
+    *,
+    graph_status: Literal["ready", "rebuilding", "failed"] = "ready",
+    graph_generation_id: int = 3,
+) -> Neo4jGraphStatus:
+    return Neo4jGraphStatus(
+        graph_status=graph_status,
+        graph_generation_id=graph_generation_id,
+        node_count=2,
+        edge_count=1,
+        key_label_counts={"Entity": 2},
+        checksum="old-checksum",
+        last_verified_at=NOW if graph_status == "ready" else None,
+        last_reload_at=None,
+    )
+
+
+def _snapshot(*, graph_generation_id: int) -> GraphSnapshot:
+    return GraphSnapshot(
+        cycle_id="cycle-1",
+        snapshot_id="snapshot-1",
+        graph_generation_id=graph_generation_id,
+        node_count=2,
+        edge_count=1,
+        key_label_counts={"Entity": 2},
+        checksum="ready-checksum",
+        created_at=NOW,
+    )
+
+
+def _node_record(node_id: str, canonical_entity_id: str) -> GraphNodeRecord:
+    return GraphNodeRecord(
+        node_id=node_id,
+        canonical_entity_id=canonical_entity_id,
+        label=NodeLabel.ENTITY.value,
+        properties={"ticker": canonical_entity_id.upper()},
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def _edge_record() -> GraphEdgeRecord:
+    return GraphEdgeRecord(
+        edge_id="edge-1",
+        source_node_id="node-1",
+        target_node_id="node-2",
+        relationship_type=RelationshipType.SUPPLY_CHAIN.value,
+        properties={"source": "filing"},
+        weight=0.7,
+        created_at=NOW,
+        updated_at=NOW,
+    )
