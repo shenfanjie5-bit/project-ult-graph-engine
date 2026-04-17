@@ -8,6 +8,11 @@ from uuid import uuid4
 
 from graph_engine.client import Neo4jClient
 from graph_engine.models import PropagationContext, PropagationResult
+from graph_engine.propagation._gds import (
+    drop_projection_if_exists,
+    execute_gds_read,
+    execute_gds_write,
+)
 from graph_engine.propagation.scoring import build_score_explanation
 from graph_engine.schema.definitions import RelationshipType
 from graph_engine.status import GraphStatusManager, require_ready_read
@@ -48,7 +53,7 @@ def run_fundamental_propagation(
         )
 
     projection_name = graph_name or _default_projection_name(context)
-    _drop_projection_if_exists(client, projection_name)
+    drop_projection_if_exists(client, projection_name)
     try:
         _create_projection(client, projection_name)
         pagerank_entities = _stream_pagerank(
@@ -63,7 +68,7 @@ def run_fundamental_propagation(
             result_limit=result_limit,
         )
     finally:
-        _drop_projection_if_exists(client, projection_name)
+        drop_projection_if_exists(client, projection_name)
 
     # Keep PageRank as the GDS topology pass, but rank persisted impacts by the
     # documented five-factor path scores so the snapshot outputs stay coherent.
@@ -92,20 +97,6 @@ def run_fundamental_propagation(
     )
 
 
-def _drop_projection_if_exists(client: Neo4jClient, graph_name: str) -> None:
-    rows = _execute_gds_read(
-        client,
-        "CALL gds.graph.exists($graph_name) YIELD exists RETURN exists",
-        {"graph_name": graph_name},
-    )
-    if rows and rows[0].get("exists") is True:
-        _execute_gds_write(
-            client,
-            "CALL gds.graph.drop($graph_name) YIELD graphName RETURN graphName",
-            {"graph_name": graph_name},
-        )
-
-
 def _default_projection_name(context: PropagationContext) -> str:
     cycle_component = re.sub(r"[^A-Za-z0-9_]", "_", context.cycle_id).strip("_")
     cycle_component = (cycle_component or "cycle")[:64]
@@ -126,7 +117,7 @@ def _create_projection(client: Neo4jClient, graph_name: str) -> None:
         }
         for relationship_type in FUNDAMENTAL_RELATIONSHIP_TYPES
     }
-    _execute_gds_write(
+    execute_gds_write(
         client,
         """
 CALL gds.graph.project($graph_name, "*", $relationship_projection)
@@ -147,7 +138,7 @@ def _stream_pagerank(
     max_iterations: int,
     result_limit: int,
 ) -> list[dict[str, Any]]:
-    rows = _execute_gds_read(
+    rows = execute_gds_read(
         client,
         """
 CALL gds.pageRank.stream($graph_name, {
@@ -356,40 +347,3 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return sorted(str(item) for item in value)
-
-
-def _execute_gds_read(
-    client: Neo4jClient,
-    query: str,
-    parameters: dict[str, Any],
-) -> list[dict[str, Any]]:
-    try:
-        return client.execute_read(query, parameters)
-    except Exception as exc:
-        if _is_missing_gds_error(exc):
-            raise RuntimeError("GDS plugin not available") from exc
-        raise
-
-
-def _execute_gds_write(
-    client: Neo4jClient,
-    query: str,
-    parameters: dict[str, Any],
-) -> list[dict[str, Any]]:
-    try:
-        return client.execute_write(query, parameters)
-    except Exception as exc:
-        if _is_missing_gds_error(exc):
-            raise RuntimeError("GDS plugin not available") from exc
-        raise
-
-
-def _is_missing_gds_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    missing_markers = (
-        "no procedure",
-        "not registered",
-        "unknown procedure",
-        "procedure not found",
-    )
-    return "gds." in message and any(marker in message for marker in missing_markers)

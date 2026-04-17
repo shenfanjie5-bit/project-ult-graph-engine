@@ -8,13 +8,14 @@ from uuid import uuid4
 
 from graph_engine.client import Neo4jClient
 from graph_engine.models import PropagationContext, PropagationResult
-from graph_engine.propagation.fundamental import (
-    _drop_projection_if_exists,
-    _execute_gds_read,
-    _execute_gds_write,
+from graph_engine.propagation._gds import (
+    drop_projection_if_exists,
+    execute_gds_read,
+    execute_gds_write,
 )
 from graph_engine.propagation.scoring import build_score_explanation
 from graph_engine.schema.definitions import RelationshipType
+from graph_engine.status import GraphStatusManager, require_ready_read
 
 EVENT_RELATIONSHIP_TYPES = (RelationshipType.EVENT_IMPACT.value,)
 _EVENT_CHANNEL = "event"
@@ -24,6 +25,7 @@ def run_event_propagation(
     context: PropagationContext,
     client: Neo4jClient,
     *,
+    status_manager: GraphStatusManager,
     graph_name: str | None = None,
     max_iterations: int = 20,
     result_limit: int = 100,
@@ -37,8 +39,16 @@ def run_event_propagation(
     if result_limit < 1:
         raise ValueError("result_limit must be greater than zero")
 
+    ready_status = require_ready_read(status_manager, "event propagation")
+    if ready_status.graph_generation_id != context.graph_generation_id:
+        raise ValueError(
+            "PropagationContext graph_generation_id disagrees with Neo4jGraphStatus: "
+            f"context={context.graph_generation_id}, "
+            f"status={ready_status.graph_generation_id}",
+        )
+
     projection_name = graph_name or _default_projection_name(context)
-    _drop_projection_if_exists(client, projection_name)
+    drop_projection_if_exists(client, projection_name)
     try:
         _create_projection(client, projection_name)
         pagerank_entities = _stream_pagerank(
@@ -53,7 +63,7 @@ def run_event_propagation(
             result_limit=result_limit,
         )
     finally:
-        _drop_projection_if_exists(client, projection_name)
+        drop_projection_if_exists(client, projection_name)
 
     impacted_entities = _impacted_entities_from_paths(
         activated_paths,
@@ -99,7 +109,7 @@ def _create_projection(client: Neo4jClient, graph_name: str) -> None:
         }
         for relationship_type in EVENT_RELATIONSHIP_TYPES
     }
-    _execute_gds_write(
+    execute_gds_write(
         client,
         """
 CALL gds.graph.project($graph_name, "*", $relationship_projection)
@@ -120,7 +130,7 @@ def _stream_pagerank(
     max_iterations: int,
     result_limit: int,
 ) -> list[dict[str, Any]]:
-    rows = _execute_gds_read(
+    rows = execute_gds_read(
         client,
         """
 CALL gds.pageRank.stream($graph_name, {

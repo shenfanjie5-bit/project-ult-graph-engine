@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
 
-from graph_engine.models import PropagationContext
+from graph_engine.models import Neo4jGraphStatus, PropagationContext
 from graph_engine.propagation import EVENT_RELATIONSHIP_TYPES, run_event_propagation
+from graph_engine.status import GraphStatusManager
+from tests.fakes import InMemoryStatusStore
+
+NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 
 
 class FakeEventGDSClient:
@@ -87,6 +92,40 @@ def test_run_event_propagation_requires_event_channel_before_neo4j_reads() -> No
         run_event_propagation(
             _context(enabled_channels=["fundamental"]),
             client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
+            graph_name="unit-event",
+        )
+
+    assert client.read_calls == []
+    assert client.write_calls == []
+
+
+@pytest.mark.parametrize("graph_status", ["rebuilding", "failed"])
+def test_run_event_propagation_blocks_non_ready_before_neo4j_reads(
+    graph_status: str,
+) -> None:
+    client = FakeEventGDSClient()
+
+    with pytest.raises(PermissionError, match="ready"):
+        run_event_propagation(
+            _context(),
+            client,  # type: ignore[arg-type]
+            status_manager=_status_manager(graph_status=graph_status),
+            graph_name="unit-event",
+        )
+
+    assert client.read_calls == []
+    assert client.write_calls == []
+
+
+def test_run_event_propagation_blocks_generation_mismatch_before_neo4j_reads() -> None:
+    client = FakeEventGDSClient()
+
+    with pytest.raises(ValueError, match="graph_generation_id"):
+        run_event_propagation(
+            _context(),
+            client,  # type: ignore[arg-type]
+            status_manager=_status_manager(graph_generation_id=2),
             graph_name="unit-event",
         )
 
@@ -128,6 +167,7 @@ def test_run_event_propagation_uses_projection_and_explains_paths() -> None:
     result = run_event_propagation(
         _context(),
         client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
         graph_name="unit-event",
         max_iterations=7,
         result_limit=2,
@@ -189,6 +229,7 @@ def test_run_event_propagation_cleans_up_projection_on_exception() -> None:
         run_event_propagation(
             _context(),
             client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
             graph_name="unit-event",
         )
 
@@ -204,6 +245,7 @@ def test_run_event_propagation_reports_missing_gds_consistently() -> None:
         run_event_propagation(
             _context(),
             client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
             graph_name="unit-event",
         )
 
@@ -218,6 +260,29 @@ def _context(*, enabled_channels: list[str] | None = None) -> PropagationContext
         regime_multipliers={"event": 0.5},
         decay_policy={},
         regime_context={},
+    )
+
+
+def _status_manager(
+    *,
+    graph_status: str = "ready",
+    graph_generation_id: int = 1,
+    writer_lock_token: str | None = None,
+) -> GraphStatusManager:
+    return GraphStatusManager(
+        InMemoryStatusStore(
+            Neo4jGraphStatus(
+                graph_status=graph_status,  # type: ignore[arg-type]
+                graph_generation_id=graph_generation_id,
+                node_count=2,
+                edge_count=1,
+                key_label_counts={"Entity": 2},
+                checksum="abc123" if graph_status == "ready" else graph_status,
+                last_verified_at=NOW if graph_status == "ready" else None,
+                last_reload_at=None,
+                writer_lock_token=writer_lock_token,
+            ),
+        ),
     )
 
 

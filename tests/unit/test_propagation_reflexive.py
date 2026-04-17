@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
 
-from graph_engine.models import PropagationContext
+from graph_engine.models import Neo4jGraphStatus, PropagationContext
 from graph_engine.propagation import run_reflexive_propagation
+from graph_engine.status import GraphStatusManager
+from tests.fakes import InMemoryStatusStore
+
+NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 
 
 class FakeReflexiveGDSClient:
@@ -32,8 +37,6 @@ class FakeReflexiveGDSClient:
         if "gds.graph.exists" in query:
             exists = self.exists_results.pop(0) if self.exists_results else False
             return [{"exists": exists}]
-        if "RETURN count(relationship) AS relationship_count" in query:
-            return [{"relationship_count": len(self._reflexive_rows())}]
         if "gds.pageRank.stream" in query:
             if self.fail_on_pagerank:
                 raise RuntimeError("pagerank failed")
@@ -73,6 +76,14 @@ class FakeReflexiveGDSClient:
         parameters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         self.write_calls.append((query, parameters or {}))
+        if "gds.graph.project" in query:
+            return [
+                {
+                    "graphName": (parameters or {}).get("graph_name"),
+                    "nodeCount": 2 if self._reflexive_rows() else 0,
+                    "relationshipCount": len(self._reflexive_rows()),
+                }
+            ]
         return []
 
     def _reflexive_rows(self) -> list[dict[str, Any]]:
@@ -92,6 +103,40 @@ def test_run_reflexive_propagation_requires_reflexive_channel_before_neo4j_reads
         run_reflexive_propagation(
             _context(enabled_channels=["event"]),
             client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
+            graph_name="unit-reflexive",
+        )
+
+    assert client.read_calls == []
+    assert client.write_calls == []
+
+
+@pytest.mark.parametrize("graph_status", ["rebuilding", "failed"])
+def test_run_reflexive_propagation_blocks_non_ready_before_neo4j_reads(
+    graph_status: str,
+) -> None:
+    client = FakeReflexiveGDSClient()
+
+    with pytest.raises(PermissionError, match="ready"):
+        run_reflexive_propagation(
+            _context(),
+            client,  # type: ignore[arg-type]
+            status_manager=_status_manager(graph_status=graph_status),
+            graph_name="unit-reflexive",
+        )
+
+    assert client.read_calls == []
+    assert client.write_calls == []
+
+
+def test_run_reflexive_propagation_blocks_generation_mismatch_before_neo4j_reads() -> None:
+    client = FakeReflexiveGDSClient()
+
+    with pytest.raises(ValueError, match="graph_generation_id"):
+        run_reflexive_propagation(
+            _context(),
+            client,  # type: ignore[arg-type]
+            status_manager=_status_manager(graph_generation_id=2),
             graph_name="unit-reflexive",
         )
 
@@ -135,6 +180,7 @@ def test_run_reflexive_propagation_filters_tagged_paths_and_explains_scores() ->
     result = run_reflexive_propagation(
         _context(),
         client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
         graph_name="unit-reflexive",
         max_iterations=8,
         result_limit=10,
@@ -189,6 +235,7 @@ def test_run_reflexive_propagation_returns_empty_result_for_empty_projection() -
     result = run_reflexive_propagation(
         _context(),
         client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
         graph_name="unit-reflexive",
     )
 
@@ -198,7 +245,8 @@ def test_run_reflexive_propagation_returns_empty_result_for_empty_projection() -
     assert result.channel_breakdown["reflexive"]["impacted_entity_count"] == 0
     assert result.channel_breakdown["reflexive"]["total_path_score"] == 0
     assert not any("gds.pageRank.stream" in query for query, _ in client.read_calls)
-    assert not any("gds.graph.project" in query for query, _ in client.write_calls)
+    assert any("gds.graph.project" in query for query, _ in client.write_calls)
+    assert not any("RETURN count(relationship)" in query for query, _ in client.read_calls)
 
 
 def test_run_reflexive_propagation_cleans_up_projection_on_exception() -> None:
@@ -222,6 +270,7 @@ def test_run_reflexive_propagation_cleans_up_projection_on_exception() -> None:
         run_reflexive_propagation(
             _context(),
             client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
             graph_name="unit-reflexive",
         )
 
@@ -240,6 +289,29 @@ def _context(*, enabled_channels: list[str] | None = None) -> PropagationContext
         regime_multipliers={"reflexive": 0.5},
         decay_policy={},
         regime_context={},
+    )
+
+
+def _status_manager(
+    *,
+    graph_status: str = "ready",
+    graph_generation_id: int = 1,
+    writer_lock_token: str | None = None,
+) -> GraphStatusManager:
+    return GraphStatusManager(
+        InMemoryStatusStore(
+            Neo4jGraphStatus(
+                graph_status=graph_status,  # type: ignore[arg-type]
+                graph_generation_id=graph_generation_id,
+                node_count=2,
+                edge_count=1,
+                key_label_counts={"Entity": 2},
+                checksum="abc123" if graph_status == "ready" else graph_status,
+                last_verified_at=NOW if graph_status == "ready" else None,
+                last_reload_at=None,
+                writer_lock_token=writer_lock_token,
+            ),
+        ),
     )
 
 

@@ -8,12 +8,13 @@ from uuid import uuid4
 
 from graph_engine.client import Neo4jClient
 from graph_engine.models import PropagationContext, PropagationResult
-from graph_engine.propagation.fundamental import (
-    _drop_projection_if_exists,
-    _execute_gds_read,
-    _execute_gds_write,
+from graph_engine.propagation._gds import (
+    drop_projection_if_exists,
+    execute_gds_read,
+    execute_gds_write,
 )
 from graph_engine.propagation.scoring import build_score_explanation
+from graph_engine.status import GraphStatusManager, require_ready_read
 
 _REFLEXIVE_CHANNEL = "reflexive"
 _REFLEXIVE_PATH_SELECTOR = (
@@ -26,6 +27,7 @@ def run_reflexive_propagation(
     context: PropagationContext,
     client: Neo4jClient,
     *,
+    status_manager: GraphStatusManager,
     graph_name: str | None = None,
     max_iterations: int = 20,
     result_limit: int = 100,
@@ -39,14 +41,22 @@ def run_reflexive_propagation(
     if result_limit < 1:
         raise ValueError("result_limit must be greater than zero")
 
+    ready_status = require_ready_read(status_manager, "reflexive propagation")
+    if ready_status.graph_generation_id != context.graph_generation_id:
+        raise ValueError(
+            "PropagationContext graph_generation_id disagrees with Neo4jGraphStatus: "
+            f"context={context.graph_generation_id}, "
+            f"status={ready_status.graph_generation_id}",
+        )
+
     projection_name = graph_name or _default_projection_name(context)
-    _drop_projection_if_exists(client, projection_name)
+    drop_projection_if_exists(client, projection_name)
     try:
-        if _count_reflexive_relationships(client) == 0:
+        relationship_count = _create_projection(client, projection_name)
+        if relationship_count == 0:
             pagerank_entities: list[dict[str, Any]] = []
             activated_paths: list[dict[str, Any]] = []
         else:
-            _create_projection(client, projection_name)
             pagerank_entities = _stream_pagerank(
                 client,
                 projection_name,
@@ -59,7 +69,7 @@ def run_reflexive_propagation(
                 result_limit=result_limit,
             )
     finally:
-        _drop_projection_if_exists(client, projection_name)
+        drop_projection_if_exists(client, projection_name)
 
     impacted_entities = _impacted_entities_from_paths(
         activated_paths,
@@ -91,22 +101,8 @@ def _default_projection_name(context: PropagationContext) -> str:
     return f"graph_engine_reflexive_{cycle_component}_{uuid4().hex[:8]}"
 
 
-def _count_reflexive_relationships(client: Neo4jClient) -> int:
-    rows = client.execute_read(
-        f"""
-MATCH ()-[relationship]->()
-WHERE {_REFLEXIVE_PATH_SELECTOR}
-RETURN count(relationship) AS relationship_count
-""",
-        {},
-    )
-    if not rows:
-        return 0
-    return int(rows[0].get("relationship_count") or 0)
-
-
-def _create_projection(client: Neo4jClient, graph_name: str) -> None:
-    _execute_gds_write(
+def _create_projection(client: Neo4jClient, graph_name: str) -> int:
+    rows = execute_gds_write(
         client,
         f"""
 MATCH (source)-[relationship]->(target)
@@ -128,6 +124,9 @@ RETURN projection.graphName AS graphName,
 """,
         {"graph_name": graph_name},
     )
+    if not rows:
+        return 0
+    return int(rows[0].get("relationshipCount") or 0)
 
 
 def _stream_pagerank(
@@ -137,7 +136,7 @@ def _stream_pagerank(
     max_iterations: int,
     result_limit: int,
 ) -> list[dict[str, Any]]:
-    rows = _execute_gds_read(
+    rows = execute_gds_read(
         client,
         """
 CALL gds.pageRank.stream($graph_name, {
