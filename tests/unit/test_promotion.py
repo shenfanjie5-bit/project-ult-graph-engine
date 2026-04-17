@@ -108,7 +108,7 @@ class RebuildAfterSyncAcquireStore(InMemoryStatusStore):
             result
             and expected_status is not None
             and expected_status.graph_status == "ready"
-            and next_status.graph_status == "syncing"
+            and next_status.writer_lock_token is not None
         ):
             self.status = _status(graph_status="rebuilding")
         return result
@@ -238,10 +238,14 @@ def test_promote_graph_deltas_writes_canonical_before_live_graph(
 
     assert calls == ["canonical", "sync"]
     assert writer.plans == [plan]
-    assert store.compare_calls == [
-        (_status(), _status(graph_status="syncing")),
-        (_status(graph_status="syncing"), _status()),
-    ]
+    assert len(store.compare_calls) == 2
+    expected_ready, locked_status = store.compare_calls[0]
+    finish_expected, finish_ready = store.compare_calls[1]
+    assert expected_ready == _status()
+    assert locked_status.graph_status == "ready"
+    assert locked_status.writer_lock_token is not None
+    assert finish_expected == locked_status
+    assert finish_ready == _status()
     assert store.status == _status()
 
 
@@ -445,6 +449,7 @@ def _status_manager(
 def _status(
     *,
     graph_status: str = "ready",
+    writer_lock_token: str | None = None,
 ) -> Neo4jGraphStatus:
     return Neo4jGraphStatus(
         graph_status=graph_status,
@@ -455,6 +460,7 @@ def _status(
         checksum="abc123",
         last_verified_at=NOW if graph_status == "ready" else None,
         last_reload_at=None,
+        writer_lock_token=writer_lock_token,
     )
 
 

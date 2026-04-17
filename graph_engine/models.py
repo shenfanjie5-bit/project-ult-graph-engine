@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class GraphNodeRecord(BaseModel):
@@ -162,7 +162,7 @@ class Neo4jGraphStatus(BaseModel):
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    graph_status: Literal["ready", "syncing", "rebuilding", "failed"]
+    graph_status: Literal["ready", "rebuilding", "failed"]
     graph_generation_id: int = Field(ge=0)
     node_count: int = Field(ge=0)
     edge_count: int = Field(ge=0)
@@ -170,3 +170,10 @@ class Neo4jGraphStatus(BaseModel):
     checksum: str = Field(min_length=1)
     last_verified_at: datetime | None
     last_reload_at: datetime | None
+    writer_lock_token: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _writer_lock_requires_ready_status(self) -> Self:
+        if self.writer_lock_token is not None and self.graph_status != "ready":
+            raise ValueError("writer_lock_token requires graph_status='ready'")
+        return self

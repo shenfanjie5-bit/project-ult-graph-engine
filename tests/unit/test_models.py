@@ -234,6 +234,35 @@ def test_candidate_delta_rejects_invalid_delta_type() -> None:
         )
 
 
+def test_neo4j_graph_status_rejects_syncing_public_state() -> None:
+    with pytest.raises(ValidationError):
+        Neo4jGraphStatus(
+            graph_status="syncing",
+            graph_generation_id=1,
+            node_count=10,
+            edge_count=12,
+            key_label_counts={"Entity": 10},
+            checksum="abc123",
+            last_verified_at=NOW,
+            last_reload_at=None,
+        )
+
+
+def test_neo4j_graph_status_writer_lock_requires_ready_state() -> None:
+    with pytest.raises(ValidationError, match="writer_lock_token"):
+        Neo4jGraphStatus(
+            graph_status="rebuilding",
+            graph_generation_id=1,
+            node_count=10,
+            edge_count=12,
+            key_label_counts={"Entity": 10},
+            checksum="abc123",
+            last_verified_at=None,
+            last_reload_at=None,
+            writer_lock_token="incremental-sync",
+        )
+
+
 def test_assertion_confidence_is_bounded() -> None:
     with pytest.raises(ValidationError):
         GraphAssertionRecord(

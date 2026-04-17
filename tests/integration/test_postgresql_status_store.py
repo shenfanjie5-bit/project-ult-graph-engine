@@ -28,7 +28,11 @@ class BarrierStatusStore(PostgreSQLStatusStore):
 
     def read_current_status(self) -> Neo4jGraphStatus | None:
         status = super().read_current_status()
-        if status is not None and status.graph_status == "ready":
+        if (
+            status is not None
+            and status.graph_status == "ready"
+            and status.writer_lock_token is None
+        ):
             self._barrier.wait(timeout=10)
         return status
 
@@ -82,10 +86,44 @@ def test_postgresql_status_store_rejects_competing_reload_and_sync_transitions()
             outcomes = [future.result(timeout=20) for future in futures]
 
         assert outcomes.count("stale") == 1
-        assert outcomes.count("syncing") + outcomes.count("rebuilding") == 1
+        assert outcomes.count("locked") + outcomes.count("rebuilding") == 1
         final_status = store.read_current_status()
         assert final_status is not None
-        assert final_status.graph_status in {"syncing", "rebuilding"}
+        assert final_status.graph_status == "rebuilding" or (
+            final_status.graph_status == "ready"
+            and final_status.writer_lock_token is not None
+        )
+    finally:
+        _drop_table(database_url, table_name)
+
+
+def test_postgresql_status_store_bootstrap_migrates_legacy_syncing_status() -> None:
+    psycopg = pytest.importorskip("psycopg")
+
+    database_url = _database_url()
+    table_name = _table_name()
+    _create_legacy_syncing_status_row(psycopg, database_url, table_name)
+    store = PostgreSQLStatusStore(database_url, table_name=table_name)
+
+    try:
+        store.bootstrap()
+
+        status = store.read_current_status()
+        assert status is not None
+        assert status.graph_status == "failed"
+        assert status.writer_lock_token is None
+        assert status.last_verified_at is None
+
+        with pytest.raises(Exception):
+            with psycopg.connect(database_url) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+UPDATE "{table_name}"
+SET graph_status = 'syncing'
+WHERE status_key = 'current'
+""",
+                    )
     finally:
         _drop_table(database_url, table_name)
 
@@ -98,7 +136,9 @@ def _begin_sync(database_url: str, table_name: str, barrier: Barrier) -> str:
     except RuntimeError as exc:
         assert "stale graph_status transition" in str(exc)
         return "stale"
-    return status.graph_status
+    assert status.graph_status == "ready"
+    assert status.writer_lock_token is not None
+    return "locked"
 
 
 def _mark_rebuilding(database_url: str, table_name: str, barrier: Barrier) -> str:
@@ -140,3 +180,58 @@ def _drop_table(database_url: str, table_name: str) -> None:
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+
+
+def _create_legacy_syncing_status_row(
+    psycopg: Any,
+    database_url: str,
+    table_name: str,
+) -> None:
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+            cursor.execute(
+                f"""
+CREATE TABLE "{table_name}" (
+    status_key text PRIMARY KEY,
+    graph_status text NOT NULL CHECK (
+        graph_status IN ('ready', 'rebuilding', 'failed', 'syncing')
+    ),
+    graph_generation_id bigint NOT NULL CHECK (graph_generation_id >= 0),
+    node_count bigint NOT NULL CHECK (node_count >= 0),
+    edge_count bigint NOT NULL CHECK (edge_count >= 0),
+    key_label_counts jsonb NOT NULL CHECK (jsonb_typeof(key_label_counts) = 'object'),
+    checksum text NOT NULL CHECK (checksum <> ''),
+    last_verified_at timestamptz NULL,
+    last_reload_at timestamptz NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+)
+""",
+            )
+            cursor.execute(
+                f"""
+INSERT INTO "{table_name}" (
+    status_key,
+    graph_status,
+    graph_generation_id,
+    node_count,
+    edge_count,
+    key_label_counts,
+    checksum,
+    last_verified_at,
+    last_reload_at
+)
+VALUES (
+    'current',
+    'syncing',
+    8,
+    2,
+    1,
+    '{{"Entity": 2}}'::jsonb,
+    'legacy-syncing',
+    %s,
+    NULL
+)
+""",
+                (NOW,),
+            )

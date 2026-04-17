@@ -13,6 +13,8 @@ from typing import Any, Protocol
 
 from graph_engine.models import Neo4jGraphStatus
 
+_GRAPH_STATUS_CHECK_CONSTRAINT = "neo4j_graph_status_graph_status_check"
+
 
 class StatusStore(Protocol):
     """Persistence boundary for the singleton Neo4j graph status row."""
@@ -107,7 +109,7 @@ class PostgreSQLStatusStore:
 CREATE TABLE IF NOT EXISTS {self._table_name} (
     status_key text PRIMARY KEY,
     graph_status text NOT NULL CHECK (
-        graph_status IN ('ready', 'syncing', 'rebuilding', 'failed')
+        graph_status IN ('ready', 'rebuilding', 'failed')
     ),
     graph_generation_id bigint NOT NULL CHECK (graph_generation_id >= 0),
     node_count bigint NOT NULL CHECK (node_count >= 0),
@@ -116,10 +118,23 @@ CREATE TABLE IF NOT EXISTS {self._table_name} (
     checksum text NOT NULL CHECK (checksum <> ''),
     last_verified_at timestamptz NULL,
     last_reload_at timestamptz NULL,
+    writer_lock_token text NULL CHECK (
+        writer_lock_token IS NULL OR writer_lock_token <> ''
+    ),
     updated_at timestamptz NOT NULL DEFAULT now()
 )
 """,
                     )
+                    cursor.execute(
+                        f"""
+ALTER TABLE {self._table_name}
+ADD COLUMN IF NOT EXISTS writer_lock_token text NULL CHECK (
+    writer_lock_token IS NULL OR writer_lock_token <> ''
+)
+""",
+                    )
+                    self._normalize_legacy_syncing_status(cursor)
+                    self._recreate_graph_status_check_constraint(cursor)
             self._bootstrapped = True
 
     def ensure_schema(self) -> None:
@@ -142,7 +157,8 @@ SELECT graph_status,
        key_label_counts,
        checksum,
        last_verified_at,
-       last_reload_at
+       last_reload_at,
+       writer_lock_token
 FROM {self._table_name}
 WHERE status_key = %s
 """,
@@ -171,9 +187,10 @@ INSERT INTO {self._table_name} (
     key_label_counts,
     checksum,
     last_verified_at,
-    last_reload_at
+    last_reload_at,
+    writer_lock_token
 )
-VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
 ON CONFLICT (status_key) DO UPDATE SET
     graph_status = EXCLUDED.graph_status,
     graph_generation_id = EXCLUDED.graph_generation_id,
@@ -183,6 +200,7 @@ ON CONFLICT (status_key) DO UPDATE SET
     checksum = EXCLUDED.checksum,
     last_verified_at = EXCLUDED.last_verified_at,
     last_reload_at = EXCLUDED.last_reload_at,
+    writer_lock_token = EXCLUDED.writer_lock_token,
     updated_at = now()
 """,
                     (self._status_key, *values),
@@ -215,6 +233,7 @@ SET graph_status = %s,
     checksum = %s,
     last_verified_at = %s,
     last_reload_at = %s,
+    writer_lock_token = %s,
     updated_at = now()
 WHERE status_key = %s
   AND graph_status = %s
@@ -225,6 +244,7 @@ WHERE status_key = %s
   AND checksum = %s
   AND last_verified_at IS NOT DISTINCT FROM %s
   AND last_reload_at IS NOT DISTINCT FROM %s
+  AND writer_lock_token IS NOT DISTINCT FROM %s
 RETURNING status_key
 """,
                     (*next_values, self._status_key, *expected_values),
@@ -245,9 +265,10 @@ INSERT INTO {self._table_name} (
     key_label_counts,
     checksum,
     last_verified_at,
-    last_reload_at
+    last_reload_at,
+    writer_lock_token
 )
-VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
 ON CONFLICT (status_key) DO NOTHING
 RETURNING status_key
 """,
@@ -258,6 +279,47 @@ RETURNING status_key
     def _ensure_bootstrap(self) -> None:
         if self._auto_bootstrap and not self._bootstrapped:
             self.bootstrap()
+
+    def _normalize_legacy_syncing_status(self, cursor: Any) -> None:
+        cursor.execute(
+            f"""
+UPDATE {self._table_name}
+SET graph_status = 'failed',
+    writer_lock_token = NULL,
+    last_verified_at = NULL,
+    checksum = CASE WHEN checksum = '' THEN 'failed' ELSE checksum END,
+    updated_at = now()
+WHERE graph_status = 'syncing'
+""",
+        )
+
+    def _recreate_graph_status_check_constraint(self, cursor: Any) -> None:
+        cursor.execute(
+            """
+SELECT conname
+FROM pg_constraint
+WHERE conrelid = %s::regclass
+  AND contype = 'c'
+  AND pg_get_constraintdef(oid) ILIKE '%%graph_status%%'
+""",
+            (self._table_name,),
+        )
+        constraint_names = [str(row[0]) for row in cursor.fetchall()]
+        for constraint_name in constraint_names:
+            cursor.execute(
+                f"""
+ALTER TABLE {self._table_name}
+DROP CONSTRAINT IF EXISTS {_quote_identifier(constraint_name)}
+""",
+            )
+
+        cursor.execute(
+            f"""
+ALTER TABLE {self._table_name}
+ADD CONSTRAINT {_quote_identifier(_GRAPH_STATUS_CHECK_CONSTRAINT)}
+CHECK (graph_status IN ('ready', 'rebuilding', 'failed'))
+""",
+        )
 
     @contextmanager
     def _transaction(self) -> Iterator[Any]:
@@ -300,6 +362,12 @@ def _quote_qualified_identifier(identifier: str) -> str:
     return ".".join(f'"{part}"' for part in parts)
 
 
+def _quote_identifier(identifier: str) -> str:
+    if _IDENTIFIER_RE.fullmatch(identifier) is None:
+        raise ValueError(f"invalid PostgreSQL identifier: {identifier!r}")
+    return f'"{identifier}"'
+
+
 def _status_write_values(status: Neo4jGraphStatus) -> tuple[Any, ...]:
     return (
         status.graph_status,
@@ -310,6 +378,7 @@ def _status_write_values(status: Neo4jGraphStatus) -> tuple[Any, ...]:
         status.checksum,
         status.last_verified_at,
         status.last_reload_at,
+        status.writer_lock_token,
     )
 
 
@@ -323,6 +392,7 @@ def _status_from_row(row: Any) -> Neo4jGraphStatus:
         checksum,
         last_verified_at,
         last_reload_at,
+        writer_lock_token,
     ) = row
     if isinstance(key_label_counts, str):
         key_label_counts = json.loads(key_label_counts)
@@ -336,4 +406,5 @@ def _status_from_row(row: Any) -> Neo4jGraphStatus:
         checksum=checksum,
         last_verified_at=last_verified_at,
         last_reload_at=last_reload_at,
+        writer_lock_token=writer_lock_token,
     )
