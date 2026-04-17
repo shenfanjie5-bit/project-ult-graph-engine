@@ -21,6 +21,7 @@ from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import SchemaManager
 from graph_engine.status import GraphStatusManager
 from graph_engine.sync import sync_live_graph
+from tests.fakes import InMemoryStatusStore
 
 pytestmark = pytest.mark.skipif(
     os.getenv("NEO4J_PASSWORD") is None,
@@ -56,28 +57,6 @@ class CapturingCanonicalWriter:
 
     def write_canonical_records(self, plan: PromotionPlan) -> None:
         self.plans.append(plan)
-
-
-class InMemoryStatusStore:
-    def __init__(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def read_current_status(self) -> Neo4jGraphStatus | None:
-        return self.status
-
-    def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def compare_and_write_current_status(
-        self,
-        *,
-        expected_status: Neo4jGraphStatus | None,
-        next_status: Neo4jGraphStatus,
-    ) -> bool:
-        if self.status != expected_status:
-            return False
-        self.write_current_status(next_status)
-        return True
 
 
 def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:

@@ -8,30 +8,9 @@ import pytest
 from graph_engine.models import Neo4jGraphStatus, ReadonlySimulationRequest
 from graph_engine.query import MAX_QUERY_DEPTH, query_subgraph, simulate_readonly_impact
 from graph_engine.status import GraphStatusManager
+from tests.fakes import InMemoryStatusStore
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
-
-
-class InMemoryStatusStore:
-    def __init__(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def read_current_status(self) -> Neo4jGraphStatus | None:
-        return self.status
-
-    def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def compare_and_write_current_status(
-        self,
-        *,
-        expected_status: Neo4jGraphStatus | None,
-        next_status: Neo4jGraphStatus,
-    ) -> bool:
-        if self.status != expected_status:
-            return False
-        self.write_current_status(next_status)
-        return True
 
 
 class FakeQueryClient:
@@ -90,8 +69,22 @@ def test_query_subgraph_blocks_non_ready_before_neo4j_reads(
 def test_query_subgraph_requires_status_manager_before_neo4j_reads() -> None:
     client = FakeQueryClient()
 
-    with pytest.raises(ValueError, match="status_manager"):
+    with pytest.raises(TypeError, match="status_manager"):
         query_subgraph(["entity-a"], 1, client=client)  # type: ignore[arg-type]
+
+    assert client.read_calls == []
+
+
+def test_query_subgraph_blocks_active_writer_lock_before_neo4j_reads() -> None:
+    client = FakeQueryClient()
+
+    with pytest.raises(PermissionError, match="writer lock"):
+        query_subgraph(
+            ["entity-a"],
+            1,
+            client=client,  # type: ignore[arg-type]
+            status_manager=_status_manager(writer_lock_token="incremental-sync"),
+        )
 
     assert client.read_calls == []
 
@@ -146,6 +139,20 @@ def test_simulate_readonly_impact_blocks_non_ready_before_neo4j_reads(
     assert client.read_calls == []
 
 
+def test_simulate_readonly_impact_blocks_active_writer_lock_before_neo4j_reads() -> None:
+    client = FakeQueryClient()
+
+    with pytest.raises(PermissionError, match="writer lock"):
+        simulate_readonly_impact(
+            ["entity-a"],
+            _simulation_request(),
+            client=client,  # type: ignore[arg-type]
+            status_manager=_status_manager(writer_lock_token="incremental-sync"),
+        )
+
+    assert client.read_calls == []
+
+
 def test_simulate_readonly_impact_reads_after_ready_gate() -> None:
     client = FakeQueryClient()
 
@@ -174,6 +181,7 @@ def _status_manager(
     *,
     graph_status: Literal["ready", "rebuilding", "failed"] = "ready",
     graph_generation_id: int = 1,
+    writer_lock_token: str | None = None,
 ) -> GraphStatusManager:
     return GraphStatusManager(
         InMemoryStatusStore(
@@ -186,6 +194,7 @@ def _status_manager(
                 checksum="abc123" if graph_status == "ready" else graph_status,
                 last_verified_at=NOW if graph_status == "ready" else None,
                 last_reload_at=None,
+                writer_lock_token=writer_lock_token,
             )
         )
     )

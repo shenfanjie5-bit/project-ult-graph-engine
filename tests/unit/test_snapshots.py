@@ -202,6 +202,23 @@ def test_build_graph_snapshot_blocks_non_ready_before_reading() -> None:
     client.execute_read.assert_not_called()
 
 
+def test_build_graph_snapshot_blocks_active_writer_lock_before_reading() -> None:
+    client = MagicMock()
+    status_manager, _ = _status_manager(
+        _ready_status(writer_lock_token="incremental-sync"),
+    )
+
+    with pytest.raises(PermissionError, match="writer lock"):
+        build_graph_snapshot(
+            "cycle-1",
+            1,
+            client,
+            status_manager=status_manager,
+        )
+
+    client.execute_read.assert_not_called()
+
+
 def test_build_graph_impact_snapshot_preserves_propagation_payload() -> None:
     propagation_result = _propagation_result()
 
@@ -222,7 +239,7 @@ def test_compute_graph_snapshots_requires_status_source_without_side_effects() -
     reader = StaticRegimeReader()
     writer = RecordingSnapshotWriter()
 
-    with pytest.raises(ValueError, match="status_manager"):
+    with pytest.raises(TypeError, match="status_manager"):
         compute_graph_snapshots(
             "cycle-1",
             "world-state-1",
@@ -253,6 +270,31 @@ def test_compute_graph_snapshots_rejects_non_ready_status_without_side_effects()
     )
 
     with pytest.raises(PermissionError, match="ready"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=client,
+            graph_generation_id=1,
+            regime_reader=reader,
+            snapshot_writer=writer,
+            status_manager=status_manager,
+        )
+
+    assert reader.calls == []
+    assert writer.calls == []
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_not_called()
+
+
+def test_compute_graph_snapshots_rejects_active_writer_lock_without_side_effects() -> None:
+    client = MagicMock()
+    reader = StaticRegimeReader()
+    writer = RecordingSnapshotWriter()
+    status_manager, _ = _status_manager(
+        _ready_status(writer_lock_token="incremental-sync"),
+    )
+
+    with pytest.raises(PermissionError, match="writer lock"):
         compute_graph_snapshots(
             "cycle-1",
             "world-state-1",
@@ -605,6 +647,7 @@ def _ready_status(
     edge_count: int = 1,
     key_label_counts: dict[str, int] | None = None,
     checksum: str = "abc123",
+    writer_lock_token: str | None = None,
 ) -> Neo4jGraphStatus:
     return Neo4jGraphStatus(
         graph_status=graph_status,
@@ -615,6 +658,7 @@ def _ready_status(
         checksum=checksum,
         last_verified_at=NOW,
         last_reload_at=None,
+        writer_lock_token=writer_lock_token,
     )
 
 

@@ -19,6 +19,8 @@ def require_ready_status(graph_status: Neo4jGraphStatus) -> Neo4jGraphStatus:
             "Neo4j live graph reads require graph_status='ready'; "
             f"received {graph_status.graph_status!r}",
         )
+    if graph_status.writer_lock_token is not None:
+        raise PermissionError("Neo4j live graph reads require no active writer lock")
     return graph_status
 
 

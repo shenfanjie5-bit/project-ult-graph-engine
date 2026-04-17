@@ -16,7 +16,7 @@ def query_subgraph(
     depth: int,
     *,
     client: Neo4jClient,
-    status_manager: GraphStatusManager | None = None,
+    status_manager: GraphStatusManager,
 ) -> dict[str, Any]:
     """Return a bounded live subgraph after verifying the graph is ready."""
 
@@ -29,7 +29,7 @@ def simulate_readonly_impact(
     context: ReadonlySimulationRequest,
     *,
     client: Neo4jClient,
-    status_manager: GraphStatusManager | None = None,
+    status_manager: GraphStatusManager,
 ) -> dict[str, Any]:
     """Run a read-only local impact simulation without modifying live graph state."""
 

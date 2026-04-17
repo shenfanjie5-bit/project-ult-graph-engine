@@ -22,6 +22,7 @@ from graph_engine.schema.manager import SchemaManager
 from graph_engine.snapshots import build_graph_snapshot, compute_graph_snapshots
 from graph_engine.status import GraphStatusManager
 from graph_engine.sync import sync_live_graph
+from tests.fakes import InMemoryStatusStore
 
 pytestmark = pytest.mark.skipif(
     os.getenv("NEO4J_PASSWORD") is None,
@@ -51,28 +52,6 @@ class CapturingSnapshotWriter:
         impact_snapshot: GraphImpactSnapshot,
     ) -> None:
         self.calls.append((graph_snapshot, impact_snapshot))
-
-
-class InMemoryStatusStore:
-    def __init__(self, graph_status: Neo4jGraphStatus) -> None:
-        self.graph_status = graph_status
-
-    def read_current_status(self) -> Neo4jGraphStatus | None:
-        return self.graph_status
-
-    def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        self.graph_status = status
-
-    def compare_and_write_current_status(
-        self,
-        *,
-        expected_status: Neo4jGraphStatus | None,
-        next_status: Neo4jGraphStatus,
-    ) -> bool:
-        if self.graph_status != expected_status:
-            return False
-        self.write_current_status(next_status)
-        return True
 
 
 def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -> None:

@@ -14,6 +14,7 @@ from graph_engine.propagation import (
     run_fundamental_propagation,
 )
 from graph_engine.status import GraphStatusManager
+from tests.fakes import InMemoryStatusStore
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 
@@ -131,28 +132,6 @@ class FakeGDSClient:
     ) -> list[dict[str, Any]]:
         self.write_calls.append((query, parameters or {}))
         return []
-
-
-class InMemoryStatusStore:
-    def __init__(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def read_current_status(self) -> Neo4jGraphStatus | None:
-        return self.status
-
-    def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def compare_and_write_current_status(
-        self,
-        *,
-        expected_status: Neo4jGraphStatus | None,
-        next_status: Neo4jGraphStatus,
-    ) -> bool:
-        if self.status != expected_status:
-            return False
-        self.write_current_status(next_status)
-        return True
 
 
 def test_compute_path_score_uses_documented_multiplication() -> None:
@@ -283,10 +262,25 @@ def test_run_fundamental_propagation_blocks_non_ready_before_neo4j_reads() -> No
     assert client.write_calls == []
 
 
+def test_run_fundamental_propagation_blocks_active_writer_lock_before_neo4j_reads() -> None:
+    client = FakeGDSClient()
+
+    with pytest.raises(PermissionError, match="writer lock"):
+        run_fundamental_propagation(
+            _context(),
+            client,  # type: ignore[arg-type]
+            status_manager=_status_manager(writer_lock_token="incremental-sync"),
+            graph_name="unit-fundamental",
+        )
+
+    assert client.read_calls == []
+    assert client.write_calls == []
+
+
 def test_run_fundamental_propagation_requires_status_manager_before_neo4j_reads() -> None:
     client = FakeGDSClient()
 
-    with pytest.raises(ValueError, match="status_manager"):
+    with pytest.raises(TypeError, match="status_manager"):
         run_fundamental_propagation(
             _context(),
             client,  # type: ignore[arg-type]
@@ -478,6 +472,7 @@ def _status_manager(
     *,
     graph_status: str = "ready",
     graph_generation_id: int = 1,
+    writer_lock_token: str | None = None,
 ) -> GraphStatusManager:
     return GraphStatusManager(
         InMemoryStatusStore(
@@ -490,6 +485,7 @@ def _status_manager(
                 checksum="abc123" if graph_status == "ready" else graph_status,
                 last_verified_at=NOW if graph_status == "ready" else None,
                 last_reload_at=None,
+                writer_lock_token=writer_lock_token,
             ),
         ),
     )

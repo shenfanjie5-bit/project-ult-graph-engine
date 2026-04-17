@@ -25,7 +25,7 @@ def run_fundamental_propagation(
     context: PropagationContext,
     client: Neo4jClient,
     *,
-    status_manager: GraphStatusManager | None = None,
+    status_manager: GraphStatusManager,
     graph_name: str | None = None,
     max_iterations: int = 20,
     result_limit: int = 100,

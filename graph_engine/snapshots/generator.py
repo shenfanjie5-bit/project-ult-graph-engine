@@ -26,7 +26,7 @@ def build_graph_snapshot(
     graph_generation_id: int,
     client: Neo4jClient,
     *,
-    status_manager: GraphStatusManager | None = None,
+    status_manager: GraphStatusManager,
 ) -> GraphSnapshot:
     """Read live graph metrics and return a deterministic structural snapshot."""
 
@@ -77,7 +77,7 @@ def compute_graph_snapshots(
     graph_generation_id: int | None = None,
     regime_reader: RegimeContextReader,
     snapshot_writer: SnapshotWriter,
-    status_manager: GraphStatusManager | None = None,
+    status_manager: GraphStatusManager,
     graph_name: str | None = None,
 ) -> tuple[GraphSnapshot, GraphImpactSnapshot]:
     """Run fundamental propagation and write graph plus impact snapshots."""

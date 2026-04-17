@@ -12,6 +12,7 @@ from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
 from graph_engine.schema.manager import SchemaManager
 from graph_engine.snapshots import build_graph_snapshot
 from graph_engine.status import GraphStatusManager, check_live_graph_consistency
+from tests.fakes import InMemoryStatusStore
 
 pytestmark = pytest.mark.skipif(
     os.getenv("NEO4J_PASSWORD") is None,
@@ -19,28 +20,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
-
-
-class InMemoryStatusStore:
-    def __init__(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def read_current_status(self) -> Neo4jGraphStatus | None:
-        return self.status
-
-    def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def compare_and_write_current_status(
-        self,
-        *,
-        expected_status: Neo4jGraphStatus | None,
-        next_status: Neo4jGraphStatus,
-    ) -> bool:
-        if self.status != expected_status:
-            return False
-        self.write_current_status(next_status)
-        return True
 
 
 class StaticSnapshotReader:
