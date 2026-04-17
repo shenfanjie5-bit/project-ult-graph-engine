@@ -261,18 +261,6 @@ class GraphStatusManager:
             )
 
 
-def require_ready_read(
-    status_manager: GraphStatusManager | None,
-    operation: str,
-) -> Neo4jGraphStatus:
-    """Return the ready status required before a public Neo4j read operation."""
-
-    if status_manager is None:
-        raise ValueError(f"{operation} requires status_manager")
-    with status_manager.ready_read() as ready_status:
-        return ready_status
-
-
 @contextmanager
 def hold_ready_read(
     status_manager: GraphStatusManager | None,

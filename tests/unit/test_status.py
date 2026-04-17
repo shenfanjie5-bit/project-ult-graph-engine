@@ -9,10 +9,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import graph_engine
+import graph_engine.status as status_module
 from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
 from graph_engine.status import (
     GraphStatusManager,
     check_live_graph_consistency,
+    hold_ready_read,
     require_ready_status,
 )
 from graph_engine.status.consistency import _read_live_graph_metrics
@@ -438,6 +441,64 @@ def test_ready_read_lock_blocks_writes_across_distinct_store_instances() -> None
     assert ready_status == _status(graph_generation_id=8)
     assert locked_status.writer_lock_token == "incremental-sync"
     assert reader_store.status == locked_status
+
+
+def test_hold_ready_read_keeps_writer_blocked_until_live_read_body_exits() -> None:
+    shared_state = InMemoryStatusState(_status(graph_generation_id=8))
+    reader_store = InMemoryStatusStore(state=shared_state)
+    read_started = Event()
+    writer_started = Event()
+    release_read = Event()
+
+    class BlockingLiveGraphClient:
+        def execute_read(self) -> list[dict[str, bool]]:
+            read_started.set()
+            release_read.wait(timeout=5)
+            return [{"ok": True}]
+
+    class ObservedWriterStore(InMemoryStatusStore):
+        def compare_and_write_current_status(
+            self,
+            *,
+            expected_status: Neo4jGraphStatus | None,
+            next_status: Neo4jGraphStatus,
+        ) -> bool:
+            writer_started.set()
+            return super().compare_and_write_current_status(
+                expected_status=expected_status,
+                next_status=next_status,
+            )
+
+    writer_store = ObservedWriterStore(state=shared_state)
+    reader_manager = GraphStatusManager(reader_store, clock=lambda: NOW)
+    writer_manager = GraphStatusManager(writer_store, clock=lambda: NOW)
+    client = BlockingLiveGraphClient()
+
+    def read_live_graph() -> list[dict[str, bool]]:
+        with hold_ready_read(reader_manager, "unit-test live graph read"):
+            return client.execute_read()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reader_future = executor.submit(read_live_graph)
+        assert read_started.wait(timeout=5)
+        writer_future = executor.submit(writer_manager.begin_sync)
+        assert writer_started.wait(timeout=5)
+        assert not writer_future.done()
+
+        release_read.set()
+        assert reader_future.result(timeout=5) == [{"ok": True}]
+        ready_status, locked_status = writer_future.result(timeout=5)
+
+    assert ready_status == _status(graph_generation_id=8)
+    assert locked_status.writer_lock_token == "incremental-sync"
+    assert reader_store.status == locked_status
+
+
+def test_legacy_require_ready_read_is_not_publicly_exported() -> None:
+    assert "require_ready_read" not in status_module.__all__
+    assert not hasattr(status_module, "require_ready_read")
+    assert "require_ready_read" not in graph_engine.__all__
+    assert not hasattr(graph_engine, "require_ready_read")
 
 
 def test_mark_verified_updates_metrics_without_bumping_generation() -> None:

@@ -38,7 +38,6 @@ from graph_engine.status import (
     StatusStore,
     check_live_graph_consistency,
     hold_ready_read,
-    require_ready_read,
     require_ready_status,
 )
 
@@ -78,7 +77,6 @@ __all__ = [
     "load_config_from_env",
     "query_subgraph",
     "rebuild_gds_projection",
-    "require_ready_read",
     "require_ready_status",
     "simulate_readonly_impact",
 ]

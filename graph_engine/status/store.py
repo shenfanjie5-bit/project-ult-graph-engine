@@ -45,11 +45,12 @@ class PostgreSQLStatusStore:
     PostgreSQL ``READ COMMITTED`` isolation or stronger: compare-and-set writes
     are a single ``UPDATE ... WHERE`` statement, so PostgreSQL locks the row and
     rechecks the expected fields after any competing transaction commits.  Ready
-    reads hold a shared advisory lock, and status writes take the matching
-    exclusive advisory lock so distinct store instances backed by the same row
-    share the same read/write barrier.  Empty store bootstrap uses the singleton
-    primary key with ``ON CONFLICT DO NOTHING`` so only one process can create
-    the first status row.
+    reads hold a shared advisory lock on a dedicated connection for the duration
+    of the read body, and status writes take the matching exclusive advisory lock
+    so distinct store instances backed by the same row share the same read/write
+    barrier.  Empty store bootstrap uses the singleton primary key with
+    ``ON CONFLICT DO NOTHING`` so only one process can create the first status
+    row.
     """
 
     def __init__(
@@ -79,7 +80,6 @@ class PostgreSQLStatusStore:
         self._connection_factory = connection_factory
         self._table_name = _quote_qualified_identifier(table_name)
         self._status_key = status_key
-        self._advisory_lock_key = _advisory_lock_key(table_name, status_key)
         self._auto_bootstrap = auto_bootstrap
         self._bootstrapped = False
         self._bootstrap_lock = Lock()
@@ -184,11 +184,13 @@ WHERE status_key = %s
         self._ensure_bootstrap()
         connection = self._connection_factory()
         locked = False
+        lock_key: int | None = None
         try:
             with connection.cursor() as cursor:
+                lock_key = self._resolve_advisory_lock_key(cursor)
                 cursor.execute(
                     "SELECT pg_advisory_lock_shared(%s)",
-                    (self._advisory_lock_key,),
+                    (lock_key,),
                 )
                 locked = True
             connection.commit()
@@ -198,11 +200,12 @@ WHERE status_key = %s
             raise
         finally:
             if locked:
+                assert lock_key is not None
                 try:
                     with connection.cursor() as cursor:
                         cursor.execute(
                             "SELECT pg_advisory_unlock_shared(%s)",
-                            (self._advisory_lock_key,),
+                            (lock_key,),
                         )
                     connection.commit()
                 except Exception:
@@ -324,10 +327,18 @@ RETURNING status_key
                 return cursor.fetchone() is not None
 
     def _acquire_exclusive_status_lock(self, cursor: Any) -> None:
+        lock_key = self._resolve_advisory_lock_key(cursor)
         cursor.execute(
             "SELECT pg_advisory_xact_lock(%s)",
-            (self._advisory_lock_key,),
+            (lock_key,),
         )
+
+    def _resolve_advisory_lock_key(self, cursor: Any) -> int:
+        cursor.execute("SELECT %s::regclass::oid", (self._table_name,))
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL did not return a status table OID")
+        return _advisory_lock_key(int(row[0]), self._status_key)
 
     def _ensure_bootstrap(self) -> None:
         if self._auto_bootstrap and not self._bootstrapped:
@@ -421,8 +432,8 @@ def _quote_identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
-def _advisory_lock_key(table_name: str, status_key: str) -> int:
-    lock_name = f"{table_name}\0{status_key}".encode()
+def _advisory_lock_key(relation_oid: int, status_key: str) -> int:
+    lock_name = f"{relation_oid}\0{status_key}".encode()
     digest = hashlib.blake2b(
         lock_name,
         digest_size=8,
