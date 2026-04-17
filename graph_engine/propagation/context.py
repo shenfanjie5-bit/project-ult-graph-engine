@@ -34,7 +34,9 @@ def build_propagation_context(
             f"received {graph_status.graph_status!r}",
         )
 
-    requested_channels = list(enabled_channels or _DEFAULT_ENABLED_CHANNELS)
+    requested_channels = list(
+        _DEFAULT_ENABLED_CHANNELS if enabled_channels is None else enabled_channels
+    )
     regime_context = dict(regime_reader.read_regime_context(world_state_ref))
     return PropagationContext(
         cycle_id=cycle_id,

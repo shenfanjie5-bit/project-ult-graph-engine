@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timezone
+from typing import Any
 
 from graph_engine.client import Neo4jClient
 from graph_engine.live_metrics import (
@@ -13,12 +15,19 @@ from graph_engine.models import (
     GraphImpactSnapshot,
     GraphSnapshot,
     Neo4jGraphStatus,
+    PropagationChannel,
     PropagationResult,
 )
 from graph_engine.propagation.context import RegimeContextReader, build_propagation_context
-from graph_engine.propagation.fundamental import run_fundamental_propagation
+from graph_engine.propagation.pipeline import run_full_propagation
 from graph_engine.snapshots.writer import SnapshotWriter
-from graph_engine.status import GraphStatusManager, require_ready_read
+from graph_engine.status import GraphStatusManager, require_ready_read, require_ready_status
+
+_DEFAULT_SNAPSHOT_CHANNELS: tuple[PropagationChannel, ...] = (
+    "fundamental",
+    "event",
+    "reflexive",
+)
 
 
 def build_graph_snapshot(
@@ -50,13 +59,14 @@ def build_graph_impact_snapshot(
 ) -> GraphImpactSnapshot:
     """Build the downstream impact snapshot from a propagation result."""
 
+    channel_breakdown = _complete_channel_breakdown(propagation_result.channel_breakdown)
     payload = {
         "cycle_id": cycle_id,
         "graph_generation_id": propagation_result.graph_generation_id,
         "world_state_ref": world_state_ref,
         "activated_paths": propagation_result.activated_paths,
         "impacted_entities": propagation_result.impacted_entities,
-        "channel_breakdown": propagation_result.channel_breakdown,
+        "channel_breakdown": channel_breakdown,
     }
     impact_hash = _checksum_payload(payload)
     return GraphImpactSnapshot(
@@ -65,7 +75,7 @@ def build_graph_impact_snapshot(
         regime_context_ref=world_state_ref,
         activated_paths=propagation_result.activated_paths,
         impacted_entities=propagation_result.impacted_entities,
-        channel_breakdown=propagation_result.channel_breakdown,
+        channel_breakdown=channel_breakdown,
     )
 
 
@@ -77,42 +87,53 @@ def compute_graph_snapshots(
     graph_generation_id: int | None = None,
     regime_reader: RegimeContextReader,
     snapshot_writer: SnapshotWriter,
-    status_manager: GraphStatusManager,
+    status_manager: GraphStatusManager | None = None,
+    graph_status: Neo4jGraphStatus | None = None,
     graph_name: str | None = None,
+    enabled_channels: Sequence[PropagationChannel] | None = None,
+    max_iterations: int = 20,
+    result_limit: int = 100,
 ) -> tuple[GraphSnapshot, GraphImpactSnapshot]:
-    """Run fundamental propagation and write graph plus impact snapshots."""
+    """Run full propagation and write graph plus impact snapshots."""
 
-    ready_status = require_ready_read(status_manager, "snapshot generation")
-    _validate_generation_input(graph_generation_id, ready_status)
-    node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
-    _validate_status_metrics(
-        ready_status,
-        node_count=node_count,
-        edge_count=edge_count,
-        key_label_counts=key_label_counts,
-        checksum=checksum,
+    ready_status = _resolve_ready_status(
+        status_manager=status_manager,
+        graph_status=graph_status,
+        operation="snapshot generation",
     )
-
+    _validate_generation_input(graph_generation_id, ready_status)
+    read_status_manager = status_manager or _static_status_manager(ready_status)
+    requested_channels = list(
+        _DEFAULT_SNAPSHOT_CHANNELS if enabled_channels is None else enabled_channels
+    )
     context = build_propagation_context(
         cycle_id,
         world_state_ref,
         ready_status.graph_generation_id,
         regime_reader=regime_reader,
         graph_status=ready_status,
+        enabled_channels=requested_channels,
     )
-    propagation_result = run_fundamental_propagation(
+    propagation_result = run_full_propagation(
         context,
         client,
-        status_manager=status_manager,
+        status_manager=read_status_manager,
         graph_name=graph_name,
+        max_iterations=max_iterations,
+        result_limit=result_limit,
     )
-    graph_snapshot = _graph_snapshot_from_metrics(
+    graph_snapshot = build_graph_snapshot(
         cycle_id,
         ready_status.graph_generation_id,
-        node_count=node_count,
-        edge_count=edge_count,
-        key_label_counts=key_label_counts,
-        checksum=checksum,
+        client,
+        status_manager=read_status_manager,
+    )
+    _validate_status_metrics(
+        ready_status,
+        node_count=graph_snapshot.node_count,
+        edge_count=graph_snapshot.edge_count,
+        key_label_counts=graph_snapshot.key_label_counts,
+        checksum=graph_snapshot.checksum,
     )
     impact_snapshot = build_graph_impact_snapshot(
         cycle_id,
@@ -121,7 +142,7 @@ def compute_graph_snapshots(
     )
     _validate_publication_status_and_metrics(
         ready_status,
-        status_manager,
+        read_status_manager,
         client,
     )
     snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
@@ -140,6 +161,57 @@ def _validate_generation_input(
             f"received {graph_generation_id}, "
             f"status has {graph_status.graph_generation_id}",
         )
+
+
+def _complete_channel_breakdown(channel_breakdown: dict[str, Any]) -> dict[str, Any]:
+    completed: dict[str, Any] = {
+        channel: channel_breakdown.get(channel, {})
+        for channel in _DEFAULT_SNAPSHOT_CHANNELS
+    }
+    for key, value in channel_breakdown.items():
+        if key not in completed and key != "merged":
+            completed[key] = value
+    completed["merged"] = channel_breakdown.get("merged", {})
+    return completed
+
+
+def _resolve_ready_status(
+    *,
+    status_manager: GraphStatusManager | None,
+    graph_status: Neo4jGraphStatus | None,
+    operation: str,
+) -> Neo4jGraphStatus:
+    if status_manager is not None:
+        return require_ready_read(status_manager, operation)
+    if graph_status is not None:
+        return require_ready_status(graph_status)
+    raise TypeError(f"{operation} requires status_manager or graph_status")
+
+
+def _static_status_manager(graph_status: Neo4jGraphStatus) -> GraphStatusManager:
+    return GraphStatusManager(_StaticStatusStore(graph_status))
+
+
+class _StaticStatusStore:
+    def __init__(self, graph_status: Neo4jGraphStatus) -> None:
+        self.graph_status = graph_status
+
+    def read_current_status(self) -> Neo4jGraphStatus:
+        return self.graph_status
+
+    def write_current_status(self, status: Neo4jGraphStatus) -> None:
+        self.graph_status = status
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        if self.graph_status != expected_status:
+            return False
+        self.graph_status = next_status
+        return True
 
 
 def _validate_status_metrics(
@@ -249,4 +321,4 @@ def _graph_snapshot_from_metrics(
 
 
 def _read_graph_metrics(client: Neo4jClient) -> tuple[int, int, dict[str, int], str]:
-    return read_live_graph_metrics(client, strict=False)
+    return read_live_graph_metrics(client, strict=True)
