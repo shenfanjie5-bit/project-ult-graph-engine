@@ -6,7 +6,7 @@ from typing import Any
 
 from graph_engine.client import Neo4jClient
 from graph_engine.models import ReadonlySimulationRequest
-from graph_engine.status import GraphStatusManager, require_ready_read
+from graph_engine.status import GraphStatusManager, hold_ready_read
 
 MAX_QUERY_DEPTH = 10
 
@@ -20,8 +20,8 @@ def query_subgraph(
 ) -> dict[str, Any]:
     """Return a bounded live subgraph after verifying the graph is ready."""
 
-    require_ready_read(status_manager, "subgraph query")
-    return _query_subgraph_after_ready(seed_entities, depth, client=client)
+    with hold_ready_read(status_manager, "subgraph query"):
+        return _query_subgraph_after_ready(seed_entities, depth, client=client)
 
 
 def simulate_readonly_impact(
@@ -33,36 +33,36 @@ def simulate_readonly_impact(
 ) -> dict[str, Any]:
     """Run a read-only local impact simulation without modifying live graph state."""
 
-    ready_status = require_ready_read(status_manager, "readonly impact simulation")
-    if ready_status.graph_generation_id != context.graph_generation_id:
-        raise ValueError(
-            "ReadonlySimulationRequest graph_generation_id disagrees with Neo4jGraphStatus: "
-            f"context={context.graph_generation_id}, "
-            f"status={ready_status.graph_generation_id}",
-        )
+    with hold_ready_read(status_manager, "readonly impact simulation") as ready_status:
+        if ready_status.graph_generation_id != context.graph_generation_id:
+            raise ValueError(
+                "ReadonlySimulationRequest graph_generation_id disagrees with Neo4jGraphStatus: "
+                f"context={context.graph_generation_id}, "
+                f"status={ready_status.graph_generation_id}",
+            )
 
-    subgraph = _query_subgraph_after_ready(seed_entities, context.depth, client=client)
-    impacted_entities = _impacted_entities_from_subgraph(
-        subgraph,
-        set(seed_entities),
-        result_limit=context.result_limit,
-    )
-    return {
-        "cycle_id": context.cycle_id,
-        "world_state_ref": context.world_state_ref,
-        "graph_generation_id": ready_status.graph_generation_id,
-        "seed_entities": list(seed_entities),
-        "subgraph": subgraph,
-        "impacted_entities": impacted_entities,
-        "activated_paths": list(subgraph["relationships"]),
-        "channel_breakdown": {
-            "readonly": {
-                "depth": subgraph["depth"],
-                "node_count": len(subgraph["nodes"]),
-                "edge_count": len(subgraph["relationships"]),
+        subgraph = _query_subgraph_after_ready(seed_entities, context.depth, client=client)
+        impacted_entities = _impacted_entities_from_subgraph(
+            subgraph,
+            set(seed_entities),
+            result_limit=context.result_limit,
+        )
+        return {
+            "cycle_id": context.cycle_id,
+            "world_state_ref": context.world_state_ref,
+            "graph_generation_id": ready_status.graph_generation_id,
+            "seed_entities": list(seed_entities),
+            "subgraph": subgraph,
+            "impacted_entities": impacted_entities,
+            "activated_paths": list(subgraph["relationships"]),
+            "channel_breakdown": {
+                "readonly": {
+                    "depth": subgraph["depth"],
+                    "node_count": len(subgraph["nodes"]),
+                    "edge_count": len(subgraph["relationships"]),
+                },
             },
-        },
-    }
+        }
 
 
 def _query_subgraph_after_ready(

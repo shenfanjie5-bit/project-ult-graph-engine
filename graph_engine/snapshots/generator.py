@@ -21,7 +21,7 @@ from graph_engine.models import (
 from graph_engine.propagation.context import RegimeContextReader, build_propagation_context
 from graph_engine.propagation.pipeline import run_full_propagation
 from graph_engine.snapshots.writer import SnapshotWriter
-from graph_engine.status import GraphStatusManager, require_ready_read, require_ready_status
+from graph_engine.status import GraphStatusManager, hold_ready_read, require_ready_status
 
 _DEFAULT_SNAPSHOT_CHANNELS: tuple[PropagationChannel, ...] = (
     "fundamental",
@@ -39,17 +39,17 @@ def build_graph_snapshot(
 ) -> GraphSnapshot:
     """Read live graph metrics and return a deterministic structural snapshot."""
 
-    ready_status = require_ready_read(status_manager, "graph snapshot generation")
-    _validate_generation_input(graph_generation_id, ready_status)
-    node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
-    return _graph_snapshot_from_metrics(
-        cycle_id,
-        graph_generation_id,
-        node_count=node_count,
-        edge_count=edge_count,
-        key_label_counts=key_label_counts,
-        checksum=checksum,
-    )
+    with hold_ready_read(status_manager, "graph snapshot generation") as ready_status:
+        _validate_generation_input(graph_generation_id, ready_status)
+        node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
+        return _graph_snapshot_from_metrics(
+            cycle_id,
+            graph_generation_id,
+            node_count=node_count,
+            edge_count=edge_count,
+            key_label_counts=key_label_counts,
+            checksum=checksum,
+        )
 
 
 def build_graph_impact_snapshot(
@@ -96,57 +96,56 @@ def compute_graph_snapshots(
 ) -> tuple[GraphSnapshot, GraphImpactSnapshot]:
     """Run full propagation and write graph plus impact snapshots."""
 
-    ready_status = _resolve_ready_status(
-        status_manager=status_manager,
-        graph_status=graph_status,
-        operation="snapshot generation",
-    )
-    _validate_generation_input(graph_generation_id, ready_status)
-    _validate_pre_propagation_status_and_metrics(ready_status, client)
-    requested_channels = list(
-        _DEFAULT_SNAPSHOT_CHANNELS if enabled_channels is None else enabled_channels
-    )
-    context = build_propagation_context(
-        cycle_id,
-        world_state_ref,
-        ready_status.graph_generation_id,
-        regime_reader=regime_reader,
-        graph_status=ready_status,
-        enabled_channels=requested_channels,
-    )
-    propagation_result = run_full_propagation(
-        context,
-        client,
-        status_manager=status_manager,
-        graph_name=graph_name,
-        max_iterations=max_iterations,
-        result_limit=result_limit,
-    )
-    graph_snapshot = build_graph_snapshot(
-        cycle_id,
-        ready_status.graph_generation_id,
-        client,
-        status_manager=status_manager,
-    )
-    _validate_status_metrics(
-        ready_status,
-        node_count=graph_snapshot.node_count,
-        edge_count=graph_snapshot.edge_count,
-        key_label_counts=graph_snapshot.key_label_counts,
-        checksum=graph_snapshot.checksum,
-    )
-    impact_snapshot = build_graph_impact_snapshot(
-        cycle_id,
-        world_state_ref,
-        propagation_result,
-    )
-    _validate_publication_status_and_metrics(
-        ready_status,
-        status_manager,
-        client,
-    )
-    snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
-    return graph_snapshot, impact_snapshot
+    with hold_ready_read(status_manager, "snapshot generation") as ready_status:
+        if graph_status is not None:
+            require_ready_status(graph_status)
+            _validate_status_matches_ready_status(ready_status, graph_status)
+        _validate_generation_input(graph_generation_id, ready_status)
+        _validate_pre_propagation_status_and_metrics(ready_status, client)
+        requested_channels = list(
+            _DEFAULT_SNAPSHOT_CHANNELS if enabled_channels is None else enabled_channels
+        )
+        context = build_propagation_context(
+            cycle_id,
+            world_state_ref,
+            ready_status.graph_generation_id,
+            regime_reader=regime_reader,
+            graph_status=ready_status,
+            enabled_channels=requested_channels,
+        )
+        propagation_result = run_full_propagation(
+            context,
+            client,
+            status_manager=status_manager,
+            graph_name=graph_name,
+            max_iterations=max_iterations,
+            result_limit=result_limit,
+        )
+        graph_snapshot = build_graph_snapshot(
+            cycle_id,
+            ready_status.graph_generation_id,
+            client,
+            status_manager=status_manager,
+        )
+        _validate_status_metrics(
+            ready_status,
+            node_count=graph_snapshot.node_count,
+            edge_count=graph_snapshot.edge_count,
+            key_label_counts=graph_snapshot.key_label_counts,
+            checksum=graph_snapshot.checksum,
+        )
+        impact_snapshot = build_graph_impact_snapshot(
+            cycle_id,
+            world_state_ref,
+            propagation_result,
+        )
+        _validate_publication_status_and_metrics(
+            ready_status,
+            status_manager,
+            client,
+        )
+        snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
+        return graph_snapshot, impact_snapshot
 
 
 def _validate_generation_input(
@@ -173,21 +172,6 @@ def _complete_channel_breakdown(channel_breakdown: dict[str, Any]) -> dict[str, 
             completed[key] = value
     completed["merged"] = channel_breakdown.get("merged", {})
     return completed
-
-
-def _resolve_ready_status(
-    *,
-    status_manager: GraphStatusManager | None,
-    graph_status: Neo4jGraphStatus | None,
-    operation: str,
-) -> Neo4jGraphStatus:
-    if status_manager is None:
-        raise TypeError(f"{operation} requires status_manager")
-    ready_status = require_ready_read(status_manager, operation)
-    if graph_status is not None:
-        require_ready_status(graph_status)
-        _validate_status_matches_ready_status(ready_status, graph_status)
-    return ready_status
 
 
 def _validate_pre_propagation_status_and_metrics(
@@ -243,7 +227,7 @@ def _validate_publication_status_and_metrics(
     client: Neo4jClient,
 ) -> None:
     try:
-        current_status = require_ready_read(status_manager, "snapshot publication")
+        current_status = require_ready_status(status_manager.get_status())
     except PermissionError as exc:
         raise RuntimeError("ready graph status changed before snapshot publication") from exc
     _validate_status_matches_ready_status(current_status, ready_status)
