@@ -47,10 +47,14 @@ class FakeSimulationClient:
         params = parameters or {}
         self.read_calls.append((query, params))
         assert _LIVE_MUTATION_PATTERN.search(query) is None
+        assert "[*" not in query
+        assert "collect(path)" not in query
         if self.missing_gds and "gds." in query:
             raise RuntimeError("There is no procedure with name `gds.graph.exists` registered")
-        if "RETURN nodes, relationships" in query:
-            return [{"nodes": self.nodes, "relationships": self.edges}]
+        if "RETURN node_key," in query:
+            return self._seed_rows(params)
+        if "RETURN relationship_key," in query:
+            return self._frontier_rows(params)
         if "gds.graph.exists" in query:
             return [{"exists": self.projections.get(str(params.get("graph_name")), False)}]
         if "gds.pageRank.stream" in query:
@@ -106,6 +110,58 @@ class FakeSimulationClient:
             }
             for edge in rows
         ]
+
+    def _seed_rows(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        seed_entities = set(params.get("seed_entities", []))
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for node in self.nodes:
+            node_key = _node_key(node)
+            if node_key in seen:
+                continue
+            if node.get("canonical_entity_id") in seed_entities or node.get("node_id") in seed_entities:
+                seen.add(node_key)
+                rows.append({"node_key": node_key, "node": node})
+        rows.sort(key=lambda row: str(row["node_key"]))
+        return rows[: int(params.get("per_depth_limit", len(rows)))]
+
+    def _frontier_rows(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        frontier = set(params.get("frontier_node_keys", []))
+        visited_relationships = set(params.get("visited_relationship_keys", []))
+        nodes_by_id = {_node_key(node): node for node in self.nodes}
+        rows: list[dict[str, Any]] = []
+        for edge in self.edges:
+            edge_key = str(edge["edge_id"])
+            if edge_key in visited_relationships:
+                continue
+            source_key = str(edge["source_node_id"])
+            target_key = str(edge["target_node_id"])
+            if source_key not in frontier and target_key not in frontier:
+                continue
+            source = nodes_by_id[source_key]
+            target = nodes_by_id[target_key]
+            neighbor = target if source_key in frontier else source
+            rows.append(
+                {
+                    "relationship_key": edge_key,
+                    "source_key": source_key,
+                    "target_key": target_key,
+                    "neighbor_key": _node_key(neighbor),
+                    "channel": _edge_channel(edge),
+                    "source": source,
+                    "target": target,
+                    "neighbor": neighbor,
+                    "relationship": edge,
+                },
+            )
+        rows.sort(
+            key=lambda row: (
+                str(row["relationship_key"]),
+                str(row["source_key"]),
+                str(row["target_key"]),
+            ),
+        )
+        return rows[: int(params.get("per_depth_limit", len(rows)))]
 
     def _path_rows(
         self,
@@ -519,6 +575,45 @@ def test_readonly_projection_scopes_paths_to_seed_subgraph() -> None:
     assert project_parameters[0]["edge_ids"] == ["edge-fundamental"]
 
 
+def test_readonly_simulation_uses_bounded_subgraph_traversal_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nodes, edges = _dense_cyclic_graph(node_count=12)
+    client = FakeSimulationClient(nodes=nodes, edges=edges)
+
+    def run_scoped(
+        request: ReadonlySimulationRequest,
+        *,
+        projection_name: str,
+        client: Any,
+        ready_status: Neo4jGraphStatus,
+    ) -> PropagationResult:
+        return PropagationResult(
+            cycle_id=request.cycle_id,
+            graph_generation_id=ready_status.graph_generation_id,
+            activated_paths=[],
+            impacted_entities=[],
+            channel_breakdown={"fundamental": {"path_count": 0}},
+        )
+
+    monkeypatch.setattr(simulation_module, "_run_scoped_propagation", run_scoped)
+
+    result = simulate_readonly_impact(
+        ["dense-entity-0"],
+        _request(result_limit=5),
+        client=client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+    )
+
+    assert result["result_limit"] == 5
+    assert result["truncated"] is True
+    assert result["truncation"]["frontier_limit_reached"] is True
+    assert result["subgraph"]["truncated"] is True
+    assert len(result["subgraph"]["nodes"]) <= 5
+    assert len(result["subgraph"]["relationships"]) <= 5
+    assert all("[*" not in query and "collect(path)" not in query for query, _ in client.read_calls)
+
+
 def test_reflexive_tagged_ownership_is_not_counted_as_fundamental() -> None:
     client = FakeSimulationClient()
 
@@ -592,6 +687,42 @@ def _edges() -> list[dict[str, Any]]:
     ]
 
 
+def _dense_cyclic_graph(node_count: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    nodes = [
+        {
+            "node_id": f"dense-node-{index}",
+            "canonical_entity_id": f"dense-entity-{index}",
+            "labels": ["Entity"],
+            "properties": {"index": index},
+        }
+        for index in range(node_count)
+    ]
+    edges: list[dict[str, Any]] = []
+    for index in range(1, node_count):
+        edges.append(
+            {
+                "edge_id": f"dense-star-{index:02d}",
+                "source_node_id": "dense-node-0",
+                "target_node_id": f"dense-node-{index}",
+                "relationship_type": "SUPPLY_CHAIN",
+                "properties": {},
+                "weight": 1.0,
+            },
+        )
+    for index in range(node_count):
+        edges.append(
+            {
+                "edge_id": f"dense-cycle-{index:02d}",
+                "source_node_id": f"dense-node-{index}",
+                "target_node_id": f"dense-node-{(index + 1) % node_count}",
+                "relationship_type": "EVENT_IMPACT",
+                "properties": {"propagation_channel": "event"},
+                "weight": 0.5,
+            },
+        )
+    return nodes, edges
+
+
 def _request(
     *,
     graph_generation_id: int = 1,
@@ -651,6 +782,10 @@ def _ready_status(
         last_reload_at=None,
         writer_lock_token=writer_lock_token,
     )
+
+
+def _node_key(node: dict[str, Any]) -> str:
+    return str(node["node_id"])
 
 
 def _edge_channel(edge: dict[str, Any]) -> str:

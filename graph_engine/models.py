@@ -215,6 +215,11 @@ class GraphQueryResult(BaseModel):
     subgraph_nodes: list[dict[str, Any]]
     subgraph_edges: list[dict[str, Any]]
     status: Literal["ready"]
+    seed_entities: list[str] = Field(default_factory=list)
+    depth: int = Field(default=0, ge=0)
+    result_limit: int = Field(default=0, ge=0)
+    truncated: bool = False
+    truncation: dict[str, Any] = Field(default_factory=dict)
 
 
 class GraphSnapshot(BaseModel):

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from typing import Any, get_args
 
 from graph_engine.client import Neo4jClient
@@ -37,6 +38,33 @@ _EDGE_STRUCTURAL_PROPERTY_KEYS = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class BoundedSubgraph:
+    nodes: list[dict[str, Any]]
+    relationships: list[dict[str, Any]]
+    truncation: dict[str, Any]
+
+    @property
+    def truncated(self) -> bool:
+        return bool(self.truncation.get("truncated"))
+
+    def __iter__(self) -> Iterator[list[dict[str, Any]]]:
+        yield self.nodes
+        yield self.relationships
+
+
+class BoundedPathList(list[dict[str, Any]]):
+    def __init__(
+        self,
+        paths: list[dict[str, Any]],
+        *,
+        truncation: dict[str, Any],
+    ) -> None:
+        super().__init__(paths)
+        self.truncation = truncation
+        self.truncated = bool(truncation.get("truncated"))
+
+
 def query_subgraph(
     seed_entities: list[str],
     depth: int,
@@ -55,7 +83,7 @@ def query_subgraph(
         raise ValueError("query_subgraph requires status_manager")
 
     with status_manager.ready_read() as graph_status:
-        nodes, edges = _read_subgraph(
+        subgraph = _read_subgraph(
             seed_list,
             validated_depth,
             client=client,
@@ -63,9 +91,14 @@ def query_subgraph(
         )
         return GraphQueryResult(
             graph_generation_id=graph_status.graph_generation_id,
-            subgraph_nodes=nodes,
-            subgraph_edges=edges,
+            subgraph_nodes=subgraph.nodes,
+            subgraph_edges=subgraph.relationships,
             status="ready",
+            seed_entities=seed_list,
+            depth=validated_depth,
+            result_limit=validated_limit,
+            truncated=subgraph.truncated,
+            truncation=subgraph.truncation,
         )
 
 
@@ -89,17 +122,13 @@ def query_propagation_paths(
         raise ValueError("query_propagation_paths requires status_manager")
 
     with status_manager.ready_read():
-        rows = client.execute_read(
-            _path_query(validated_depth),
-            {
-                "channels": channel_filter,
-                "result_limit": validated_limit,
-                "seed_entities": seed_list,
-            },
+        return _read_propagation_paths(
+            seed_list,
+            validated_depth,
+            client=client,
+            channels=channel_filter,
+            result_limit=validated_limit,
         )
-    row = rows[0] if isinstance(rows, list) and rows else {}
-    raw_paths = row.get("paths") if isinstance(row, dict) else None
-    return _normalize_paths(raw_paths, channels=channel_filter, result_limit=validated_limit)
 
 
 def _read_subgraph(
@@ -108,119 +137,511 @@ def _read_subgraph(
     *,
     client: Neo4jClient,
     result_limit: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    rows = client.execute_read(
-        _subgraph_query(depth),
-        {
-            "result_limit": result_limit,
-            "seed_entities": seed_entities,
-        },
+) -> BoundedSubgraph:
+    seed_rows = _read_seed_rows(
+        client,
+        seed_entities=seed_entities,
+        result_limit=result_limit,
     )
-    row = rows[0] if isinstance(rows, list) and rows else {}
-    if not isinstance(row, dict):
-        row = {}
 
-    raw_nodes = row.get("nodes", row.get("subgraph_nodes"))
-    raw_edges = row.get("relationships", row.get("subgraph_edges", row.get("edges")))
-    return (
-        _normalize_nodes(raw_nodes, result_limit=result_limit),
-        _normalize_edges(raw_edges, result_limit=result_limit),
+    nodes_by_key: dict[str, dict[str, Any]] = {}
+    frontier_node_keys: list[str] = []
+    node_limit_reached = len(seed_rows) > result_limit
+    for row in seed_rows[:result_limit]:
+        node, node_key = _node_from_traversal_row(row)
+        if node_key is None or node_key in nodes_by_key:
+            continue
+        nodes_by_key[node_key] = node
+        frontier_node_keys.append(node_key)
+
+    relationships_by_key: dict[str, dict[str, Any]] = {}
+    visited_relationship_keys: set[str] = set()
+    frontier_limit_reached = False
+    relationship_limit_reached = False
+    truncated_depths: set[int] = set()
+    reached_depth = 0
+
+    for current_depth in range(1, depth + 1):
+        if not frontier_node_keys:
+            break
+        reached_depth = current_depth
+        rows = _read_frontier_rows(
+            client,
+            frontier_node_keys=frontier_node_keys,
+            visited_relationship_keys=visited_relationship_keys,
+            result_limit=result_limit,
+            include_channel=False,
+        )
+        if len(rows) > result_limit:
+            frontier_limit_reached = True
+            truncated_depths.add(current_depth)
+
+        previous_node_keys = set(nodes_by_key)
+        next_frontier_keys: list[str] = []
+        for row in rows[:result_limit]:
+            relationship, relationship_key = _relationship_from_traversal_row(row)
+            if relationship_key is None or relationship_key in visited_relationship_keys:
+                continue
+            visited_relationship_keys.add(relationship_key)
+
+            endpoint_nodes = _endpoint_nodes_from_traversal_row(row)
+            endpoints_available = True
+            for endpoint_key, endpoint_node in endpoint_nodes:
+                if endpoint_key is None or endpoint_key in nodes_by_key:
+                    continue
+                if len(nodes_by_key) >= result_limit:
+                    node_limit_reached = True
+                    truncated_depths.add(current_depth)
+                    endpoints_available = False
+                    break
+                nodes_by_key[endpoint_key] = endpoint_node
+
+            if not endpoints_available:
+                continue
+            if len(relationships_by_key) >= result_limit:
+                relationship_limit_reached = True
+                truncated_depths.add(current_depth)
+                break
+
+            relationships_by_key[relationship_key] = relationship
+            neighbor_key = _text_or_none(row.get("neighbor_key"))
+            if (
+                neighbor_key is not None
+                and neighbor_key not in previous_node_keys
+                and neighbor_key in nodes_by_key
+                and neighbor_key not in next_frontier_keys
+            ):
+                next_frontier_keys.append(neighbor_key)
+
+        frontier_node_keys = next_frontier_keys
+        if node_limit_reached or relationship_limit_reached:
+            break
+
+    nodes = _normalize_nodes(list(nodes_by_key.values()), result_limit=result_limit)
+    included_node_ids = {
+        node_id
+        for node in nodes
+        if (node_id := _text_or_none(node.get("node_id"))) is not None
+    }
+    relationships = _normalize_edges(
+        [
+            relationship
+            for relationship in relationships_by_key.values()
+            if _relationship_endpoints_included(relationship, included_node_ids)
+        ],
+        result_limit=result_limit,
     )
+    truncation = _truncation_metadata(
+        depth=depth,
+        reached_depth=reached_depth,
+        result_limit=result_limit,
+        node_count=len(nodes),
+        relationship_count=len(relationships),
+        path_count=None,
+        node_limit_reached=node_limit_reached,
+        relationship_limit_reached=relationship_limit_reached,
+        path_limit_reached=False,
+        frontier_limit_reached=frontier_limit_reached,
+        truncated_depths=truncated_depths,
+    )
+    return BoundedSubgraph(nodes, relationships, truncation)
 
 
 def _subgraph_query(depth: int) -> str:
-    return f"""
+    return _seed_nodes_query()
+
+
+def _seed_nodes_query() -> str:
+    return """
 MATCH (seed)
 WHERE seed.canonical_entity_id IN $seed_entities
    OR seed.node_id IN $seed_entities
-OPTIONAL MATCH path = (seed)-[*0..{depth}]-(reachable)
-WITH collect(path) AS paths
-CALL {{
-    WITH paths
-    UNWIND paths AS graph_path
-    WITH graph_path
-    WHERE graph_path IS NOT NULL
-    UNWIND nodes(graph_path) AS graph_node
-    WITH DISTINCT graph_node
-    ORDER BY coalesce(graph_node.node_id, ""),
-             coalesce(graph_node.canonical_entity_id, "")
-    LIMIT $result_limit
-    RETURN collect({{
-        node_id: graph_node.node_id,
-        canonical_entity_id: graph_node.canonical_entity_id,
-        labels: labels(graph_node),
-        properties: properties(graph_node)
-    }}) AS nodes
-}}
-CALL {{
-    WITH paths
-    UNWIND paths AS graph_path
-    WITH graph_path
-    WHERE graph_path IS NOT NULL
-    UNWIND relationships(graph_path) AS relationship
-    WITH DISTINCT relationship
-    ORDER BY coalesce(relationship.edge_id, ""),
-             coalesce(startNode(relationship).node_id, ""),
-             type(relationship),
-             coalesce(endNode(relationship).node_id, "")
-    LIMIT $result_limit
-    RETURN collect({{
-        edge_id: relationship.edge_id,
-        source_node_id: startNode(relationship).node_id,
-        target_node_id: endNode(relationship).node_id,
-        relationship_type: type(relationship),
-        properties: properties(relationship),
-        weight: coalesce(relationship.weight, 1.0)
-    }}) AS relationships
-}}
-RETURN nodes, relationships
+WITH DISTINCT seed,
+     coalesce(seed.node_id, elementId(seed)) AS node_key
+ORDER BY coalesce(seed.node_id, ""),
+         coalesce(seed.canonical_entity_id, ""),
+         node_key
+LIMIT $per_depth_limit
+RETURN node_key,
+       {
+           node_id: seed.node_id,
+           canonical_entity_id: seed.canonical_entity_id,
+           labels: labels(seed),
+           properties: properties(seed)
+       } AS node
 """
 
 
 def _path_query(depth: int) -> str:
     if depth == 0:
-        return """
-MATCH (seed)
-WHERE seed.canonical_entity_id IN $seed_entities
-   OR seed.node_id IN $seed_entities
-WITH count(seed) AS seed_count
-RETURN [] AS paths
+        return "RETURN [] AS paths"
+
+    return _frontier_expansion_query(include_channel=True)
+
+
+def _frontier_expansion_query(*, include_channel: bool) -> str:
+    channel_expression = effective_channel_expression("relationship")
+    channel_projection = f"{channel_expression} AS channel" if include_channel else "null AS channel"
+    return f"""
+MATCH (frontier)-[relationship]-(neighbor)
+WHERE coalesce(frontier.node_id, elementId(frontier)) IN $frontier_node_keys
+WITH DISTINCT relationship
+WITH relationship,
+     startNode(relationship) AS source,
+     endNode(relationship) AS target,
+     coalesce(relationship.edge_id, elementId(relationship)) AS relationship_key
+WITH relationship,
+     source,
+     target,
+     relationship_key,
+     coalesce(source.node_id, elementId(source)) AS source_key,
+     coalesce(target.node_id, elementId(target)) AS target_key
+WHERE NOT (relationship_key IN $visited_relationship_keys)
+WITH relationship,
+     source,
+     target,
+     relationship_key,
+     source_key,
+     target_key,
+     CASE
+         WHEN source_key IN $frontier_node_keys
+              AND NOT (target_key IN $frontier_node_keys) THEN target
+         WHEN target_key IN $frontier_node_keys
+              AND NOT (source_key IN $frontier_node_keys) THEN source
+         WHEN source_key IN $frontier_node_keys THEN target
+         ELSE source
+     END AS neighbor
+WITH relationship,
+     source,
+     target,
+     relationship_key,
+     source_key,
+     target_key,
+     neighbor,
+     coalesce(neighbor.node_id, elementId(neighbor)) AS neighbor_key,
+     {channel_projection}
+ORDER BY relationship_key,
+         source_key,
+         type(relationship),
+         target_key,
+         neighbor_key
+LIMIT $per_depth_limit
+RETURN relationship_key,
+       source_key,
+       target_key,
+       neighbor_key,
+       channel,
+       {{
+           node_id: source.node_id,
+           canonical_entity_id: source.canonical_entity_id,
+           labels: labels(source),
+           properties: properties(source)
+       }} AS source,
+       {{
+           node_id: target.node_id,
+           canonical_entity_id: target.canonical_entity_id,
+           labels: labels(target),
+           properties: properties(target)
+       }} AS target,
+       {{
+           node_id: neighbor.node_id,
+           canonical_entity_id: neighbor.canonical_entity_id,
+           labels: labels(neighbor),
+           properties: properties(neighbor)
+       }} AS neighbor,
+       {{
+           edge_id: relationship.edge_id,
+           source_node_id: source.node_id,
+           target_node_id: target.node_id,
+           relationship_type: type(relationship),
+           properties: properties(relationship),
+           weight: coalesce(relationship.weight, 1.0)
+       }} AS relationship
 """
 
-    channel_expression = effective_channel_expression("relationship")
-    return f"""
-MATCH (seed)
-WHERE seed.canonical_entity_id IN $seed_entities
-   OR seed.node_id IN $seed_entities
-MATCH path = (seed)-[*1..{depth}]-(reachable)
-UNWIND relationships(path) AS relationship
-WITH relationship,
-     {channel_expression} AS channel,
-     length(path) AS path_length
-WHERE channel IS NOT NULL
-  AND ($channels IS NULL OR channel IN $channels)
-WITH relationship,
-     channel,
-     min(path_length) AS path_length,
-     toFloat(coalesce(relationship.weight, 1.0)) AS score
-ORDER BY score DESC,
-         path_length ASC,
-         coalesce(relationship.edge_id, ""),
-         coalesce(startNode(relationship).node_id, ""),
-         type(relationship),
-         coalesce(endNode(relationship).node_id, "")
-LIMIT $result_limit
-RETURN collect({{
-    channel: channel,
-    edge_id: relationship.edge_id,
-    source_node_id: startNode(relationship).node_id,
-    target_node_id: endNode(relationship).node_id,
-    relationship_type: type(relationship),
-    score: score,
-    path_length: path_length,
-    properties: properties(relationship)
-}}) AS paths
-"""
+
+def _read_propagation_paths(
+    seed_entities: list[str],
+    depth: int,
+    *,
+    client: Neo4jClient,
+    channels: list[str] | None,
+    result_limit: int,
+) -> BoundedPathList:
+    if depth == 0:
+        return BoundedPathList(
+            [],
+            truncation=_truncation_metadata(
+                depth=depth,
+                reached_depth=0,
+                result_limit=result_limit,
+                node_count=0,
+                relationship_count=0,
+                path_count=0,
+                node_limit_reached=False,
+                relationship_limit_reached=False,
+                path_limit_reached=False,
+                frontier_limit_reached=False,
+                truncated_depths=set(),
+            ),
+        )
+
+    seed_rows = _read_seed_rows(
+        client,
+        seed_entities=seed_entities,
+        result_limit=result_limit,
+    )
+    nodes_by_key: dict[str, dict[str, Any]] = {}
+    frontier_node_keys: list[str] = []
+    node_limit_reached = len(seed_rows) > result_limit
+    for row in seed_rows[:result_limit]:
+        node, node_key = _node_from_traversal_row(row)
+        if node_key is None or node_key in nodes_by_key:
+            continue
+        nodes_by_key[node_key] = node
+        frontier_node_keys.append(node_key)
+
+    visited_relationship_keys: set[str] = set()
+    paths_by_key: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    channel_set = set(channels) if channels is not None else None
+    candidate_limit = result_limit * max(depth, 1)
+    frontier_limit_reached = False
+    relationship_limit_reached = False
+    path_limit_reached = False
+    truncated_depths: set[int] = set()
+    reached_depth = 0
+
+    for current_depth in range(1, depth + 1):
+        if not frontier_node_keys:
+            break
+        reached_depth = current_depth
+        rows = _read_frontier_rows(
+            client,
+            frontier_node_keys=frontier_node_keys,
+            visited_relationship_keys=visited_relationship_keys,
+            result_limit=result_limit,
+            include_channel=True,
+        )
+        if len(rows) > result_limit:
+            frontier_limit_reached = True
+            truncated_depths.add(current_depth)
+
+        previous_node_keys = set(nodes_by_key)
+        next_frontier_keys: list[str] = []
+        for row in rows[:result_limit]:
+            relationship, relationship_key = _relationship_from_traversal_row(row)
+            if relationship_key is None or relationship_key in visited_relationship_keys:
+                continue
+            visited_relationship_keys.add(relationship_key)
+
+            neighbor = row.get("neighbor")
+            neighbor_payload = _node_payload(neighbor) if isinstance(neighbor, Mapping) else {}
+            neighbor_key = _text_or_none(row.get("neighbor_key"))
+            if neighbor_key is not None and neighbor_key not in nodes_by_key:
+                if len(nodes_by_key) >= result_limit:
+                    node_limit_reached = True
+                    truncated_depths.add(current_depth)
+                else:
+                    nodes_by_key[neighbor_key] = neighbor_payload
+
+            if (
+                neighbor_key is not None
+                and neighbor_key not in previous_node_keys
+                and neighbor_key in nodes_by_key
+                and neighbor_key not in next_frontier_keys
+            ):
+                next_frontier_keys.append(neighbor_key)
+
+            channel = _text_or_none(row.get("channel"))
+            if channel is None or (channel_set is not None and channel not in channel_set):
+                continue
+            if len(paths_by_key) >= candidate_limit:
+                path_limit_reached = True
+                truncated_depths.add(current_depth)
+                continue
+
+            path = _path_payload(
+                {
+                    **relationship,
+                    "channel": channel,
+                    "path_length": current_depth,
+                    "score": relationship.get("weight"),
+                },
+            )
+            key = _path_identity(path)
+            paths_by_key.setdefault(key, path)
+
+        frontier_node_keys = next_frontier_keys
+        if node_limit_reached and not frontier_node_keys:
+            break
+        if relationship_limit_reached:
+            break
+
+    raw_paths = list(paths_by_key.values())
+    paths = _normalize_paths(raw_paths, channels=channels, result_limit=result_limit)
+    if len(raw_paths) > result_limit:
+        path_limit_reached = True
+    truncation = _truncation_metadata(
+        depth=depth,
+        reached_depth=reached_depth,
+        result_limit=result_limit,
+        node_count=len(nodes_by_key),
+        relationship_count=len(visited_relationship_keys),
+        path_count=len(paths),
+        node_limit_reached=node_limit_reached,
+        relationship_limit_reached=relationship_limit_reached,
+        path_limit_reached=path_limit_reached,
+        frontier_limit_reached=frontier_limit_reached,
+        truncated_depths=truncated_depths,
+    )
+    return BoundedPathList(paths, truncation=truncation)
+
+
+def _read_seed_rows(
+    client: Neo4jClient,
+    *,
+    seed_entities: list[str],
+    result_limit: int,
+) -> list[dict[str, Any]]:
+    return client.execute_read(
+        _seed_nodes_query(),
+        {
+            "per_depth_limit": _per_depth_limit(result_limit),
+            "seed_entities": seed_entities,
+        },
+    )
+
+
+def _read_frontier_rows(
+    client: Neo4jClient,
+    *,
+    frontier_node_keys: list[str],
+    visited_relationship_keys: set[str],
+    result_limit: int,
+    include_channel: bool,
+) -> list[dict[str, Any]]:
+    return client.execute_read(
+        _frontier_expansion_query(include_channel=include_channel),
+        {
+            "frontier_node_keys": frontier_node_keys,
+            "per_depth_limit": _per_depth_limit(result_limit),
+            "visited_relationship_keys": sorted(visited_relationship_keys),
+        },
+    )
+
+
+def _per_depth_limit(result_limit: int) -> int:
+    return result_limit + 1
+
+
+def _node_from_traversal_row(row: Mapping[str, Any]) -> tuple[dict[str, Any], str | None]:
+    raw_node = row.get("node")
+    if not isinstance(raw_node, Mapping):
+        raw_node = row
+    node = _node_payload(raw_node)
+    return node, _text_or_none(row.get("node_key")) or _node_key(node)
+
+
+def _relationship_from_traversal_row(
+    row: Mapping[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    raw_relationship = row.get("relationship")
+    if not isinstance(raw_relationship, Mapping):
+        raw_relationship = row
+    relationship = _edge_payload(raw_relationship)
+    return relationship, _text_or_none(row.get("relationship_key")) or _relationship_key(
+        relationship,
+    )
+
+
+def _endpoint_nodes_from_traversal_row(
+    row: Mapping[str, Any],
+) -> list[tuple[str | None, dict[str, Any]]]:
+    endpoints: list[tuple[str | None, dict[str, Any]]] = []
+    for key_name, node_name in (("source_key", "source"), ("target_key", "target")):
+        raw_node = row.get(node_name)
+        if not isinstance(raw_node, Mapping):
+            continue
+        node = _node_payload(raw_node)
+        endpoints.append((_text_or_none(row.get(key_name)) or _node_key(node), node))
+    return endpoints
+
+
+def _node_key(node: Mapping[str, Any]) -> str | None:
+    node_id = _text_or_none(node.get("node_id"))
+    if node_id:
+        return node_id
+    canonical_entity_id = _text_or_none(node.get("canonical_entity_id"))
+    if canonical_entity_id:
+        return canonical_entity_id
+    return None
+
+
+def _relationship_key(relationship: Mapping[str, Any]) -> str | None:
+    edge_id = _text_or_none(relationship.get("edge_id"))
+    if edge_id:
+        return edge_id
+    source_node_id = _text_or_none(relationship.get("source_node_id"))
+    relationship_type = _text_or_none(relationship.get("relationship_type"))
+    target_node_id = _text_or_none(relationship.get("target_node_id"))
+    if source_node_id is None or relationship_type is None or target_node_id is None:
+        return None
+    return "|".join((source_node_id, relationship_type, target_node_id))
+
+
+def _relationship_endpoints_included(
+    relationship: Mapping[str, Any],
+    included_node_ids: set[str],
+) -> bool:
+    source_node_id = _text_or_none(relationship.get("source_node_id"))
+    target_node_id = _text_or_none(relationship.get("target_node_id"))
+    if source_node_id is None or target_node_id is None:
+        return False
+    return source_node_id in included_node_ids and target_node_id in included_node_ids
+
+
+def _truncation_metadata(
+    *,
+    depth: int,
+    reached_depth: int,
+    result_limit: int,
+    node_count: int,
+    relationship_count: int,
+    path_count: int | None,
+    node_limit_reached: bool,
+    relationship_limit_reached: bool,
+    path_limit_reached: bool,
+    frontier_limit_reached: bool,
+    truncated_depths: set[int],
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    if node_limit_reached:
+        reasons.append("node_limit_reached")
+    if relationship_limit_reached:
+        reasons.append("relationship_limit_reached")
+    if path_limit_reached:
+        reasons.append("path_limit_reached")
+    if frontier_limit_reached:
+        reasons.append("frontier_limit_reached")
+
+    metadata: dict[str, Any] = {
+        "truncated": bool(reasons),
+        "reasons": reasons,
+        "depth": depth,
+        "reached_depth": reached_depth,
+        "result_limit": result_limit,
+        "per_depth_limit": result_limit,
+        "node_count": node_count,
+        "relationship_count": relationship_count,
+        "node_limit_reached": node_limit_reached,
+        "relationship_limit_reached": relationship_limit_reached,
+        "path_limit_reached": path_limit_reached,
+        "frontier_limit_reached": frontier_limit_reached,
+        "truncated_depths": sorted(truncated_depths),
+    }
+    if path_count is not None:
+        metadata["path_count"] = path_count
+    return metadata
 
 
 def _node_payload(value: Mapping[str, Any]) -> dict[str, Any]:
