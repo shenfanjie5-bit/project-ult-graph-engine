@@ -220,6 +220,21 @@ def test_build_propagation_context_reads_multipliers_for_requested_channels() ->
     assert context.decay_policy == {"half_life_days": 3}
 
 
+def test_build_propagation_context_rejects_explicit_empty_channels() -> None:
+    reader = StaticRegimeReader({})
+
+    with pytest.raises(ValidationError, match="at least 1"):
+        build_propagation_context(
+            "cycle-1",
+            "world-state-1",
+            7,
+            regime_reader=reader,
+            enabled_channels=[],
+        )
+
+    assert reader.calls == ["world-state-1"]
+
+
 def test_build_propagation_context_rejects_non_ready_status_before_reading() -> None:
     reader = StaticRegimeReader({})
     graph_status = Neo4jGraphStatus(

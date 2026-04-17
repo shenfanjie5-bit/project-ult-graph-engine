@@ -231,7 +231,35 @@ def test_build_graph_impact_snapshot_preserves_propagation_payload() -> None:
     assert impact_snapshot.regime_context_ref == "world-state-1"
     assert impact_snapshot.activated_paths == propagation_result.activated_paths
     assert impact_snapshot.impacted_entities == propagation_result.impacted_entities
-    assert impact_snapshot.channel_breakdown == propagation_result.channel_breakdown
+    assert impact_snapshot.channel_breakdown == {
+        "fundamental": {"path_count": 1},
+        "event": {},
+        "reflexive": {},
+        "merged": {},
+    }
+
+
+def test_build_graph_impact_snapshot_id_tracks_full_propagation_payload() -> None:
+    baseline = build_graph_impact_snapshot(
+        "cycle-1",
+        "world-state-1",
+        _propagation_result(),
+    )
+    repeated = build_graph_impact_snapshot(
+        "cycle-1",
+        "world-state-1",
+        _propagation_result(),
+    )
+    changed_breakdown = _propagation_result()
+    changed_breakdown.channel_breakdown["event"] = {"path_count": 1}
+    changed = build_graph_impact_snapshot(
+        "cycle-1",
+        "world-state-1",
+        changed_breakdown,
+    )
+
+    assert repeated.impact_snapshot_id == baseline.impact_snapshot_id
+    assert changed.impact_snapshot_id != baseline.impact_snapshot_id
 
 
 def test_compute_graph_snapshots_requires_status_source_without_side_effects() -> None:
@@ -247,6 +275,28 @@ def test_compute_graph_snapshots_requires_status_source_without_side_effects() -
             graph_generation_id=1,
             regime_reader=reader,
             snapshot_writer=writer,
+        )
+
+    assert reader.calls == []
+    assert writer.calls == []
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_not_called()
+
+
+def test_compute_graph_snapshots_rejects_graph_status_without_status_manager() -> None:
+    client = MagicMock()
+    reader = StaticRegimeReader()
+    writer = RecordingSnapshotWriter()
+
+    with pytest.raises(TypeError, match="status_manager"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=client,
+            graph_generation_id=1,
+            regime_reader=reader,
+            snapshot_writer=writer,
+            graph_status=_ready_status(),
         )
 
     assert reader.calls == []
@@ -327,6 +377,7 @@ def test_compute_graph_snapshots_uses_status_manager_and_derives_generation(
         **kwargs: Any,
     ) -> PropagationContext:
         events.append(f"context:{graph_generation_id}")
+        assert kwargs["enabled_channels"] == ["fundamental", "event", "reflexive"]
         return _context(graph_generation_id=graph_generation_id)
 
     def run_propagation(
@@ -338,7 +389,7 @@ def test_compute_graph_snapshots_uses_status_manager_and_derives_generation(
         return _propagation_result(graph_generation_id=context.graph_generation_id)
 
     monkeypatch.setattr(snapshot_generator, "build_propagation_context", build_context)
-    monkeypatch.setattr(snapshot_generator, "run_fundamental_propagation", run_propagation)
+    monkeypatch.setattr(snapshot_generator, "run_full_propagation", run_propagation)
 
     graph_snapshot, impact_snapshot = compute_graph_snapshots(
         "cycle-1",
@@ -349,14 +400,21 @@ def test_compute_graph_snapshots_uses_status_manager_and_derives_generation(
         status_manager=status_manager,
     )
 
-    assert status_store.calls == 2
+    assert status_store.calls == 3
     assert graph_snapshot.graph_generation_id == 7
     assert graph_snapshot.node_count == 2
     assert graph_snapshot.edge_count == 1
     assert graph_snapshot.key_label_counts == {"Entity": 2}
     assert graph_snapshot.checksum == "abc123"
     assert impact_snapshot.regime_context_ref == "world-state-1"
-    assert events == ["metrics", "context:7", "propagation:7", "metrics", "write"]
+    assert events == [
+        "metrics",
+        "context:7",
+        "propagation:7",
+        "metrics",
+        "metrics",
+        "write",
+    ]
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
 
@@ -366,11 +424,16 @@ def test_compute_graph_snapshots_uses_status_manager_and_derives_generation(
         ("graph_generation_id", 2, {}, []),
         ("node_count", 1, {"node_count": 999}, ["metrics"]),
         ("edge_count", 1, {"edge_count": 999}, ["metrics"]),
-        ("key_label_counts", 1, {"key_label_counts": {"Entity": 999}}, ["metrics"]),
+        (
+            "key_label_counts",
+            1,
+            {"key_label_counts": {"Entity": 999}},
+            ["metrics"],
+        ),
         ("checksum", 1, {"checksum": "stale"}, ["metrics"]),
     ],
 )
-def test_compute_graph_snapshots_rejects_status_disagreements_before_propagation(
+def test_compute_graph_snapshots_rejects_status_disagreements_before_write(
     monkeypatch: pytest.MonkeyPatch,
     field_name: str,
     graph_generation_id: int,
@@ -389,7 +452,7 @@ def test_compute_graph_snapshots_rejects_status_disagreements_before_propagation
         events.append("propagation")
         return _propagation_result()
 
-    monkeypatch.setattr(snapshot_generator, "run_fundamental_propagation", run_propagation)
+    monkeypatch.setattr(snapshot_generator, "run_full_propagation", run_propagation)
 
     with pytest.raises(ValueError, match=field_name):
         compute_graph_snapshots(
@@ -421,7 +484,7 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
     )
     monkeypatch.setattr(
         snapshot_generator,
-        "run_fundamental_propagation",
+        "run_full_propagation",
         lambda *args, **kwargs: events.append("propagation") or _propagation_result(),
     )
     monkeypatch.setattr(
@@ -447,8 +510,49 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
     assert graph_snapshot.node_count == 2
     assert graph_snapshot.edge_count == 1
     assert graph_snapshot.checksum == "abc123"
-    assert events == ["metrics", "context", "propagation", "impact", "metrics", "write"]
+    assert events == [
+        "metrics",
+        "context",
+        "propagation",
+        "metrics",
+        "impact",
+        "metrics",
+        "write",
+    ]
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
+
+
+def test_compute_graph_snapshots_accepts_single_channel_regression_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_channels: list[str] = []
+
+    _patch_metrics(monkeypatch)
+
+    def build_context(*args: Any, **kwargs: Any) -> PropagationContext:
+        requested_channels.extend(kwargs["enabled_channels"])
+        return _context()
+
+    monkeypatch.setattr(snapshot_generator, "build_propagation_context", build_context)
+    monkeypatch.setattr(
+        snapshot_generator,
+        "run_full_propagation",
+        lambda *args, **kwargs: _propagation_result(),
+    )
+    status_manager, _ = _status_manager(_ready_status())
+
+    compute_graph_snapshots(
+        "cycle-1",
+        "world-state-1",
+        client=MagicMock(),
+        graph_generation_id=1,
+        regime_reader=StaticRegimeReader(),
+        snapshot_writer=RecordingSnapshotWriter(),
+        status_manager=status_manager,
+        enabled_channels=["fundamental"],
+    )
+
+    assert requested_channels == ["fundamental"]
 
 
 def test_compute_graph_snapshots_rechecks_status_before_write(
@@ -457,7 +561,7 @@ def test_compute_graph_snapshots_rechecks_status_before_write(
     events: list[str] = []
     ready_status = _ready_status()
     rebuilding_status = _ready_status(graph_status="rebuilding")
-    status_manager, status_store = _status_manager([ready_status, rebuilding_status])
+    status_manager, status_store = _status_manager([ready_status, ready_status, rebuilding_status])
     writer = RecordingSnapshotWriter(events)
 
     _patch_metrics(monkeypatch, events)
@@ -468,7 +572,7 @@ def test_compute_graph_snapshots_rechecks_status_before_write(
     )
     monkeypatch.setattr(
         snapshot_generator,
-        "run_fundamental_propagation",
+        "run_full_propagation",
         lambda *args, **kwargs: events.append("propagation") or _propagation_result(),
     )
     monkeypatch.setattr(
@@ -488,8 +592,8 @@ def test_compute_graph_snapshots_rechecks_status_before_write(
             status_manager=status_manager,
         )
 
-    assert status_store.calls == 2
-    assert events == ["metrics", "context", "propagation", "impact"]
+    assert status_store.calls == 3
+    assert events == ["metrics", "context", "propagation", "metrics", "impact"]
     assert writer.calls == []
 
 
@@ -504,6 +608,7 @@ def test_compute_graph_snapshots_rechecks_live_metrics_before_write(
         events,
         metrics_sequence=[
             (2, 1, {"Entity": 2}, "abc123"),
+            (2, 1, {"Entity": 2}, "abc123"),
             (3, 1, {"Entity": 3}, "changed"),
         ],
     )
@@ -514,7 +619,7 @@ def test_compute_graph_snapshots_rechecks_live_metrics_before_write(
     )
     monkeypatch.setattr(
         snapshot_generator,
-        "run_fundamental_propagation",
+        "run_full_propagation",
         lambda *args, **kwargs: events.append("propagation") or _propagation_result(),
     )
     monkeypatch.setattr(
@@ -535,7 +640,7 @@ def test_compute_graph_snapshots_rechecks_live_metrics_before_write(
             status_manager=status_manager,
         )
 
-    assert events == ["metrics", "context", "propagation", "impact", "metrics"]
+    assert events == ["metrics", "context", "propagation", "metrics", "impact", "metrics"]
     assert writer.calls == []
 
 
@@ -552,7 +657,7 @@ def test_compute_graph_snapshots_does_not_write_if_snapshot_build_fails(
     )
     monkeypatch.setattr(
         snapshot_generator,
-        "run_fundamental_propagation",
+        "run_full_propagation",
         lambda *args, **kwargs: _propagation_result(),
     )
 
@@ -591,7 +696,7 @@ def test_compute_graph_snapshots_surfaces_writer_errors(
     )
     monkeypatch.setattr(
         snapshot_generator,
-        "run_fundamental_propagation",
+        "run_full_propagation",
         lambda *args, **kwargs: _propagation_result(),
     )
     monkeypatch.setattr(
