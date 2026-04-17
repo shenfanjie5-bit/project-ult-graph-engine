@@ -263,6 +263,14 @@ def test_run_full_propagation_reuses_projection_name_for_single_channel(
     assert calls == [("event", "unit-projection", 20, 100)]
 
 
+def test_run_full_propagation_requires_status_manager() -> None:
+    with pytest.raises(TypeError, match="status_manager"):
+        run_full_propagation(
+            _context(enabled_channels=["fundamental"]),
+            object(),  # type: ignore[arg-type]
+        )
+
+
 def _runner(channel: str, calls: list[tuple[str, str | None, int, int]]):
     def run_channel(
         context: PropagationContext,

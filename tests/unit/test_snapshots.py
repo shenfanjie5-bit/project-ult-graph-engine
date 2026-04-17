@@ -283,6 +283,28 @@ def test_compute_graph_snapshots_requires_status_source_without_side_effects() -
     client.execute_write.assert_not_called()
 
 
+def test_compute_graph_snapshots_rejects_graph_status_without_status_manager() -> None:
+    client = MagicMock()
+    reader = StaticRegimeReader()
+    writer = RecordingSnapshotWriter()
+
+    with pytest.raises(TypeError, match="status_manager"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=client,
+            graph_generation_id=1,
+            regime_reader=reader,
+            snapshot_writer=writer,
+            graph_status=_ready_status(),
+        )
+
+    assert reader.calls == []
+    assert writer.calls == []
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_not_called()
+
+
 def test_compute_graph_snapshots_rejects_non_ready_status_without_side_effects() -> None:
     client = MagicMock()
     reader = StaticRegimeReader()
@@ -385,7 +407,14 @@ def test_compute_graph_snapshots_uses_status_manager_and_derives_generation(
     assert graph_snapshot.key_label_counts == {"Entity": 2}
     assert graph_snapshot.checksum == "abc123"
     assert impact_snapshot.regime_context_ref == "world-state-1"
-    assert events == ["context:7", "propagation:7", "metrics", "metrics", "write"]
+    assert events == [
+        "metrics",
+        "context:7",
+        "propagation:7",
+        "metrics",
+        "metrics",
+        "write",
+    ]
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
 
@@ -393,15 +422,15 @@ def test_compute_graph_snapshots_uses_status_manager_and_derives_generation(
     ("field_name", "graph_generation_id", "status_updates", "expected_events"),
     [
         ("graph_generation_id", 2, {}, []),
-        ("node_count", 1, {"node_count": 999}, ["propagation", "metrics"]),
-        ("edge_count", 1, {"edge_count": 999}, ["propagation", "metrics"]),
+        ("node_count", 1, {"node_count": 999}, ["metrics"]),
+        ("edge_count", 1, {"edge_count": 999}, ["metrics"]),
         (
             "key_label_counts",
             1,
             {"key_label_counts": {"Entity": 999}},
-            ["propagation", "metrics"],
+            ["metrics"],
         ),
-        ("checksum", 1, {"checksum": "stale"}, ["propagation", "metrics"]),
+        ("checksum", 1, {"checksum": "stale"}, ["metrics"]),
     ],
 )
 def test_compute_graph_snapshots_rejects_status_disagreements_before_write(
@@ -437,10 +466,7 @@ def test_compute_graph_snapshots_rejects_status_disagreements_before_write(
         )
 
     assert events == expected_events
-    if field_name == "graph_generation_id":
-        assert reader.calls == []
-    else:
-        assert reader.calls == ["world-state-1"]
+    assert reader.calls == []
     assert writer.calls == []
 
 
@@ -484,7 +510,15 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
     assert graph_snapshot.node_count == 2
     assert graph_snapshot.edge_count == 1
     assert graph_snapshot.checksum == "abc123"
-    assert events == ["context", "propagation", "metrics", "impact", "metrics", "write"]
+    assert events == [
+        "metrics",
+        "context",
+        "propagation",
+        "metrics",
+        "impact",
+        "metrics",
+        "write",
+    ]
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
 
@@ -559,7 +593,7 @@ def test_compute_graph_snapshots_rechecks_status_before_write(
         )
 
     assert status_store.calls == 3
-    assert events == ["context", "propagation", "metrics", "impact"]
+    assert events == ["metrics", "context", "propagation", "metrics", "impact"]
     assert writer.calls == []
 
 
@@ -573,6 +607,7 @@ def test_compute_graph_snapshots_rechecks_live_metrics_before_write(
         monkeypatch,
         events,
         metrics_sequence=[
+            (2, 1, {"Entity": 2}, "abc123"),
             (2, 1, {"Entity": 2}, "abc123"),
             (3, 1, {"Entity": 3}, "changed"),
         ],
@@ -605,7 +640,7 @@ def test_compute_graph_snapshots_rechecks_live_metrics_before_write(
             status_manager=status_manager,
         )
 
-    assert events == ["context", "propagation", "metrics", "impact", "metrics"]
+    assert events == ["metrics", "context", "propagation", "metrics", "impact", "metrics"]
     assert writer.calls == []
 
 

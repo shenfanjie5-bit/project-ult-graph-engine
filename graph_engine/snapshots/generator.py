@@ -87,7 +87,7 @@ def compute_graph_snapshots(
     graph_generation_id: int | None = None,
     regime_reader: RegimeContextReader,
     snapshot_writer: SnapshotWriter,
-    status_manager: GraphStatusManager | None = None,
+    status_manager: GraphStatusManager,
     graph_status: Neo4jGraphStatus | None = None,
     graph_name: str | None = None,
     enabled_channels: Sequence[PropagationChannel] | None = None,
@@ -102,7 +102,7 @@ def compute_graph_snapshots(
         operation="snapshot generation",
     )
     _validate_generation_input(graph_generation_id, ready_status)
-    read_status_manager = status_manager or _static_status_manager(ready_status)
+    _validate_pre_propagation_status_and_metrics(ready_status, client)
     requested_channels = list(
         _DEFAULT_SNAPSHOT_CHANNELS if enabled_channels is None else enabled_channels
     )
@@ -117,7 +117,7 @@ def compute_graph_snapshots(
     propagation_result = run_full_propagation(
         context,
         client,
-        status_manager=read_status_manager,
+        status_manager=status_manager,
         graph_name=graph_name,
         max_iterations=max_iterations,
         result_limit=result_limit,
@@ -126,7 +126,7 @@ def compute_graph_snapshots(
         cycle_id,
         ready_status.graph_generation_id,
         client,
-        status_manager=read_status_manager,
+        status_manager=status_manager,
     )
     _validate_status_metrics(
         ready_status,
@@ -142,7 +142,7 @@ def compute_graph_snapshots(
     )
     _validate_publication_status_and_metrics(
         ready_status,
-        read_status_manager,
+        status_manager,
         client,
     )
     snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
@@ -181,37 +181,27 @@ def _resolve_ready_status(
     graph_status: Neo4jGraphStatus | None,
     operation: str,
 ) -> Neo4jGraphStatus:
-    if status_manager is not None:
-        return require_ready_read(status_manager, operation)
+    if status_manager is None:
+        raise TypeError(f"{operation} requires status_manager")
+    ready_status = require_ready_read(status_manager, operation)
     if graph_status is not None:
-        return require_ready_status(graph_status)
-    raise TypeError(f"{operation} requires status_manager or graph_status")
+        require_ready_status(graph_status)
+        _validate_status_matches_ready_status(ready_status, graph_status)
+    return ready_status
 
 
-def _static_status_manager(graph_status: Neo4jGraphStatus) -> GraphStatusManager:
-    return GraphStatusManager(_StaticStatusStore(graph_status))
-
-
-class _StaticStatusStore:
-    def __init__(self, graph_status: Neo4jGraphStatus) -> None:
-        self.graph_status = graph_status
-
-    def read_current_status(self) -> Neo4jGraphStatus:
-        return self.graph_status
-
-    def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        self.graph_status = status
-
-    def compare_and_write_current_status(
-        self,
-        *,
-        expected_status: Neo4jGraphStatus | None,
-        next_status: Neo4jGraphStatus,
-    ) -> bool:
-        if self.graph_status != expected_status:
-            return False
-        self.graph_status = next_status
-        return True
+def _validate_pre_propagation_status_and_metrics(
+    ready_status: Neo4jGraphStatus,
+    client: Neo4jClient,
+) -> None:
+    node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
+    _validate_status_metrics(
+        ready_status,
+        node_count=node_count,
+        edge_count=edge_count,
+        key_label_counts=key_label_counts,
+        checksum=checksum,
+    )
 
 
 def _validate_status_metrics(
@@ -249,7 +239,7 @@ def _validate_status_metrics(
 
 def _validate_publication_status_and_metrics(
     ready_status: Neo4jGraphStatus,
-    status_manager: GraphStatusManager | None,
+    status_manager: GraphStatusManager,
     client: Neo4jClient,
 ) -> None:
     try:
