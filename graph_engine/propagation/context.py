@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, Literal, Protocol
+from collections.abc import Mapping, Sequence
+from typing import Any, Protocol
 
-from graph_engine.models import Neo4jGraphStatus, PropagationContext
+from graph_engine.models import Neo4jGraphStatus, PropagationChannel, PropagationContext
 
-_FUNDAMENTAL_CHANNEL: Literal["fundamental"] = "fundamental"
+_DEFAULT_ENABLED_CHANNELS: tuple[PropagationChannel, ...] = ("fundamental",)
 
 
 class RegimeContextReader(Protocol):
@@ -24,8 +24,9 @@ def build_propagation_context(
     *,
     regime_reader: RegimeContextReader,
     graph_status: Neo4jGraphStatus | None = None,
+    enabled_channels: Sequence[PropagationChannel] | None = None,
 ) -> PropagationContext:
-    """Build a single-channel propagation context without mutating world state."""
+    """Build a propagation context without mutating world state."""
 
     if graph_status is not None and graph_status.graph_status != "ready":
         raise PermissionError(
@@ -33,23 +34,28 @@ def build_propagation_context(
             f"received {graph_status.graph_status!r}",
         )
 
+    requested_channels = list(enabled_channels or _DEFAULT_ENABLED_CHANNELS)
     regime_context = dict(regime_reader.read_regime_context(world_state_ref))
     return PropagationContext(
         cycle_id=cycle_id,
         world_state_ref=world_state_ref,
         graph_generation_id=graph_generation_id,
-        enabled_channels=[_FUNDAMENTAL_CHANNEL],
+        enabled_channels=requested_channels,
         channel_multipliers={
-            _FUNDAMENTAL_CHANNEL: _context_multiplier(
+            channel: _context_multiplier(
                 regime_context,
                 "channel_multipliers",
-            ),
+                channel,
+            )
+            for channel in requested_channels
         },
         regime_multipliers={
-            _FUNDAMENTAL_CHANNEL: _context_multiplier(
+            channel: _context_multiplier(
                 regime_context,
                 "regime_multipliers",
-            ),
+                channel,
+            )
+            for channel in requested_channels
         },
         decay_policy=_context_mapping(regime_context, "decay_policy"),
         regime_context=regime_context,
@@ -59,12 +65,13 @@ def build_propagation_context(
 def _context_multiplier(
     regime_context: Mapping[str, Any],
     key: str,
+    channel: PropagationChannel,
 ) -> float:
     raw_multipliers = regime_context.get(key)
     if not isinstance(raw_multipliers, Mapping):
         return 1.0
     return _as_non_negative_float(
-        raw_multipliers.get(_FUNDAMENTAL_CHANNEL, 1.0),
+        raw_multipliers.get(channel, 1.0),
         key,
     )
 

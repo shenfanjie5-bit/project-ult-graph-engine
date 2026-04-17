@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+PropagationChannel = Literal["fundamental", "event", "reflexive"]
+_ALLOWED_PROPAGATION_CHANNELS: frozenset[str] = frozenset(get_args(PropagationChannel))
 
 
 class GraphNodeRecord(BaseModel):
@@ -85,7 +88,7 @@ class PropagationContext(BaseModel):
     cycle_id: str = Field(min_length=1)
     world_state_ref: str = Field(min_length=1)
     graph_generation_id: int = Field(ge=0)
-    enabled_channels: list[Literal["fundamental"]] = Field(min_length=1)
+    enabled_channels: list[PropagationChannel] = Field(min_length=1)
     channel_multipliers: dict[str, float]
     regime_multipliers: dict[str, float]
     decay_policy: dict[str, Any]
@@ -93,12 +96,19 @@ class PropagationContext(BaseModel):
 
     @field_validator("enabled_channels")
     @classmethod
-    def _requires_fundamental_channel(
+    def _validate_enabled_channels(
         cls,
-        enabled_channels: list[Literal["fundamental"]],
-    ) -> list[Literal["fundamental"]]:
-        if "fundamental" not in enabled_channels:
-            raise ValueError("enabled_channels must include 'fundamental'")
+        enabled_channels: list[PropagationChannel],
+    ) -> list[PropagationChannel]:
+        if not enabled_channels:
+            raise ValueError("enabled_channels must not be empty")
+        unknown_channels = [
+            channel for channel in enabled_channels if channel not in _ALLOWED_PROPAGATION_CHANNELS
+        ]
+        if unknown_channels:
+            raise ValueError(f"unknown propagation channels: {unknown_channels}")
+        if len(set(enabled_channels)) != len(enabled_channels):
+            raise ValueError("enabled_channels must not contain duplicates")
         return enabled_channels
 
 
