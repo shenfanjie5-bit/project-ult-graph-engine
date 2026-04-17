@@ -14,7 +14,9 @@ from graph_engine.models import (
     PropagationContext,
     PropagationResult,
     PromotionPlan,
+    ReadonlySimulationRequest,
 )
+from graph_engine.query import query_subgraph, simulate_readonly_impact
 from graph_engine.reload import (
     CanonicalReader,
     ColdReloadTimeoutError,
@@ -35,6 +37,7 @@ from graph_engine.status import (
     PostgresStatusStore,
     StatusStore,
     check_live_graph_consistency,
+    require_ready_read,
     require_ready_status,
 )
 
@@ -61,6 +64,7 @@ __all__ = [
     "PromotionPlan",
     "PropagationContext",
     "PropagationResult",
+    "ReadonlySimulationRequest",
     "RelationshipType",
     "SchemaManager",
     "StatusStore",
@@ -70,6 +74,9 @@ __all__ = [
     "get_constraint_statements",
     "get_index_statements",
     "load_config_from_env",
+    "query_subgraph",
     "rebuild_gds_projection",
+    "require_ready_read",
     "require_ready_status",
+    "simulate_readonly_impact",
 ]

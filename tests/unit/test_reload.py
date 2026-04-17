@@ -21,32 +21,9 @@ from graph_engine.reload.projection import rebuild_gds_projection
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import DROP_ALL_CONFIRMATION_TOKEN
 from graph_engine.status import GraphStatusManager
+from tests.fakes import InMemoryStatusStore
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
-
-
-class InMemoryStatusStore:
-    def __init__(self, status: Neo4jGraphStatus | None = None) -> None:
-        self.status = status
-        self.writes: list[Neo4jGraphStatus] = []
-
-    def read_current_status(self) -> Neo4jGraphStatus | None:
-        return self.status
-
-    def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-        self.writes.append(status)
-
-    def compare_and_write_current_status(
-        self,
-        *,
-        expected_status: Neo4jGraphStatus | None,
-        next_status: Neo4jGraphStatus,
-    ) -> bool:
-        if self.status != expected_status:
-            return False
-        self.write_current_status(next_status)
-        return True
 
 
 class RecordingStatusManager(GraphStatusManager):

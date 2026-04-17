@@ -19,6 +19,8 @@ def require_ready_status(graph_status: Neo4jGraphStatus) -> Neo4jGraphStatus:
             "Neo4j live graph reads require graph_status='ready'; "
             f"received {graph_status.graph_status!r}",
         )
+    if graph_status.writer_lock_token is not None:
+        raise PermissionError("Neo4j live graph reads require no active writer lock")
     return graph_status
 
 
@@ -249,6 +251,17 @@ class GraphStatusManager:
             raise RuntimeError(
                 "stale graph_status transition rejected because current status changed",
             )
+
+
+def require_ready_read(
+    status_manager: GraphStatusManager | None,
+    operation: str,
+) -> Neo4jGraphStatus:
+    """Return the ready status required before a public Neo4j read operation."""
+
+    if status_manager is None:
+        raise ValueError(f"{operation} requires status_manager")
+    return status_manager.require_ready()
 
 
 def _utc_now() -> datetime:

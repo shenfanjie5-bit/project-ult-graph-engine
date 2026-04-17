@@ -22,6 +22,7 @@ from graph_engine.schema.manager import DROP_ALL_CONFIRMATION_TOKEN, SchemaManag
 from graph_engine.snapshots import build_graph_snapshot
 from graph_engine.status import GraphStatusManager, check_live_graph_consistency
 from graph_engine.sync import sync_live_graph
+from tests.fakes import InMemoryStatusStore
 
 pytestmark = pytest.mark.skipif(
     os.getenv("NEO4J_PASSWORD") is None,
@@ -29,28 +30,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
-
-
-class InMemoryStatusStore:
-    def __init__(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def read_current_status(self) -> Neo4jGraphStatus | None:
-        return self.status
-
-    def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def compare_and_write_current_status(
-        self,
-        *,
-        expected_status: Neo4jGraphStatus | None,
-        next_status: Neo4jGraphStatus,
-    ) -> bool:
-        if self.status != expected_status:
-            return False
-        self.write_current_status(next_status)
-        return True
 
 
 class StaticCanonicalReader:
@@ -95,7 +74,14 @@ def test_cold_reload_rebuilds_live_graph_and_gds_projection() -> None:
 
         try:
             sync_live_graph(promotion_plan, client)
-            expected_snapshot = build_graph_snapshot("cycle-reload", 7, client)
+            expected_snapshot = build_graph_snapshot(
+                "cycle-reload",
+                7,
+                client,
+                status_manager=GraphStatusManager(
+                    InMemoryStatusStore(_status(graph_generation_id=7)),
+                ),
+            )
             plan = ColdReloadPlan(
                 snapshot_ref="snapshot-ref-reload",
                 cycle_id="cycle-reload",

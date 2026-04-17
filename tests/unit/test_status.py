@@ -14,33 +14,10 @@ from graph_engine.status import (
     require_ready_status,
 )
 from graph_engine.status.consistency import _read_live_graph_metrics
+from tests.fakes import InMemoryStatusStore
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 SNAPSHOT_CREATED_AT = datetime(2026, 4, 17, 1, 0, 0, tzinfo=timezone.utc)
-
-
-class InMemoryStatusStore:
-    def __init__(self, status: Neo4jGraphStatus | None = None) -> None:
-        self.status = status
-        self.writes: list[Neo4jGraphStatus] = []
-
-    def read_current_status(self) -> Neo4jGraphStatus | None:
-        return self.status
-
-    def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-        self.writes.append(status)
-
-    def compare_and_write_current_status(
-        self,
-        *,
-        expected_status: Neo4jGraphStatus | None,
-        next_status: Neo4jGraphStatus,
-    ) -> bool:
-        if self.status != expected_status:
-            return False
-        self.write_current_status(next_status)
-        return True
 
 
 class InterleavingStatusStore(InMemoryStatusStore):
@@ -392,6 +369,15 @@ def test_require_ready_returns_ready_status() -> None:
 
     assert require_ready_status(ready_status) is ready_status
     assert GraphStatusManager(InMemoryStatusStore(ready_status)).require_ready() is ready_status
+
+
+def test_require_ready_rejects_active_writer_lock() -> None:
+    status = _status(graph_status="ready", writer_lock_token="incremental-sync")
+
+    with pytest.raises(PermissionError, match="writer lock"):
+        require_ready_status(status)
+    with pytest.raises(PermissionError, match="writer lock"):
+        GraphStatusManager(InMemoryStatusStore(status)).require_ready()
 
 
 @pytest.mark.parametrize("graph_status", ["rebuilding", "failed"])

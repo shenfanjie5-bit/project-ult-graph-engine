@@ -19,6 +19,7 @@ from graph_engine.snapshots import (
     build_graph_snapshot,
     compute_graph_snapshots,
 )
+from graph_engine.status import GraphStatusManager
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 
@@ -93,7 +94,7 @@ class RaisingSnapshotWriter:
         raise RuntimeError("writer failed")
 
 
-class StaticStatusReader:
+class SequentialStatusStore:
     def __init__(
         self,
         graph_status: Neo4jGraphStatus | list[Neo4jGraphStatus],
@@ -104,10 +105,24 @@ class StaticStatusReader:
             self.graph_statuses = [graph_status]
         self.calls = 0
 
-    def read_graph_status(self) -> Neo4jGraphStatus:
+    def read_current_status(self) -> Neo4jGraphStatus:
         self.calls += 1
         index = min(self.calls - 1, len(self.graph_statuses) - 1)
         return self.graph_statuses[index]
+
+    def write_current_status(self, status: Neo4jGraphStatus) -> None:
+        self.graph_statuses = [status]
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        if self.graph_statuses[-1] != expected_status:
+            return False
+        self.write_current_status(next_status)
+        return True
 
 
 def test_build_graph_snapshot_reads_metrics_and_stable_checksum() -> None:
@@ -136,9 +151,20 @@ def test_build_graph_snapshot_reads_metrics_and_stable_checksum() -> None:
             }
         ],
     )
+    status_manager, _ = _status_manager(_ready_status(graph_generation_id=3))
 
-    first = build_graph_snapshot("cycle-1", 3, client)  # type: ignore[arg-type]
-    second = build_graph_snapshot("cycle-1", 3, client)  # type: ignore[arg-type]
+    first = build_graph_snapshot(  # type: ignore[arg-type]
+        "cycle-1",
+        3,
+        client,
+        status_manager=status_manager,
+    )
+    second = build_graph_snapshot(  # type: ignore[arg-type]
+        "cycle-1",
+        3,
+        client,
+        status_manager=status_manager,
+    )
 
     assert first.node_count == 2
     assert first.edge_count == 1
@@ -151,9 +177,46 @@ def test_build_graph_snapshot_reads_metrics_and_stable_checksum() -> None:
         **client.relationships[0],
         "properties": {"weight": 0.9},
     }
-    changed = build_graph_snapshot("cycle-1", 3, client)  # type: ignore[arg-type]
+    changed = build_graph_snapshot(  # type: ignore[arg-type]
+        "cycle-1",
+        3,
+        client,
+        status_manager=status_manager,
+    )
     assert changed.checksum != first.checksum
     assert len(client.read_calls) == 3
+
+
+def test_build_graph_snapshot_blocks_non_ready_before_reading() -> None:
+    client = MagicMock()
+    status_manager, _ = _status_manager(_ready_status(graph_status="failed"))
+
+    with pytest.raises(PermissionError, match="ready"):
+        build_graph_snapshot(
+            "cycle-1",
+            1,
+            client,
+            status_manager=status_manager,
+        )
+
+    client.execute_read.assert_not_called()
+
+
+def test_build_graph_snapshot_blocks_active_writer_lock_before_reading() -> None:
+    client = MagicMock()
+    status_manager, _ = _status_manager(
+        _ready_status(writer_lock_token="incremental-sync"),
+    )
+
+    with pytest.raises(PermissionError, match="writer lock"):
+        build_graph_snapshot(
+            "cycle-1",
+            1,
+            client,
+            status_manager=status_manager,
+        )
+
+    client.execute_read.assert_not_called()
 
 
 def test_build_graph_impact_snapshot_preserves_propagation_payload() -> None:
@@ -176,7 +239,7 @@ def test_compute_graph_snapshots_requires_status_source_without_side_effects() -
     reader = StaticRegimeReader()
     writer = RecordingSnapshotWriter()
 
-    with pytest.raises(ValueError, match="graph_status or status_reader"):
+    with pytest.raises(TypeError, match="status_manager"):
         compute_graph_snapshots(
             "cycle-1",
             "world-state-1",
@@ -196,6 +259,15 @@ def test_compute_graph_snapshots_rejects_non_ready_status_without_side_effects()
     client = MagicMock()
     reader = StaticRegimeReader()
     writer = RecordingSnapshotWriter()
+    status_manager, _ = _status_manager(
+        _ready_status(
+            graph_status="failed",
+            node_count=0,
+            edge_count=0,
+            key_label_counts={},
+            checksum="failed",
+        ),
+    )
 
     with pytest.raises(PermissionError, match="ready"):
         compute_graph_snapshots(
@@ -205,13 +277,7 @@ def test_compute_graph_snapshots_rejects_non_ready_status_without_side_effects()
             graph_generation_id=1,
             regime_reader=reader,
             snapshot_writer=writer,
-            graph_status=_ready_status(
-                graph_status="failed",
-                node_count=0,
-                edge_count=0,
-                key_label_counts={},
-                checksum="failed",
-            ),
+            status_manager=status_manager,
         )
 
     assert reader.calls == []
@@ -220,11 +286,36 @@ def test_compute_graph_snapshots_rejects_non_ready_status_without_side_effects()
     client.execute_write.assert_not_called()
 
 
-def test_compute_graph_snapshots_uses_status_reader_and_derives_generation(
+def test_compute_graph_snapshots_rejects_active_writer_lock_without_side_effects() -> None:
+    client = MagicMock()
+    reader = StaticRegimeReader()
+    writer = RecordingSnapshotWriter()
+    status_manager, _ = _status_manager(
+        _ready_status(writer_lock_token="incremental-sync"),
+    )
+
+    with pytest.raises(PermissionError, match="writer lock"):
+        compute_graph_snapshots(
+            "cycle-1",
+            "world-state-1",
+            client=client,
+            graph_generation_id=1,
+            regime_reader=reader,
+            snapshot_writer=writer,
+            status_manager=status_manager,
+        )
+
+    assert reader.calls == []
+    assert writer.calls == []
+    client.execute_read.assert_not_called()
+    client.execute_write.assert_not_called()
+
+
+def test_compute_graph_snapshots_uses_status_manager_and_derives_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
-    status_reader = StaticStatusReader(_ready_status(graph_generation_id=7))
+    status_manager, status_store = _status_manager(_ready_status(graph_generation_id=7))
     writer = RecordingSnapshotWriter(events)
 
     _patch_metrics(monkeypatch, events)
@@ -255,10 +346,10 @@ def test_compute_graph_snapshots_uses_status_reader_and_derives_generation(
         client=MagicMock(),
         regime_reader=StaticRegimeReader(),
         snapshot_writer=writer,
-        status_reader=status_reader,
+        status_manager=status_manager,
     )
 
-    assert status_reader.calls == 2
+    assert status_store.calls == 2
     assert graph_snapshot.graph_generation_id == 7
     assert graph_snapshot.node_count == 2
     assert graph_snapshot.edge_count == 1
@@ -290,6 +381,7 @@ def test_compute_graph_snapshots_rejects_status_disagreements_before_propagation
     reader = StaticRegimeReader()
     writer = RecordingSnapshotWriter()
     graph_status = _ready_status(**status_updates)
+    status_manager, _ = _status_manager(graph_status)
 
     _patch_metrics(monkeypatch, events)
 
@@ -307,35 +399,10 @@ def test_compute_graph_snapshots_rejects_status_disagreements_before_propagation
             graph_generation_id=graph_generation_id,
             regime_reader=reader,
             snapshot_writer=writer,
-            status_reader=StaticStatusReader(graph_status),
+            status_manager=status_manager,
         )
 
     assert events == expected_events
-    assert reader.calls == []
-    assert writer.calls == []
-
-
-def test_compute_graph_snapshots_rejects_direct_ready_status_without_reader(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-    reader = StaticRegimeReader()
-    writer = RecordingSnapshotWriter()
-
-    _patch_metrics(monkeypatch, events)
-
-    with pytest.raises(ValueError, match="status_reader"):
-        compute_graph_snapshots(
-            "cycle-1",
-            "world-state-1",
-            client=MagicMock(),
-            graph_generation_id=1,
-            regime_reader=reader,
-            snapshot_writer=writer,
-            graph_status=_ready_status(),
-        )
-
-    assert events == []
     assert reader.calls == []
     assert writer.calls == []
 
@@ -363,6 +430,7 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
         lambda *args, **kwargs: events.append("impact") or impact_snapshot,
     )
     writer = RecordingSnapshotWriter(events)
+    status_manager, _ = _status_manager(_ready_status())
 
     result = compute_graph_snapshots(
         "cycle-1",
@@ -371,7 +439,7 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
         graph_generation_id=1,
         regime_reader=StaticRegimeReader(),
         snapshot_writer=writer,
-        status_reader=StaticStatusReader(_ready_status()),
+        status_manager=status_manager,
     )
 
     graph_snapshot = result[0]
@@ -389,7 +457,7 @@ def test_compute_graph_snapshots_rechecks_status_before_write(
     events: list[str] = []
     ready_status = _ready_status()
     rebuilding_status = _ready_status(graph_status="rebuilding")
-    status_reader = StaticStatusReader([ready_status, rebuilding_status])
+    status_manager, status_store = _status_manager([ready_status, rebuilding_status])
     writer = RecordingSnapshotWriter(events)
 
     _patch_metrics(monkeypatch, events)
@@ -417,10 +485,10 @@ def test_compute_graph_snapshots_rechecks_status_before_write(
             graph_generation_id=1,
             regime_reader=StaticRegimeReader(),
             snapshot_writer=writer,
-            status_reader=status_reader,
+            status_manager=status_manager,
         )
 
-    assert status_reader.calls == 2
+    assert status_store.calls == 2
     assert events == ["metrics", "context", "propagation", "impact"]
     assert writer.calls == []
 
@@ -454,6 +522,7 @@ def test_compute_graph_snapshots_rechecks_live_metrics_before_write(
         "build_graph_impact_snapshot",
         lambda *args, **kwargs: events.append("impact") or _impact_snapshot(),
     )
+    status_manager, _ = _status_manager(_ready_status())
 
     with pytest.raises(ValueError, match="live graph metrics disagree"):
         compute_graph_snapshots(
@@ -463,7 +532,7 @@ def test_compute_graph_snapshots_rechecks_live_metrics_before_write(
             graph_generation_id=1,
             regime_reader=StaticRegimeReader(),
             snapshot_writer=writer,
-            status_reader=StaticStatusReader(_ready_status()),
+            status_manager=status_manager,
         )
 
     assert events == ["metrics", "context", "propagation", "impact", "metrics"]
@@ -495,6 +564,7 @@ def test_compute_graph_snapshots_does_not_write_if_snapshot_build_fails(
         "build_graph_impact_snapshot",
         raise_impact_error,
     )
+    status_manager, _ = _status_manager(_ready_status())
 
     with pytest.raises(ValueError, match="impact failed"):
         compute_graph_snapshots(
@@ -504,7 +574,7 @@ def test_compute_graph_snapshots_does_not_write_if_snapshot_build_fails(
             graph_generation_id=1,
             regime_reader=StaticRegimeReader(),
             snapshot_writer=writer,
-            status_reader=StaticStatusReader(_ready_status()),
+            status_manager=status_manager,
         )
 
     assert writer.calls == []
@@ -529,6 +599,7 @@ def test_compute_graph_snapshots_surfaces_writer_errors(
         "build_graph_impact_snapshot",
         lambda *args, **kwargs: _impact_snapshot(),
     )
+    status_manager, _ = _status_manager(_ready_status())
 
     with pytest.raises(RuntimeError, match="writer failed"):
         compute_graph_snapshots(
@@ -538,7 +609,7 @@ def test_compute_graph_snapshots_surfaces_writer_errors(
             graph_generation_id=1,
             regime_reader=StaticRegimeReader(),
             snapshot_writer=RaisingSnapshotWriter(),
-            status_reader=StaticStatusReader(_ready_status()),
+            status_manager=status_manager,
         )
 
 
@@ -561,6 +632,13 @@ def _patch_metrics(
     monkeypatch.setattr(snapshot_generator, "_read_graph_metrics", read_metrics)
 
 
+def _status_manager(
+    graph_status: Neo4jGraphStatus | list[Neo4jGraphStatus],
+) -> tuple[GraphStatusManager, SequentialStatusStore]:
+    store = SequentialStatusStore(graph_status)
+    return GraphStatusManager(store), store
+
+
 def _ready_status(
     *,
     graph_status: Literal["ready", "rebuilding", "failed"] = "ready",
@@ -569,6 +647,7 @@ def _ready_status(
     edge_count: int = 1,
     key_label_counts: dict[str, int] | None = None,
     checksum: str = "abc123",
+    writer_lock_token: str | None = None,
 ) -> Neo4jGraphStatus:
     return Neo4jGraphStatus(
         graph_status=graph_status,
@@ -579,6 +658,7 @@ def _ready_status(
         checksum=checksum,
         last_verified_at=NOW,
         last_reload_at=None,
+        writer_lock_token=writer_lock_token,
     )
 
 

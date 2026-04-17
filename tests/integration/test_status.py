@@ -12,6 +12,7 @@ from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
 from graph_engine.schema.manager import SchemaManager
 from graph_engine.snapshots import build_graph_snapshot
 from graph_engine.status import GraphStatusManager, check_live_graph_consistency
+from tests.fakes import InMemoryStatusStore
 
 pytestmark = pytest.mark.skipif(
     os.getenv("NEO4J_PASSWORD") is None,
@@ -19,28 +20,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
-
-
-class InMemoryStatusStore:
-    def __init__(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def read_current_status(self) -> Neo4jGraphStatus | None:
-        return self.status
-
-    def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        self.status = status
-
-    def compare_and_write_current_status(
-        self,
-        *,
-        expected_status: Neo4jGraphStatus | None,
-        next_status: Neo4jGraphStatus,
-    ) -> bool:
-        if self.status != expected_status:
-            return False
-        self.write_current_status(next_status)
-        return True
 
 
 class StaticSnapshotReader:
@@ -97,7 +76,14 @@ CREATE (source)-[:SUPPLY_CHAIN {
                     "edge_id": edge_id,
                 },
             )
-            snapshot = build_graph_snapshot("cycle-status", 11, client)
+            snapshot = build_graph_snapshot(
+                "cycle-status",
+                11,
+                client,
+                status_manager=GraphStatusManager(
+                    InMemoryStatusStore(_status_for_generation(11)),
+                ),
+            )
             status_manager = GraphStatusManager(
                 InMemoryStatusStore(_status_from_snapshot(snapshot)),
                 clock=lambda: NOW,
@@ -143,6 +129,19 @@ def _status_from_snapshot(snapshot: GraphSnapshot) -> Neo4jGraphStatus:
         edge_count=snapshot.edge_count,
         key_label_counts=snapshot.key_label_counts,
         checksum=snapshot.checksum,
+        last_verified_at=NOW,
+        last_reload_at=None,
+    )
+
+
+def _status_for_generation(graph_generation_id: int) -> Neo4jGraphStatus:
+    return Neo4jGraphStatus(
+        graph_status="ready",
+        graph_generation_id=graph_generation_id,
+        node_count=0,
+        edge_count=0,
+        key_label_counts={},
+        checksum="pending",
         last_verified_at=NOW,
         last_reload_at=None,
     )
