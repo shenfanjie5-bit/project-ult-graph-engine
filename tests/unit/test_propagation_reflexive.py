@@ -90,9 +90,7 @@ class FakeReflexiveGDSClient:
         return [
             row
             for row in self.path_rows
-            if row.get("propagation_channel") == "reflexive"
-            or row.get("channel") == "reflexive"
-            or row.get("impact_channel") == "reflexive"
+            if _effective_channel(row) == "reflexive"
         ]
 
 
@@ -193,7 +191,8 @@ def test_run_reflexive_propagation_filters_tagged_paths_and_explains_scores() ->
     assert all(" SET " not in query and " DELETE " not in query for query in write_queries)
     assert client.write_calls[1][1]["graph_name"] == "unit-reflexive"
     assert "relationship.propagation_channel" in write_queries[1]
-    assert 'relationship.impact_channel) = "reflexive"' in write_queries[1]
+    assert 'relationship.impact_channel, CASE type(relationship)' in write_queries[1]
+    assert '= "reflexive"' in write_queries[1]
 
     path_query = next(
         query
@@ -201,7 +200,8 @@ def test_run_reflexive_propagation_filters_tagged_paths_and_explains_scores() ->
         if "MATCH (source)-[relationship]->(target)" in query
     )
     assert "coalesce(relationship.propagation_channel" in path_query
-    assert 'relationship.impact_channel) = "reflexive"' in path_query
+    assert 'relationship.impact_channel, CASE type(relationship)' in path_query
+    assert '= "reflexive"' in path_query
 
     pagerank_call = next(
         (query, params)
@@ -343,6 +343,10 @@ def _path_row(
         "channel": channel,
         "impact_channel": impact_channel,
     }
+
+
+def _effective_channel(row: dict[str, Any]) -> str | None:
+    return row.get("propagation_channel") or row.get("channel") or row.get("impact_channel")
 
 
 def _path_score(row: dict[str, Any], params: dict[str, Any]) -> float:

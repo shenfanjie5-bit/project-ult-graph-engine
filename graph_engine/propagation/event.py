@@ -13,12 +13,14 @@ from graph_engine.propagation._gds import (
     execute_gds_read,
     execute_gds_write,
 )
+from graph_engine.propagation.channels import effective_channel_selector
 from graph_engine.propagation.scoring import build_score_explanation
 from graph_engine.schema.definitions import RelationshipType
 from graph_engine.status import GraphStatusManager, hold_ready_read
 
 EVENT_RELATIONSHIP_TYPES = (RelationshipType.EVENT_IMPACT.value,)
 _EVENT_CHANNEL = "event"
+_EVENT_PATH_SELECTOR = effective_channel_selector(_EVENT_CHANNEL)
 
 
 def run_event_propagation(
@@ -50,18 +52,22 @@ def run_event_propagation(
         projection_name = graph_name or _default_projection_name(context)
         drop_projection_if_exists(client, projection_name)
         try:
-            _create_projection(client, projection_name)
-            pagerank_entities = _stream_pagerank(
-                client,
-                projection_name,
-                max_iterations=max_iterations,
-                result_limit=result_limit,
-            )
-            activated_paths = _read_activated_paths(
-                context,
-                client,
-                result_limit=result_limit,
-            )
+            relationship_count = _create_projection(client, projection_name)
+            if relationship_count == 0:
+                pagerank_entities: list[dict[str, Any]] = []
+                activated_paths: list[dict[str, Any]] = []
+            else:
+                pagerank_entities = _stream_pagerank(
+                    client,
+                    projection_name,
+                    max_iterations=max_iterations,
+                    result_limit=result_limit,
+                )
+                activated_paths = _read_activated_paths(
+                    context,
+                    client,
+                    result_limit=result_limit,
+                )
         finally:
             drop_projection_if_exists(client, projection_name)
 
@@ -73,6 +79,7 @@ def run_event_propagation(
     channel_breakdown: dict[str, Any] = {
         _EVENT_CHANNEL: {
             "relationship_types": list(EVENT_RELATIONSHIP_TYPES),
+            "path_selector": _EVENT_PATH_SELECTOR,
             "path_count": len(activated_paths),
             "impacted_entity_count": len(impacted_entities),
             "total_path_score": sum(float(path["score"]) for path in activated_paths),
@@ -95,32 +102,32 @@ def _default_projection_name(context: PropagationContext) -> str:
     return f"graph_engine_event_{cycle_component}_{uuid4().hex[:8]}"
 
 
-def _create_projection(client: Neo4jClient, graph_name: str) -> None:
-    relationship_projection = {
-        relationship_type: {
-            "type": relationship_type,
-            "orientation": "NATURAL",
-            "properties": {
-                "weight": {
-                    "property": "weight",
-                    "defaultValue": 1.0,
-                },
-            },
-        }
-        for relationship_type in EVENT_RELATIONSHIP_TYPES
-    }
-    execute_gds_write(
+def _create_projection(client: Neo4jClient, graph_name: str) -> int:
+    rows = execute_gds_write(
         client,
-        """
-CALL gds.graph.project($graph_name, "*", $relationship_projection)
-YIELD graphName, nodeCount, relationshipCount
-RETURN graphName, nodeCount, relationshipCount
+        f"""
+MATCH (source)-[relationship]->(target)
+WHERE {_EVENT_PATH_SELECTOR}
+WITH gds.graph.project(
+    $graph_name,
+    source,
+    target,
+    {{
+        relationshipType: type(relationship),
+        relationshipProperties: {{
+            weight: coalesce(relationship.weight, 1.0)
+        }}
+    }}
+) AS projection
+RETURN projection.graphName AS graphName,
+       projection.nodeCount AS nodeCount,
+       projection.relationshipCount AS relationshipCount
 """,
-        {
-            "graph_name": graph_name,
-            "relationship_projection": relationship_projection,
-        },
+        {"graph_name": graph_name},
     )
+    if not rows:
+        return 0
+    return int(rows[0].get("relationshipCount") or 0)
 
 
 def _stream_pagerank(
@@ -172,9 +179,9 @@ def _read_activated_paths(
     channel_multiplier = _context_multiplier(context.channel_multipliers)
     regime_multiplier = _context_multiplier(context.regime_multipliers)
     rows = client.execute_read(
-        """
+        f"""
 MATCH (source)-[relationship]->(target)
-WHERE type(relationship) IN $relationship_types
+WHERE {_EVENT_PATH_SELECTOR}
 WITH source,
      relationship,
      target,
@@ -212,7 +219,6 @@ ORDER BY path_score DESC,
 LIMIT $result_limit
 """,
         {
-            "relationship_types": list(EVENT_RELATIONSHIP_TYPES),
             "result_limit": result_limit,
             "channel_multiplier": channel_multiplier,
             "regime_multiplier": regime_multiplier,

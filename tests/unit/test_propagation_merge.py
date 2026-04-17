@@ -12,6 +12,110 @@ from graph_engine.status import GraphStatusManager
 from tests.fakes import InMemoryStatusStore
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
+_DEFAULT_CHANNEL_BY_RELATIONSHIP_TYPE = {
+    "SUPPLY_CHAIN": "fundamental",
+    "OWNERSHIP": "fundamental",
+    "INDUSTRY_CHAIN": "fundamental",
+    "SECTOR_MEMBERSHIP": "fundamental",
+    "EVENT_IMPACT": "event",
+}
+
+
+class FakeFullPropagationGDSClient:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.read_calls: list[tuple[str, dict[str, Any]]] = []
+        self.write_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def execute_read(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        params = parameters or {}
+        self.read_calls.append((query, params))
+        if "gds.graph.exists" in query:
+            return [{"exists": False}]
+        if "gds.pageRank.stream" in query:
+            channel = _channel_from_graph_name(str(params.get("graph_name") or ""))
+            return self._pagerank_rows(channel)
+        if "MATCH (source)-[relationship]->(target)" in query:
+            rows = self._matching_rows(query, params)
+            rows.sort(
+                key=lambda row: (
+                    -_path_score(row, params),
+                    str(row["source_node_id"]),
+                    str(row["relationship_type"]),
+                    str(row["target_node_id"]),
+                    str(row["edge_id"]),
+                ),
+            )
+            return rows[: int(params.get("result_limit", len(rows)))]
+        return []
+
+    def execute_write(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        params = parameters or {}
+        self.write_calls.append((query, params))
+        if "gds.graph.project" not in query:
+            return []
+
+        rows = self._matching_rows(query, params)
+        node_ids = {
+            str(row[node_key])
+            for row in rows
+            for node_key in ("source_node_id", "target_node_id")
+        }
+        return [
+            {
+                "graphName": params.get("graph_name"),
+                "nodeCount": len(node_ids),
+                "relationshipCount": len(rows),
+            }
+        ]
+
+    def _matching_rows(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        channel = _channel_from_query(query)
+        if channel is not None:
+            return [row for row in self.rows if _effective_channel(row) == channel]
+
+        relationship_types = params.get("relationship_types")
+        if relationship_types is not None:
+            return [
+                row
+                for row in self.rows
+                if row.get("relationship_type") in set(relationship_types)
+            ]
+
+        relationship_projection = params.get("relationship_projection")
+        if isinstance(relationship_projection, dict):
+            return [
+                row
+                for row in self.rows
+                if row.get("relationship_type") in set(relationship_projection)
+            ]
+
+        return list(self.rows)
+
+    def _pagerank_rows(self, channel: str | None) -> list[dict[str, Any]]:
+        rows = [
+            row
+            for row in self.rows
+            if channel is None or _effective_channel(row) == channel
+        ]
+        return [
+            {
+                "node_id": row["target_node_id"],
+                "canonical_entity_id": row["target_entity_id"],
+                "labels": row["target_labels"],
+                "stable_node_id": row["target_node_id"],
+                "score": row["relation_weight"],
+            }
+            for row in rows
+        ]
 
 
 def test_merge_propagation_results_rejects_empty_results() -> None:
@@ -243,6 +347,57 @@ def test_run_full_propagation_uses_distinct_projection_names_per_channel(
     ]
 
 
+def test_run_full_propagation_emits_reflexive_tagged_ownership_only_once() -> None:
+    client = FakeFullPropagationGDSClient(
+        [
+            _full_path_row(
+                edge_id="edge-fundamental",
+                relationship_type="SUPPLY_CHAIN",
+                target_node_id="node-fundamental",
+                target_entity_id="entity-fundamental",
+                relation_weight=1.0,
+            ),
+            _full_path_row(
+                edge_id="edge-event",
+                relationship_type="EVENT_IMPACT",
+                target_node_id="node-event",
+                target_entity_id="entity-event",
+                relation_weight=2.0,
+            ),
+            _full_path_row(
+                edge_id="edge-reflexive-ownership",
+                relationship_type="OWNERSHIP",
+                target_node_id="node-reflexive",
+                target_entity_id="entity-reflexive",
+                relation_weight=3.0,
+                propagation_channel="reflexive",
+            ),
+        ]
+    )
+
+    result = run_full_propagation(
+        _context(enabled_channels=["fundamental", "event", "reflexive"]),
+        client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+        graph_name="unit-projection",
+        result_limit=20,
+    )
+
+    channels_by_edge_id: dict[str, set[str]] = {}
+    for path in result.activated_paths:
+        channels_by_edge_id.setdefault(str(path["edge_id"]), set()).add(str(path["channel"]))
+
+    assert channels_by_edge_id["edge-reflexive-ownership"] == {"reflexive"}
+    assert channels_by_edge_id["edge-fundamental"] == {"fundamental"}
+    assert channels_by_edge_id["edge-event"] == {"event"}
+    duplicated_edges = {
+        edge_id: channels
+        for edge_id, channels in channels_by_edge_id.items()
+        if len(channels) > 1
+    }
+    assert duplicated_edges == {}
+
+
 def test_run_full_propagation_reuses_projection_name_for_single_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -269,6 +424,74 @@ def test_run_full_propagation_requires_status_manager() -> None:
             _context(enabled_channels=["fundamental"]),
             object(),  # type: ignore[arg-type]
         )
+
+
+def _full_path_row(
+    *,
+    edge_id: str,
+    relationship_type: str,
+    target_node_id: str,
+    target_entity_id: str,
+    relation_weight: float,
+    propagation_channel: str | None = None,
+    channel: str | None = None,
+    impact_channel: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "source_node_id": "node-source",
+        "source_entity_id": "entity-source",
+        "source_labels": ["Entity"],
+        "target_node_id": target_node_id,
+        "target_entity_id": target_entity_id,
+        "target_labels": ["Entity"],
+        "edge_id": edge_id,
+        "relationship_type": relationship_type,
+        "relation_weight": relation_weight,
+        "evidence_confidence": 1.0,
+        "recency_decay": 1.0,
+        "propagation_channel": propagation_channel,
+        "channel": channel,
+        "impact_channel": impact_channel,
+    }
+
+
+def _effective_channel(row: dict[str, Any]) -> str | None:
+    return (
+        row.get("propagation_channel")
+        or row.get("channel")
+        or row.get("impact_channel")
+        or _DEFAULT_CHANNEL_BY_RELATIONSHIP_TYPE.get(str(row.get("relationship_type") or ""))
+    )
+
+
+def _channel_from_query(query: str) -> str | None:
+    for channel in ("fundamental", "event", "reflexive"):
+        if f') = "{channel}"' in query:
+            return channel
+    return None
+
+
+def _channel_from_graph_name(graph_name: str) -> str | None:
+    for channel in ("fundamental", "event", "reflexive"):
+        if graph_name.endswith(f"-{channel}"):
+            return channel
+    return None
+
+
+def _path_score(row: dict[str, Any], params: dict[str, Any]) -> float:
+    return (
+        _float_or_default(row.get("relation_weight"))
+        * _float_or_default(row.get("evidence_confidence"))
+        * float(params.get("channel_multiplier", 1.0))
+        * float(params.get("regime_multiplier", 1.0))
+        * _float_or_default(row.get("recency_decay"))
+    )
+
+
+def _float_or_default(value: Any, default: float = 1.0) -> float:
+    if value is None:
+        return default
+    return float(value)
 
 
 def _runner(channel: str, calls: list[tuple[str, str | None, int, int]]):
