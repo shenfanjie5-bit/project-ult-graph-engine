@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from graph_engine.models import Neo4jGraphStatus
 
 
@@ -23,6 +26,10 @@ class InMemoryStatusStore:
 
     def read_current_status(self) -> Neo4jGraphStatus | None:
         return self.status
+
+    @contextmanager
+    def ready_read_current_status(self) -> Iterator[Neo4jGraphStatus | None]:
+        yield self.read_current_status()
 
     def write_current_status(self, status: Neo4jGraphStatus) -> None:
         self.status = status

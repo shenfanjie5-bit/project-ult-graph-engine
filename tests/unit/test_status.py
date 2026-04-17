@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from threading import Condition, Event
 from typing import Any, Literal
 from unittest.mock import MagicMock
 
@@ -42,6 +46,74 @@ class InterleavingStatusStore(InMemoryStatusStore):
             expected_status=expected_status,
             next_status=next_status,
         )
+
+
+class SharedStatusBoundary:
+    def __init__(self, status: Neo4jGraphStatus) -> None:
+        self.status = status
+        self.writer_waiting = Event()
+        self._condition = Condition()
+        self._active_readers = 0
+        self._writer_active = False
+
+    @contextmanager
+    def ready_read(self) -> Iterator[Neo4jGraphStatus]:
+        with self._condition:
+            while self._writer_active:
+                self._condition.wait()
+            self._active_readers += 1
+        try:
+            yield self.status
+        finally:
+            with self._condition:
+                self._active_readers -= 1
+                self._condition.notify_all()
+
+    @contextmanager
+    def status_write(self) -> Iterator[None]:
+        with self._condition:
+            self.writer_waiting.set()
+            while self._writer_active or self._active_readers > 0:
+                self._condition.wait()
+            self._writer_active = True
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer_active = False
+                self._condition.notify_all()
+
+
+class SharedBoundaryStatusStore:
+    def __init__(self, boundary: SharedStatusBoundary) -> None:
+        self.boundary = boundary
+        self.writes: list[Neo4jGraphStatus] = []
+
+    def read_current_status(self) -> Neo4jGraphStatus:
+        return self.boundary.status
+
+    @contextmanager
+    def ready_read_current_status(self) -> Iterator[Neo4jGraphStatus]:
+        with self.boundary.ready_read() as status:
+            yield status
+
+    def write_current_status(self, status: Neo4jGraphStatus) -> None:
+        with self.boundary.status_write():
+            self.boundary.status = status
+            self.writes.append(status)
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        with self.boundary.status_write():
+            if self.boundary.status != expected_status:
+                return False
+            self.boundary.status = next_status
+            self.writes.append(next_status)
+            return True
 
 
 class StaticSnapshotReader:
@@ -390,6 +462,28 @@ def test_require_ready_rejects_non_ready_status(
         require_ready_status(status)
     with pytest.raises(PermissionError, match="ready"):
         GraphStatusManager(InMemoryStatusStore(status)).require_ready()
+
+
+def test_ready_read_barrier_is_shared_by_distinct_status_store_instances() -> None:
+    boundary = SharedStatusBoundary(_status(graph_status="ready", graph_generation_id=8))
+    reader_manager = GraphStatusManager(SharedBoundaryStatusStore(boundary))
+    writer_manager = GraphStatusManager(SharedBoundaryStatusStore(boundary))
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        with reader_manager.ready_read() as ready_status:
+            future = executor.submit(writer_manager.mark_rebuilding)
+
+            assert ready_status.graph_status == "ready"
+            assert boundary.writer_waiting.wait(timeout=1.0)
+            assert not future.done()
+            assert boundary.status == ready_status
+
+        rebuilt_status = future.result(timeout=1.0)
+    finally:
+        executor.shutdown(wait=True)
+
+    assert rebuilt_status.graph_status == "rebuilding"
+    assert boundary.status == rebuilt_status
 
 
 def test_mark_verified_updates_metrics_without_bumping_generation() -> None:

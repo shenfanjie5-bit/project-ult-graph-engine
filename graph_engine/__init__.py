@@ -37,6 +37,7 @@ from graph_engine.status import (
     PostgresStatusStore,
     StatusStore,
     check_live_graph_consistency,
+    ready_read,
     require_ready_read,
     require_ready_status,
 )
@@ -75,6 +76,7 @@ __all__ = [
     "get_index_statements",
     "load_config_from_env",
     "query_subgraph",
+    "ready_read",
     "rebuild_gds_projection",
     "require_ready_read",
     "require_ready_status",

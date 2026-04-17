@@ -6,6 +6,7 @@ from graph_engine.status.consistency import (
 )
 from graph_engine.status.manager import (
     GraphStatusManager,
+    ready_read,
     require_ready_read,
     require_ready_status,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "PostgresStatusStore",
     "StatusStore",
     "check_live_graph_consistency",
+    "ready_read",
     "require_ready_read",
     "require_ready_status",
 ]

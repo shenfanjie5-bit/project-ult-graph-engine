@@ -18,7 +18,7 @@ from graph_engine.models import (
 from graph_engine.propagation.context import RegimeContextReader, build_propagation_context
 from graph_engine.propagation.fundamental import run_fundamental_propagation
 from graph_engine.snapshots.writer import SnapshotWriter
-from graph_engine.status import GraphStatusManager, require_ready_read
+from graph_engine.status import GraphStatusManager, ready_read
 
 
 def build_graph_snapshot(
@@ -30,17 +30,17 @@ def build_graph_snapshot(
 ) -> GraphSnapshot:
     """Read live graph metrics and return a deterministic structural snapshot."""
 
-    ready_status = require_ready_read(status_manager, "graph snapshot generation")
-    _validate_generation_input(graph_generation_id, ready_status)
-    node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
-    return _graph_snapshot_from_metrics(
-        cycle_id,
-        graph_generation_id,
-        node_count=node_count,
-        edge_count=edge_count,
-        key_label_counts=key_label_counts,
-        checksum=checksum,
-    )
+    with ready_read(status_manager, "graph snapshot generation") as ready_status:
+        _validate_generation_input(graph_generation_id, ready_status)
+        node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
+        return _graph_snapshot_from_metrics(
+            cycle_id,
+            graph_generation_id,
+            node_count=node_count,
+            edge_count=edge_count,
+            key_label_counts=key_label_counts,
+            checksum=checksum,
+        )
 
 
 def build_graph_impact_snapshot(
@@ -82,50 +82,50 @@ def compute_graph_snapshots(
 ) -> tuple[GraphSnapshot, GraphImpactSnapshot]:
     """Run fundamental propagation and write graph plus impact snapshots."""
 
-    ready_status = require_ready_read(status_manager, "snapshot generation")
-    _validate_generation_input(graph_generation_id, ready_status)
-    node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
-    _validate_status_metrics(
-        ready_status,
-        node_count=node_count,
-        edge_count=edge_count,
-        key_label_counts=key_label_counts,
-        checksum=checksum,
-    )
+    with ready_read(status_manager, "snapshot generation") as ready_status:
+        _validate_generation_input(graph_generation_id, ready_status)
+        node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
+        _validate_status_metrics(
+            ready_status,
+            node_count=node_count,
+            edge_count=edge_count,
+            key_label_counts=key_label_counts,
+            checksum=checksum,
+        )
 
-    context = build_propagation_context(
-        cycle_id,
-        world_state_ref,
-        ready_status.graph_generation_id,
-        regime_reader=regime_reader,
-        graph_status=ready_status,
-    )
-    propagation_result = run_fundamental_propagation(
-        context,
-        client,
-        status_manager=status_manager,
-        graph_name=graph_name,
-    )
-    graph_snapshot = _graph_snapshot_from_metrics(
-        cycle_id,
-        ready_status.graph_generation_id,
-        node_count=node_count,
-        edge_count=edge_count,
-        key_label_counts=key_label_counts,
-        checksum=checksum,
-    )
-    impact_snapshot = build_graph_impact_snapshot(
-        cycle_id,
-        world_state_ref,
-        propagation_result,
-    )
-    _validate_publication_status_and_metrics(
-        ready_status,
-        status_manager,
-        client,
-    )
-    snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
-    return graph_snapshot, impact_snapshot
+        context = build_propagation_context(
+            cycle_id,
+            world_state_ref,
+            ready_status.graph_generation_id,
+            regime_reader=regime_reader,
+            graph_status=ready_status,
+        )
+        propagation_result = run_fundamental_propagation(
+            context,
+            client,
+            status_manager=status_manager,
+            graph_name=graph_name,
+        )
+        graph_snapshot = _graph_snapshot_from_metrics(
+            cycle_id,
+            ready_status.graph_generation_id,
+            node_count=node_count,
+            edge_count=edge_count,
+            key_label_counts=key_label_counts,
+            checksum=checksum,
+        )
+        impact_snapshot = build_graph_impact_snapshot(
+            cycle_id,
+            world_state_ref,
+            propagation_result,
+        )
+        _validate_publication_status_and_metrics(
+            ready_status,
+            status_manager,
+            client,
+        )
+        snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
+        return graph_snapshot, impact_snapshot
 
 
 def _validate_generation_input(
@@ -181,19 +181,19 @@ def _validate_publication_status_and_metrics(
     client: Neo4jClient,
 ) -> None:
     try:
-        current_status = require_ready_read(status_manager, "snapshot publication")
+        with ready_read(status_manager, "snapshot publication") as current_status:
+            _validate_status_matches_ready_status(current_status, ready_status)
+
+            node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
+            _validate_status_metrics(
+                current_status,
+                node_count=node_count,
+                edge_count=edge_count,
+                key_label_counts=key_label_counts,
+                checksum=checksum,
+            )
     except PermissionError as exc:
         raise RuntimeError("ready graph status changed before snapshot publication") from exc
-    _validate_status_matches_ready_status(current_status, ready_status)
-
-    node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
-    _validate_status_metrics(
-        current_status,
-        node_count=node_count,
-        edge_count=edge_count,
-        key_label_counts=key_label_counts,
-        checksum=checksum,
-    )
 
 
 def _validate_status_matches_ready_status(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Literal
 from unittest.mock import MagicMock
@@ -109,6 +111,10 @@ class SequentialStatusStore:
         self.calls += 1
         index = min(self.calls - 1, len(self.graph_statuses) - 1)
         return self.graph_statuses[index]
+
+    @contextmanager
+    def ready_read_current_status(self) -> Iterator[Neo4jGraphStatus]:
+        yield self.read_current_status()
 
     def write_current_status(self, status: Neo4jGraphStatus) -> None:
         self.graph_statuses = [status]

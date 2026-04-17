@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from threading import Barrier
 from typing import Any
@@ -28,13 +30,22 @@ class BarrierStatusStore(PostgreSQLStatusStore):
 
     def read_current_status(self) -> Neo4jGraphStatus | None:
         status = super().read_current_status()
+        self._wait_if_ready(status)
+        return status
+
+    @contextmanager
+    def ready_read_current_status(self) -> Iterator[Neo4jGraphStatus | None]:
+        with super().ready_read_current_status() as status:
+            self._wait_if_ready(status)
+            yield status
+
+    def _wait_if_ready(self, status: Neo4jGraphStatus | None) -> None:
         if (
             status is not None
             and status.graph_status == "ready"
             and status.writer_lock_token is None
         ):
             self._barrier.wait(timeout=10)
-        return status
 
 
 def test_postgresql_status_store_bootstraps_empty_row_and_persists_transitions() -> None:

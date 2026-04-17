@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import importlib
+import json
 import os
 import re
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from threading import Lock
 from typing import Any, Protocol
 
@@ -22,8 +22,18 @@ class StatusStore(Protocol):
     def read_current_status(self) -> Neo4jGraphStatus | None:
         """Return the current status row, or None before bootstrap."""
 
+    def ready_read_current_status(self) -> AbstractContextManager[Neo4jGraphStatus | None]:
+        """Hold a shared persistence barrier for a ready-gated live graph read.
+
+        Production stores must coordinate this barrier across every store
+        instance backed by the same status row.  Status writes must take the
+        matching exclusive barrier before changing the persisted status so a
+        writer cannot begin mutating the live graph after a ready check but
+        before the protected read has completed.
+        """
+
     def write_current_status(self, status: Neo4jGraphStatus) -> None:
-        """Persist the current status row."""
+        """Persist the current status row under the exclusive status barrier."""
 
     def compare_and_write_current_status(
         self,
@@ -31,7 +41,11 @@ class StatusStore(Protocol):
         expected_status: Neo4jGraphStatus | None,
         next_status: Neo4jGraphStatus,
     ) -> bool:
-        """Atomically persist next_status only if the current row still matches."""
+        """Atomically persist next_status only if the current row still matches.
+
+        The compare-and-write must acquire the same exclusive status barrier
+        used by write_current_status before checking and writing the row.
+        """
 
 
 class PostgreSQLStatusStore:
@@ -148,26 +162,21 @@ ADD COLUMN IF NOT EXISTS writer_lock_token text NULL CHECK (
         self._ensure_bootstrap()
         with self._transaction() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    f"""
-SELECT graph_status,
-       graph_generation_id,
-       node_count,
-       edge_count,
-       key_label_counts,
-       checksum,
-       last_verified_at,
-       last_reload_at,
-       writer_lock_token
-FROM {self._table_name}
-WHERE status_key = %s
-""",
-                    (self._status_key,),
-                )
-                row = cursor.fetchone()
+                row = self._read_current_status_row(cursor)
         if row is None:
             return None
         return _status_from_row(row)
+
+    @contextmanager
+    def ready_read_current_status(self) -> Iterator[Neo4jGraphStatus | None]:
+        """Return current status while holding a shared transaction advisory lock."""
+
+        self._ensure_bootstrap()
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._acquire_ready_read_lock(cursor)
+                row = self._read_current_status_row(cursor)
+            yield None if row is None else _status_from_row(row)
 
     def write_current_status(self, status: Neo4jGraphStatus) -> None:
         """Persist the current status row without comparing the previous value."""
@@ -176,6 +185,7 @@ WHERE status_key = %s
         values = _status_write_values(status)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._acquire_status_write_lock(cursor)
                 cursor.execute(
                     f"""
 INSERT INTO {self._table_name} (
@@ -222,6 +232,7 @@ ON CONFLICT (status_key) DO UPDATE SET
         expected_values = _status_write_values(expected_status)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._acquire_status_write_lock(cursor)
                 cursor.execute(
                     f"""
 UPDATE {self._table_name}
@@ -254,6 +265,7 @@ RETURNING status_key
     def _insert_if_missing(self, next_values: tuple[Any, ...]) -> bool:
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._acquire_status_write_lock(cursor)
                 cursor.execute(
                     f"""
 INSERT INTO {self._table_name} (
@@ -275,6 +287,45 @@ RETURNING status_key
                     (self._status_key, *next_values),
                 )
                 return cursor.fetchone() is not None
+
+    def _read_current_status_row(self, cursor: Any) -> Any:
+        cursor.execute(
+            f"""
+SELECT graph_status,
+       graph_generation_id,
+       node_count,
+       edge_count,
+       key_label_counts,
+       checksum,
+       last_verified_at,
+       last_reload_at,
+       writer_lock_token
+FROM {self._table_name}
+WHERE status_key = %s
+""",
+            (self._status_key,),
+        )
+        return cursor.fetchone()
+
+    def _acquire_ready_read_lock(self, cursor: Any) -> None:
+        cursor.execute(
+            """
+SELECT pg_advisory_xact_lock_shared(
+    hashtextextended((%s::regclass)::oid::text || ':' || %s, 0::bigint)
+)
+""",
+            (self._table_name, self._status_key),
+        )
+
+    def _acquire_status_write_lock(self, cursor: Any) -> None:
+        cursor.execute(
+            """
+SELECT pg_advisory_xact_lock(
+    hashtextextended((%s::regclass)::oid::text || ':' || %s, 0::bigint)
+)
+""",
+            (self._table_name, self._status_key),
+        )
 
     def _ensure_bootstrap(self) -> None:
         if self._auto_bootstrap and not self._bootstrapped:

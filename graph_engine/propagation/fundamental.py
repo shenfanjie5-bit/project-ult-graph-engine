@@ -10,7 +10,7 @@ from graph_engine.client import Neo4jClient
 from graph_engine.models import PropagationContext, PropagationResult
 from graph_engine.propagation.scoring import build_score_explanation
 from graph_engine.schema.definitions import RelationshipType
-from graph_engine.status import GraphStatusManager, require_ready_read
+from graph_engine.status import GraphStatusManager, ready_read
 
 FUNDAMENTAL_RELATIONSHIP_TYPES = (
     RelationshipType.SUPPLY_CHAIN.value,
@@ -39,57 +39,57 @@ def run_fundamental_propagation(
     if result_limit < 1:
         raise ValueError("result_limit must be greater than zero")
 
-    ready_status = require_ready_read(status_manager, "fundamental propagation")
-    if ready_status.graph_generation_id != context.graph_generation_id:
-        raise ValueError(
-            "PropagationContext graph_generation_id disagrees with Neo4jGraphStatus: "
-            f"context={context.graph_generation_id}, "
-            f"status={ready_status.graph_generation_id}",
-        )
+    with ready_read(status_manager, "fundamental propagation") as ready_status:
+        if ready_status.graph_generation_id != context.graph_generation_id:
+            raise ValueError(
+                "PropagationContext graph_generation_id disagrees with Neo4jGraphStatus: "
+                f"context={context.graph_generation_id}, "
+                f"status={ready_status.graph_generation_id}",
+            )
 
-    projection_name = graph_name or _default_projection_name(context)
-    _drop_projection_if_exists(client, projection_name)
-    try:
-        _create_projection(client, projection_name)
-        pagerank_entities = _stream_pagerank(
-            client,
-            projection_name,
-            max_iterations=max_iterations,
-            result_limit=result_limit,
-        )
-        activated_paths = _read_activated_paths(
-            context,
-            client,
-            result_limit=result_limit,
-        )
-    finally:
+        projection_name = graph_name or _default_projection_name(context)
         _drop_projection_if_exists(client, projection_name)
+        try:
+            _create_projection(client, projection_name)
+            pagerank_entities = _stream_pagerank(
+                client,
+                projection_name,
+                max_iterations=max_iterations,
+                result_limit=result_limit,
+            )
+            activated_paths = _read_activated_paths(
+                context,
+                client,
+                result_limit=result_limit,
+            )
+        finally:
+            _drop_projection_if_exists(client, projection_name)
 
-    # Keep PageRank as the GDS topology pass, but rank persisted impacts by the
-    # documented five-factor path scores so the snapshot outputs stay coherent.
-    impacted_entities = _impacted_entities_from_paths(
-        activated_paths,
-        pagerank_entities,
-        result_limit=result_limit,
-    )
+        # Keep PageRank as the GDS topology pass, but rank persisted impacts by the
+        # documented five-factor path scores so the snapshot outputs stay coherent.
+        impacted_entities = _impacted_entities_from_paths(
+            activated_paths,
+            pagerank_entities,
+            result_limit=result_limit,
+        )
 
-    channel_breakdown: dict[str, Any] = {
-        _FUNDAMENTAL_CHANNEL: {
-            "relationship_types": list(FUNDAMENTAL_RELATIONSHIP_TYPES),
-            "path_count": len(activated_paths),
-            "impacted_entity_count": len(impacted_entities),
-            "total_path_score": sum(float(path["score"]) for path in activated_paths),
-            "channel_multiplier": _context_multiplier(context.channel_multipliers),
-            "regime_multiplier": _context_multiplier(context.regime_multipliers),
-        },
-    }
-    return PropagationResult(
-        cycle_id=context.cycle_id,
-        graph_generation_id=context.graph_generation_id,
-        activated_paths=activated_paths,
-        impacted_entities=impacted_entities,
-        channel_breakdown=channel_breakdown,
-    )
+        channel_breakdown: dict[str, Any] = {
+            _FUNDAMENTAL_CHANNEL: {
+                "relationship_types": list(FUNDAMENTAL_RELATIONSHIP_TYPES),
+                "path_count": len(activated_paths),
+                "impacted_entity_count": len(impacted_entities),
+                "total_path_score": sum(float(path["score"]) for path in activated_paths),
+                "channel_multiplier": _context_multiplier(context.channel_multipliers),
+                "regime_multiplier": _context_multiplier(context.regime_multipliers),
+            },
+        }
+        return PropagationResult(
+            cycle_id=context.cycle_id,
+            graph_generation_id=context.graph_generation_id,
+            activated_paths=activated_paths,
+            impacted_entities=impacted_entities,
+            channel_breakdown=channel_breakdown,
+        )
 
 
 def _drop_projection_if_exists(client: Neo4jClient, graph_name: str) -> None:
