@@ -58,6 +58,7 @@ class FakeCanonicalWriter:
 class InMemoryStatusStore:
     def __init__(self, status: Neo4jGraphStatus | None = None) -> None:
         self.status = status
+        self.compare_calls: list[tuple[Neo4jGraphStatus | None, Neo4jGraphStatus]] = []
 
     def read_current_status(self) -> Neo4jGraphStatus | None:
         return self.status
@@ -71,22 +72,29 @@ class InMemoryStatusStore:
         expected_status: Neo4jGraphStatus | None,
         next_status: Neo4jGraphStatus,
     ) -> bool:
+        self.compare_calls.append((expected_status, next_status))
         if self.status != expected_status:
             return False
         self.write_current_status(next_status)
         return True
 
 
-class FlippingReadyManager(GraphStatusManager):
-    def __init__(self) -> None:
-        super().__init__(InMemoryStatusStore(_status()))
-        self.require_ready_calls = 0
+class StaleBarrierStatusStore(InMemoryStatusStore):
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        self.status = _status(graph_status="rebuilding")
+        return super().compare_and_write_current_status(
+            expected_status=expected_status,
+            next_status=next_status,
+        )
 
-    def require_ready(self) -> Neo4jGraphStatus:
-        self.require_ready_calls += 1
-        if self.require_ready_calls == 1:
-            return _status()
-        raise PermissionError("Neo4j live graph reads require graph_status='ready'")
+
+def _status_manager_from_store(store: InMemoryStatusStore) -> GraphStatusManager:
+    return GraphStatusManager(store)
 
 
 def test_validate_entity_anchors_checks_all_source_entities_once() -> None:
@@ -184,6 +192,7 @@ def test_promote_graph_deltas_writes_canonical_before_live_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
+    store = InMemoryStatusStore(_status())
 
     def fake_sync_live_graph(plan: PromotionPlan, client: Neo4jClient) -> None:
         assert plan.delta_ids == ["delta-1"]
@@ -203,11 +212,12 @@ def test_promote_graph_deltas_writes_canonical_before_live_graph(
         entity_reader=FakeEntityReader({"entity-1"}),
         canonical_writer=writer,
         client=mock_client,
-        status_manager=_status_manager(),
+        status_manager=_status_manager_from_store(store),
     )
 
     assert calls == ["canonical", "sync"]
     assert writer.plans == [plan]
+    assert store.compare_calls == [(_status(), _status())]
 
 
 def test_promote_graph_deltas_does_not_sync_when_canonical_write_fails(
@@ -276,15 +286,15 @@ def test_promote_graph_deltas_blocks_live_sync_when_graph_is_not_ready(
     sync_live_graph.assert_not_called()
 
 
-def test_promote_graph_deltas_rechecks_ready_before_live_sync(
+def test_promote_graph_deltas_rejects_stale_status_before_live_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sync_live_graph = MagicMock()
     monkeypatch.setattr(service_module, "sync_live_graph", sync_live_graph)
     writer = FakeCanonicalWriter()
-    status_manager = FlippingReadyManager()
+    status_manager = _status_manager_from_store(StaleBarrierStatusStore(_status()))
 
-    with pytest.raises(PermissionError, match="ready"):
+    with pytest.raises(RuntimeError, match="writer barrier"):
         promote_graph_deltas(
             "cycle-1",
             "selection-1",
@@ -298,8 +308,39 @@ def test_promote_graph_deltas_rechecks_ready_before_live_sync(
         )
 
     assert len(writer.plans) == 1
-    assert status_manager.require_ready_calls == 2
     sync_live_graph.assert_not_called()
+
+
+def test_promote_graph_deltas_detects_status_change_during_live_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    store = InMemoryStatusStore(_status())
+
+    def fake_sync_live_graph(plan: PromotionPlan, client: Neo4jClient) -> None:
+        assert plan.delta_ids == ["delta-1"]
+        calls.append("sync")
+        store.status = _status(graph_status="rebuilding")
+
+    monkeypatch.setattr(service_module, "sync_live_graph", fake_sync_live_graph)
+    writer = FakeCanonicalWriter()
+
+    with pytest.raises(RuntimeError, match="graph_status changed during promotion live sync"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([
+                _delta("delta-1", "node_add", {"node": _node_payload()}),
+            ]),
+            entity_reader=FakeEntityReader({"entity-1"}),
+            canonical_writer=writer,
+            client=MagicMock(spec=Neo4jClient),
+            status_manager=_status_manager_from_store(store),
+        )
+
+    assert len(writer.plans) == 1
+    assert calls == ["sync"]
+    assert store.status == _status(graph_status="rebuilding")
 
 
 def test_promote_graph_deltas_can_skip_live_graph_sync() -> None:

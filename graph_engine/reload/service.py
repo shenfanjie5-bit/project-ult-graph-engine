@@ -151,11 +151,6 @@ class _ExpectedSnapshotReader:
         return self._snapshot
 
 
-def _raise_if_deadline_exceeded(deadline: float, stage: str) -> None:
-    if monotonic() > deadline:
-        raise ColdReloadTimeoutError(f"cold reload timed out before {stage}")
-
-
 def _run_stage_with_deadline(
     deadline: float,
     stage: str,
