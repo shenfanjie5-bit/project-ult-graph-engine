@@ -55,26 +55,26 @@ def _sync_live_graph_with_status_barrier(
 ) -> None:
     """Mirror a promotion only while the ready status token still holds."""
 
-    ready_status, syncing_status = status_manager.begin_sync()
+    ready_status, locked_status = status_manager.begin_sync()
 
     try:
         _require_status_token_unchanged(
             status_manager,
-            syncing_status,
+            locked_status,
             "before promotion live sync",
         )
         sync_live_graph(plan, client)
         _require_status_token_unchanged(
             status_manager,
-            syncing_status,
+            locked_status,
             "after promotion live sync",
         )
         status_manager.finish_sync(
-            expected_status=syncing_status,
+            expected_status=locked_status,
             ready_status=ready_status,
         )
     except Exception:
-        _mark_sync_failed_safely(status_manager, syncing_status)
+        _mark_sync_failed_safely(status_manager, locked_status)
         raise
 
 
@@ -93,9 +93,9 @@ def _require_status_token_unchanged(
 
 def _mark_sync_failed_safely(
     status_manager: GraphStatusManager,
-    syncing_status: Neo4jGraphStatus,
+    locked_status: Neo4jGraphStatus,
 ) -> None:
     try:
-        status_manager.mark_sync_failed(expected_status=syncing_status)
+        status_manager.mark_sync_failed(expected_status=locked_status)
     except Exception:  # noqa: BLE001 - preserve the original promotion sync failure.
         return

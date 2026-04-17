@@ -28,7 +28,11 @@ class BarrierStatusStore(PostgreSQLStatusStore):
 
     def read_current_status(self) -> Neo4jGraphStatus | None:
         status = super().read_current_status()
-        if status is not None and status.graph_status == "ready":
+        if (
+            status is not None
+            and status.graph_status == "ready"
+            and status.writer_lock_token is None
+        ):
             self._barrier.wait(timeout=10)
         return status
 
@@ -82,10 +86,13 @@ def test_postgresql_status_store_rejects_competing_reload_and_sync_transitions()
             outcomes = [future.result(timeout=20) for future in futures]
 
         assert outcomes.count("stale") == 1
-        assert outcomes.count("syncing") + outcomes.count("rebuilding") == 1
+        assert outcomes.count("locked") + outcomes.count("rebuilding") == 1
         final_status = store.read_current_status()
         assert final_status is not None
-        assert final_status.graph_status in {"syncing", "rebuilding"}
+        assert final_status.graph_status == "rebuilding" or (
+            final_status.graph_status == "ready"
+            and final_status.writer_lock_token is not None
+        )
     finally:
         _drop_table(database_url, table_name)
 
@@ -98,7 +105,9 @@ def _begin_sync(database_url: str, table_name: str, barrier: Barrier) -> str:
     except RuntimeError as exc:
         assert "stale graph_status transition" in str(exc)
         return "stale"
-    return status.graph_status
+    assert status.graph_status == "ready"
+    assert status.writer_lock_token is not None
+    return "locked"
 
 
 def _mark_rebuilding(database_url: str, table_name: str, barrier: Barrier) -> str:

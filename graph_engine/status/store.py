@@ -107,7 +107,7 @@ class PostgreSQLStatusStore:
 CREATE TABLE IF NOT EXISTS {self._table_name} (
     status_key text PRIMARY KEY,
     graph_status text NOT NULL CHECK (
-        graph_status IN ('ready', 'syncing', 'rebuilding', 'failed')
+        graph_status IN ('ready', 'rebuilding', 'failed')
     ),
     graph_generation_id bigint NOT NULL CHECK (graph_generation_id >= 0),
     node_count bigint NOT NULL CHECK (node_count >= 0),
@@ -116,7 +116,18 @@ CREATE TABLE IF NOT EXISTS {self._table_name} (
     checksum text NOT NULL CHECK (checksum <> ''),
     last_verified_at timestamptz NULL,
     last_reload_at timestamptz NULL,
+    writer_lock_token text NULL CHECK (
+        writer_lock_token IS NULL OR writer_lock_token <> ''
+    ),
     updated_at timestamptz NOT NULL DEFAULT now()
+)
+""",
+                    )
+                    cursor.execute(
+                        f"""
+ALTER TABLE {self._table_name}
+ADD COLUMN IF NOT EXISTS writer_lock_token text NULL CHECK (
+    writer_lock_token IS NULL OR writer_lock_token <> ''
 )
 """,
                     )
@@ -142,7 +153,8 @@ SELECT graph_status,
        key_label_counts,
        checksum,
        last_verified_at,
-       last_reload_at
+       last_reload_at,
+       writer_lock_token
 FROM {self._table_name}
 WHERE status_key = %s
 """,
@@ -171,9 +183,10 @@ INSERT INTO {self._table_name} (
     key_label_counts,
     checksum,
     last_verified_at,
-    last_reload_at
+    last_reload_at,
+    writer_lock_token
 )
-VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
 ON CONFLICT (status_key) DO UPDATE SET
     graph_status = EXCLUDED.graph_status,
     graph_generation_id = EXCLUDED.graph_generation_id,
@@ -183,6 +196,7 @@ ON CONFLICT (status_key) DO UPDATE SET
     checksum = EXCLUDED.checksum,
     last_verified_at = EXCLUDED.last_verified_at,
     last_reload_at = EXCLUDED.last_reload_at,
+    writer_lock_token = EXCLUDED.writer_lock_token,
     updated_at = now()
 """,
                     (self._status_key, *values),
@@ -215,6 +229,7 @@ SET graph_status = %s,
     checksum = %s,
     last_verified_at = %s,
     last_reload_at = %s,
+    writer_lock_token = %s,
     updated_at = now()
 WHERE status_key = %s
   AND graph_status = %s
@@ -225,6 +240,7 @@ WHERE status_key = %s
   AND checksum = %s
   AND last_verified_at IS NOT DISTINCT FROM %s
   AND last_reload_at IS NOT DISTINCT FROM %s
+  AND writer_lock_token IS NOT DISTINCT FROM %s
 RETURNING status_key
 """,
                     (*next_values, self._status_key, *expected_values),
@@ -245,9 +261,10 @@ INSERT INTO {self._table_name} (
     key_label_counts,
     checksum,
     last_verified_at,
-    last_reload_at
+    last_reload_at,
+    writer_lock_token
 )
-VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
 ON CONFLICT (status_key) DO NOTHING
 RETURNING status_key
 """,
@@ -310,6 +327,7 @@ def _status_write_values(status: Neo4jGraphStatus) -> tuple[Any, ...]:
         status.checksum,
         status.last_verified_at,
         status.last_reload_at,
+        status.writer_lock_token,
     )
 
 
@@ -323,6 +341,7 @@ def _status_from_row(row: Any) -> Neo4jGraphStatus:
         checksum,
         last_verified_at,
         last_reload_at,
+        writer_lock_token,
     ) = row
     if isinstance(key_label_counts, str):
         key_label_counts = json.loads(key_label_counts)
@@ -336,4 +355,5 @@ def _status_from_row(row: Any) -> Neo4jGraphStatus:
         checksum=checksum,
         last_verified_at=last_verified_at,
         last_reload_at=last_reload_at,
+        writer_lock_token=writer_lock_token,
     )

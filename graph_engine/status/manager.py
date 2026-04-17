@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Literal
 
 from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
 from graph_engine.status.store import StatusStore
+
+_SYNC_WRITER_LOCK_TOKEN = "incremental-sync"
 
 
 def require_ready_status(graph_status: Neo4jGraphStatus) -> Neo4jGraphStatus:
@@ -51,6 +52,8 @@ class GraphStatusManager:
 
         current = self.store.read_current_status()
         current_state = current.graph_status if current is not None else None
+        if current is not None and current.writer_lock_token is not None:
+            raise ValueError("cannot transition graph_status with active writer lock to 'rebuilding'")
         if current_state == "rebuilding":
             raise ValueError("cannot transition graph_status from 'rebuilding' to 'rebuilding'")
 
@@ -74,7 +77,10 @@ class GraphStatusManager:
         """Acquire an exclusive live-graph writer token for incremental sync."""
 
         current = self.require_ready()
-        status = _copy_status_with_graph_status(current, "syncing")
+        if current.writer_lock_token is not None:
+            raise ValueError("incremental sync writer lock is already held")
+
+        status = _copy_status_with_writer_lock(current, _SYNC_WRITER_LOCK_TOKEN)
         self._commit_transition(current, status)
         return current, status
 
@@ -86,10 +92,12 @@ class GraphStatusManager:
     ) -> Neo4jGraphStatus:
         """Release an incremental sync writer token back to its ready status."""
 
-        if expected_status.graph_status != "syncing":
-            raise ValueError("finish_sync requires expected graph_status='syncing'")
+        if expected_status.graph_status != "ready" or expected_status.writer_lock_token is None:
+            raise ValueError("finish_sync requires an active incremental sync writer lock")
         if ready_status.graph_status != "ready":
             raise ValueError("finish_sync requires ready graph_status='ready'")
+        if ready_status.writer_lock_token is not None:
+            raise ValueError("finish_sync requires ready status without writer lock")
 
         self._commit_transition(expected_status, ready_status)
         return ready_status
@@ -105,8 +113,8 @@ class GraphStatusManager:
     ) -> Neo4jGraphStatus:
         """Release a failed incremental sync by exposing live graph failure."""
 
-        if expected_status.graph_status != "syncing":
-            raise ValueError("mark_sync_failed requires expected graph_status='syncing'")
+        if expected_status.graph_status != "ready" or expected_status.writer_lock_token is None:
+            raise ValueError("mark_sync_failed requires an active incremental sync writer lock")
 
         status = Neo4jGraphStatus(
             graph_status="failed",
@@ -179,7 +187,7 @@ class GraphStatusManager:
 
         current = self.store.read_current_status()
         current_state = current.graph_status if current is not None else None
-        if current_state not in {"rebuilding", "ready", "syncing"}:
+        if current_state not in {"rebuilding", "ready"}:
             raise ValueError(
                 "cannot transition graph_status from "
                 f"{current_state!r} to 'failed'",
@@ -203,6 +211,8 @@ class GraphStatusManager:
         """Refresh ready metrics from a canonical snapshot without bumping generation."""
 
         current = self.require_ready()
+        if current.writer_lock_token is not None:
+            raise ValueError("cannot verify graph_status while writer lock is active")
         if snapshot.graph_generation_id != current.graph_generation_id:
             raise ValueError(
                 "snapshot graph_generation_id disagrees with current status: "
@@ -241,17 +251,18 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _copy_status_with_graph_status(
+def _copy_status_with_writer_lock(
     status: Neo4jGraphStatus,
-    graph_status: Literal["ready", "syncing", "rebuilding", "failed"],
+    writer_lock_token: str,
 ) -> Neo4jGraphStatus:
     return Neo4jGraphStatus(
-        graph_status=graph_status,
+        graph_status=status.graph_status,
         graph_generation_id=status.graph_generation_id,
         node_count=status.node_count,
         edge_count=status.edge_count,
         key_label_counts=dict(status.key_label_counts),
         checksum=status.checksum,
-        last_verified_at=None if graph_status != "ready" else status.last_verified_at,
+        last_verified_at=status.last_verified_at,
         last_reload_at=status.last_reload_at,
+        writer_lock_token=writer_lock_token,
     )
