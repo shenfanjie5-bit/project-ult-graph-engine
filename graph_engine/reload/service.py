@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from time import monotonic
+from typing import TypeVar
 
 from graph_engine.client import Neo4jClient
 from graph_engine.models import ColdReloadPlan, GraphSnapshot, Neo4jGraphStatus, PromotionPlan
@@ -14,6 +17,7 @@ from graph_engine.status import GraphStatusManager, check_live_graph_consistency
 from graph_engine.sync import sync_live_graph
 
 _LOGGER = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 class ColdReloadTimeoutError(TimeoutError):
@@ -42,53 +46,78 @@ def cold_reload(
     entered_rebuilding = False
 
     try:
-        _raise_if_deadline_exceeded(deadline, "mark_rebuilding")
-        rebuilding_status = status_manager.mark_rebuilding()
+        rebuilding_status = _run_stage_with_deadline(
+            deadline,
+            "mark_rebuilding",
+            status_manager.mark_rebuilding,
+        )
         entered_rebuilding = True
 
-        _raise_if_deadline_exceeded(deadline, "read_cold_reload_plan")
-        plan = canonical_reader.read_cold_reload_plan(snapshot_ref)
-
-        _raise_if_deadline_exceeded(deadline, "drop_all")
-        manager.drop_all(
-            confirmation_token=DROP_ALL_CONFIRMATION_TOKEN,
-            graph_status=rebuilding_status,
+        plan = _run_stage_with_deadline(
+            deadline,
+            "read_cold_reload_plan",
+            lambda: canonical_reader.read_cold_reload_plan(snapshot_ref),
         )
 
-        _raise_if_deadline_exceeded(deadline, "sync_live_graph")
-        sync_live_graph(
-            build_reload_promotion_plan(plan, snapshot_ref=snapshot_ref),
-            client,
-            batch_size=batch_size,
+        _run_stage_with_deadline(
+            deadline,
+            "drop_all",
+            lambda: manager.drop_all(
+                confirmation_token=DROP_ALL_CONFIRMATION_TOKEN,
+                graph_status=rebuilding_status,
+            ),
         )
 
-        _raise_if_deadline_exceeded(deadline, "apply_schema")
-        manager.apply_schema()
+        _run_stage_with_deadline(
+            deadline,
+            "sync_live_graph",
+            lambda: sync_live_graph(
+                build_reload_promotion_plan(plan, snapshot_ref=snapshot_ref),
+                client,
+                batch_size=batch_size,
+            ),
+        )
 
-        _raise_if_deadline_exceeded(deadline, "verify_schema")
-        if not manager.verify_schema():
+        _run_stage_with_deadline(deadline, "apply_schema", manager.apply_schema)
+
+        schema_verified = _run_stage_with_deadline(
+            deadline,
+            "verify_schema",
+            manager.verify_schema,
+        )
+        if not schema_verified:
             raise RuntimeError("schema verification failed after cold reload")
 
-        _raise_if_deadline_exceeded(deadline, "rebuild_gds_projection")
-        rebuild_gds_projection(client, plan.projection_name)
+        _run_stage_with_deadline(
+            deadline,
+            "rebuild_gds_projection",
+            lambda: rebuild_gds_projection(client, plan.projection_name),
+        )
 
-        _raise_if_deadline_exceeded(deadline, "check_live_graph_consistency")
-        if not check_live_graph_consistency(
-            snapshot_ref,
-            client=client,
-            snapshot_reader=_ExpectedSnapshotReader(plan.expected_snapshot),
-            require_ready=False,
-        ):
+        is_consistent = _run_stage_with_deadline(
+            deadline,
+            "check_live_graph_consistency",
+            lambda: check_live_graph_consistency(
+                snapshot_ref,
+                client=client,
+                snapshot_reader=_ExpectedSnapshotReader(plan.expected_snapshot),
+                require_ready=False,
+            ),
+        )
+        if not is_consistent:
             raise RuntimeError("live graph consistency check failed after cold reload")
 
-        _raise_if_deadline_exceeded(deadline, "mark_ready")
-        return status_manager.mark_ready(
-            node_count=plan.expected_snapshot.node_count,
-            edge_count=plan.expected_snapshot.edge_count,
-            key_label_counts=plan.expected_snapshot.key_label_counts,
-            checksum=plan.expected_snapshot.checksum,
-            graph_generation_id=plan.expected_snapshot.graph_generation_id,
-            reload_completed=True,
+        return _run_stage_with_deadline(
+            deadline,
+            "mark_ready",
+            lambda: status_manager.mark_ready(
+                node_count=plan.expected_snapshot.node_count,
+                edge_count=plan.expected_snapshot.edge_count,
+                key_label_counts=plan.expected_snapshot.key_label_counts,
+                checksum=plan.expected_snapshot.checksum,
+                graph_generation_id=plan.expected_snapshot.graph_generation_id,
+                reload_completed=True,
+            ),
         )
     except Exception:
         if entered_rebuilding:
@@ -125,6 +154,30 @@ class _ExpectedSnapshotReader:
 def _raise_if_deadline_exceeded(deadline: float, stage: str) -> None:
     if monotonic() > deadline:
         raise ColdReloadTimeoutError(f"cold reload timed out before {stage}")
+
+
+def _run_stage_with_deadline(
+    deadline: float,
+    stage: str,
+    operation: Callable[[], _T],
+) -> _T:
+    remaining_seconds = deadline - monotonic()
+    if remaining_seconds <= 0:
+        raise ColdReloadTimeoutError(f"cold reload timed out before {stage}")
+
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cold-reload-{stage}")
+    future = executor.submit(operation)
+    timed_out = False
+    try:
+        return future.result(timeout=remaining_seconds)
+    except FutureTimeoutError as exc:
+        timed_out = True
+        future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise ColdReloadTimeoutError(f"cold reload timed out during {stage}") from exc
+    finally:
+        if not timed_out:
+            executor.shutdown(wait=True)
 
 
 def _mark_failed_safely(status_manager: GraphStatusManager) -> None:

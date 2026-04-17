@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from typing import Any, Literal
 from unittest.mock import MagicMock
@@ -434,6 +435,47 @@ def test_cold_reload_timeout_after_rebuilding_marks_failed(
     assert store.status is not None
     assert store.status.graph_status == "failed"
     assert order == ["mark_rebuilding", "mark_failed"]
+
+
+def test_cold_reload_timeout_during_blocking_stage_marks_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    store = InMemoryStatusStore(_status(graph_generation_id=3))
+    unblock_sync = threading.Event()
+
+    def blocking_sync_live_graph(
+        promotion_batch: PromotionPlan,
+        sync_client: Neo4jClient,
+        *,
+        batch_size: int,
+    ) -> None:
+        order.append("sync_live_graph")
+        unblock_sync.wait()
+
+    monkeypatch.setattr(reload_service, "sync_live_graph", blocking_sync_live_graph)
+
+    try:
+        with pytest.raises(
+            reload_service.ColdReloadTimeoutError,
+            match="during sync_live_graph",
+        ):
+            reload_service.cold_reload(
+                "snapshot-ref-1",
+                client=MagicMock(spec=Neo4jClient),
+                canonical_reader=StaticCanonicalReader(_reload_plan()),
+                status_manager=RecordingStatusManager(store, order),
+                schema_manager=RecordingSchemaManager(order),  # type: ignore[arg-type]
+                timeout_seconds=0.1,
+            )
+    finally:
+        unblock_sync.set()
+
+    assert store.status is not None
+    assert store.status.graph_status == "failed"
+    assert "sync_live_graph" in order
+    assert "mark_failed" in order
+    assert "mark_ready" not in order
 
 
 def test_rebuild_gds_projection_drops_existing_projection_and_creates_full_projection() -> None:

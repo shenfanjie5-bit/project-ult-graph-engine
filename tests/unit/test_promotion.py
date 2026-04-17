@@ -9,10 +9,11 @@ import pytest
 
 import graph_engine.promotion.service as service_module
 from graph_engine.client import Neo4jClient
-from graph_engine.models import CandidateGraphDelta, PromotionPlan
+from graph_engine.models import CandidateGraphDelta, Neo4jGraphStatus, PromotionPlan
 from graph_engine.promotion import build_promotion_plan, promote_graph_deltas
 from graph_engine.promotion.planner import validate_entity_anchors
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
+from graph_engine.status import GraphStatusManager
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 
@@ -52,6 +53,40 @@ class FakeCanonicalWriter:
         self.plans.append(plan)
         if self.fail:
             raise RuntimeError("canonical write failed")
+
+
+class InMemoryStatusStore:
+    def __init__(self, status: Neo4jGraphStatus | None = None) -> None:
+        self.status = status
+
+    def read_current_status(self) -> Neo4jGraphStatus | None:
+        return self.status
+
+    def write_current_status(self, status: Neo4jGraphStatus) -> None:
+        self.status = status
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        if self.status != expected_status:
+            return False
+        self.write_current_status(next_status)
+        return True
+
+
+class FlippingReadyManager(GraphStatusManager):
+    def __init__(self) -> None:
+        super().__init__(InMemoryStatusStore(_status()))
+        self.require_ready_calls = 0
+
+    def require_ready(self) -> Neo4jGraphStatus:
+        self.require_ready_calls += 1
+        if self.require_ready_calls == 1:
+            return _status()
+        raise PermissionError("Neo4j live graph reads require graph_status='ready'")
 
 
 def test_validate_entity_anchors_checks_all_source_entities_once() -> None:
@@ -168,6 +203,7 @@ def test_promote_graph_deltas_writes_canonical_before_live_graph(
         entity_reader=FakeEntityReader({"entity-1"}),
         canonical_writer=writer,
         client=mock_client,
+        status_manager=_status_manager(),
     )
 
     assert calls == ["canonical", "sync"]
@@ -190,8 +226,79 @@ def test_promote_graph_deltas_does_not_sync_when_canonical_write_fails(
             entity_reader=FakeEntityReader({"entity-1"}),
             canonical_writer=FakeCanonicalWriter(fail=True),
             client=MagicMock(spec=Neo4jClient),
+            status_manager=_status_manager(),
         )
 
+    sync_live_graph.assert_not_called()
+
+
+def test_promote_graph_deltas_requires_status_manager_for_live_sync() -> None:
+    writer = FakeCanonicalWriter()
+    reader = FakeCandidateReader([
+        _delta("delta-1", "node_add", {"node": _node_payload()}),
+    ])
+
+    with pytest.raises(ValueError, match="status_manager"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=reader,
+            entity_reader=FakeEntityReader({"entity-1"}),
+            canonical_writer=writer,
+            client=MagicMock(spec=Neo4jClient),
+        )
+
+    assert reader.calls == []
+    assert writer.plans == []
+
+
+def test_promote_graph_deltas_blocks_live_sync_when_graph_is_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync_live_graph = MagicMock()
+    monkeypatch.setattr(service_module, "sync_live_graph", sync_live_graph)
+    writer = FakeCanonicalWriter()
+
+    with pytest.raises(PermissionError, match="ready"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([
+                _delta("delta-1", "node_add", {"node": _node_payload()}),
+            ]),
+            entity_reader=FakeEntityReader({"entity-1"}),
+            canonical_writer=writer,
+            client=MagicMock(spec=Neo4jClient),
+            status_manager=_status_manager(graph_status="rebuilding"),
+        )
+
+    assert writer.plans == []
+    sync_live_graph.assert_not_called()
+
+
+def test_promote_graph_deltas_rechecks_ready_before_live_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync_live_graph = MagicMock()
+    monkeypatch.setattr(service_module, "sync_live_graph", sync_live_graph)
+    writer = FakeCanonicalWriter()
+    status_manager = FlippingReadyManager()
+
+    with pytest.raises(PermissionError, match="ready"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([
+                _delta("delta-1", "node_add", {"node": _node_payload()}),
+            ]),
+            entity_reader=FakeEntityReader({"entity-1"}),
+            canonical_writer=writer,
+            client=MagicMock(spec=Neo4jClient),
+            status_manager=status_manager,
+        )
+
+    assert len(writer.plans) == 1
+    assert status_manager.require_ready_calls == 2
     sync_live_graph.assert_not_called()
 
 
@@ -210,6 +317,29 @@ def test_promote_graph_deltas_can_skip_live_graph_sync() -> None:
     )
 
     assert writer.plans == [plan]
+
+
+def _status_manager(
+    *,
+    graph_status: str = "ready",
+) -> GraphStatusManager:
+    return GraphStatusManager(InMemoryStatusStore(_status(graph_status=graph_status)))
+
+
+def _status(
+    *,
+    graph_status: str = "ready",
+) -> Neo4jGraphStatus:
+    return Neo4jGraphStatus(
+        graph_status=graph_status,
+        graph_generation_id=3,
+        node_count=2,
+        edge_count=1,
+        key_label_counts={"Entity": 2},
+        checksum="abc123",
+        last_verified_at=NOW if graph_status == "ready" else None,
+        last_reload_at=None,
+    )
 
 
 def _delta(

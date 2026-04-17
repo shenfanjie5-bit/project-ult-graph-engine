@@ -9,10 +9,17 @@ import pytest
 
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
-from graph_engine.models import CandidateGraphDelta, GraphEdgeRecord, GraphNodeRecord, PromotionPlan
+from graph_engine.models import (
+    CandidateGraphDelta,
+    GraphEdgeRecord,
+    GraphNodeRecord,
+    Neo4jGraphStatus,
+    PromotionPlan,
+)
 from graph_engine.promotion import promote_graph_deltas
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import SchemaManager
+from graph_engine.status import GraphStatusManager
 from graph_engine.sync import sync_live_graph
 
 pytestmark = pytest.mark.skipif(
@@ -51,6 +58,28 @@ class CapturingCanonicalWriter:
         self.plans.append(plan)
 
 
+class InMemoryStatusStore:
+    def __init__(self, status: Neo4jGraphStatus) -> None:
+        self.status = status
+
+    def read_current_status(self) -> Neo4jGraphStatus | None:
+        return self.status
+
+    def write_current_status(self, status: Neo4jGraphStatus) -> None:
+        self.status = status
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        if self.status != expected_status:
+            return False
+        self.write_current_status(next_status)
+        return True
+
+
 def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
     pytest.importorskip("neo4j")
     prefix = f"promotion-sync-{uuid4().hex}"
@@ -86,6 +115,7 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
         manager = SchemaManager(client)
         manager.apply_schema()
         assert manager.verify_schema() is True
+        status_manager = GraphStatusManager(InMemoryStatusStore(_ready_status()))
 
         try:
             for _ in range(2):
@@ -98,6 +128,7 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
                     ),
                     canonical_writer=writer,
                     client=client,
+                    status_manager=status_manager,
                 )
 
             counts = _live_graph_counts(client, node_ids, edge_id, assertion_id)
@@ -258,6 +289,19 @@ RETURN node.properties_json AS node_properties_json,
         },
     )
     return rows[0]
+
+
+def _ready_status() -> Neo4jGraphStatus:
+    return Neo4jGraphStatus(
+        graph_status="ready",
+        graph_generation_id=3,
+        node_count=0,
+        edge_count=0,
+        key_label_counts={},
+        checksum="integration-ready",
+        last_verified_at=NOW,
+        last_reload_at=None,
+    )
 
 
 def _live_graph_score_payloads(
