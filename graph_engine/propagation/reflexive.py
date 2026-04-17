@@ -1,4 +1,4 @@
-"""Fundamental single-channel propagation over a temporary GDS projection."""
+"""Reflexive propagation over reflexive-tagged relationships."""
 
 from __future__ import annotations
 
@@ -14,19 +14,16 @@ from graph_engine.propagation._gds import (
     execute_gds_write,
 )
 from graph_engine.propagation.scoring import build_score_explanation
-from graph_engine.schema.definitions import RelationshipType
 from graph_engine.status import GraphStatusManager, require_ready_read
 
-FUNDAMENTAL_RELATIONSHIP_TYPES = (
-    RelationshipType.SUPPLY_CHAIN.value,
-    RelationshipType.OWNERSHIP.value,
-    RelationshipType.INDUSTRY_CHAIN.value,
-    RelationshipType.SECTOR_MEMBERSHIP.value,
+_REFLEXIVE_CHANNEL = "reflexive"
+_REFLEXIVE_PATH_SELECTOR = (
+    'coalesce(relationship.propagation_channel, relationship.channel, '
+    'relationship.impact_channel) = "reflexive"'
 )
-_FUNDAMENTAL_CHANNEL = "fundamental"
 
 
-def run_fundamental_propagation(
+def run_reflexive_propagation(
     context: PropagationContext,
     client: Neo4jClient,
     *,
@@ -35,16 +32,16 @@ def run_fundamental_propagation(
     max_iterations: int = 20,
     result_limit: int = 100,
 ) -> PropagationResult:
-    """Run weighted PageRank for the fundamental channel and explain edge paths."""
+    """Run weighted PageRank for reflexive-tagged relationships."""
 
-    if _FUNDAMENTAL_CHANNEL not in context.enabled_channels:
-        raise PermissionError("fundamental propagation requires the fundamental channel")
+    if _REFLEXIVE_CHANNEL not in context.enabled_channels:
+        raise PermissionError("reflexive propagation requires the reflexive channel")
     if max_iterations < 1:
         raise ValueError("max_iterations must be greater than zero")
     if result_limit < 1:
         raise ValueError("result_limit must be greater than zero")
 
-    ready_status = require_ready_read(status_manager, "fundamental propagation")
+    ready_status = require_ready_read(status_manager, "reflexive propagation")
     if ready_status.graph_generation_id != context.graph_generation_id:
         raise ValueError(
             "PropagationContext graph_generation_id disagrees with Neo4jGraphStatus: "
@@ -55,32 +52,33 @@ def run_fundamental_propagation(
     projection_name = graph_name or _default_projection_name(context)
     drop_projection_if_exists(client, projection_name)
     try:
-        _create_projection(client, projection_name)
-        pagerank_entities = _stream_pagerank(
-            client,
-            projection_name,
-            max_iterations=max_iterations,
-            result_limit=result_limit,
-        )
-        activated_paths = _read_activated_paths(
-            context,
-            client,
-            result_limit=result_limit,
-        )
+        relationship_count = _create_projection(client, projection_name)
+        if relationship_count == 0:
+            pagerank_entities: list[dict[str, Any]] = []
+            activated_paths: list[dict[str, Any]] = []
+        else:
+            pagerank_entities = _stream_pagerank(
+                client,
+                projection_name,
+                max_iterations=max_iterations,
+                result_limit=result_limit,
+            )
+            activated_paths = _read_activated_paths(
+                context,
+                client,
+                result_limit=result_limit,
+            )
     finally:
         drop_projection_if_exists(client, projection_name)
 
-    # Keep PageRank as the GDS topology pass, but rank persisted impacts by the
-    # documented five-factor path scores so the snapshot outputs stay coherent.
     impacted_entities = _impacted_entities_from_paths(
         activated_paths,
         pagerank_entities,
         result_limit=result_limit,
     )
-
     channel_breakdown: dict[str, Any] = {
-        _FUNDAMENTAL_CHANNEL: {
-            "relationship_types": list(FUNDAMENTAL_RELATIONSHIP_TYPES),
+        _REFLEXIVE_CHANNEL: {
+            "path_selector": _REFLEXIVE_PATH_SELECTOR,
             "path_count": len(activated_paths),
             "impacted_entity_count": len(impacted_entities),
             "total_path_score": sum(float(path["score"]) for path in activated_paths),
@@ -100,35 +98,35 @@ def run_fundamental_propagation(
 def _default_projection_name(context: PropagationContext) -> str:
     cycle_component = re.sub(r"[^A-Za-z0-9_]", "_", context.cycle_id).strip("_")
     cycle_component = (cycle_component or "cycle")[:64]
-    return f"graph_engine_fundamental_{cycle_component}_{uuid4().hex[:8]}"
+    return f"graph_engine_reflexive_{cycle_component}_{uuid4().hex[:8]}"
 
 
-def _create_projection(client: Neo4jClient, graph_name: str) -> None:
-    relationship_projection = {
-        relationship_type: {
-            "type": relationship_type,
-            "orientation": "NATURAL",
-            "properties": {
-                "weight": {
-                    "property": "weight",
-                    "defaultValue": 1.0,
-                },
-            },
-        }
-        for relationship_type in FUNDAMENTAL_RELATIONSHIP_TYPES
-    }
-    execute_gds_write(
+def _create_projection(client: Neo4jClient, graph_name: str) -> int:
+    rows = execute_gds_write(
         client,
-        """
-CALL gds.graph.project($graph_name, "*", $relationship_projection)
-YIELD graphName, nodeCount, relationshipCount
-RETURN graphName, nodeCount, relationshipCount
+        f"""
+MATCH (source)-[relationship]->(target)
+WHERE {_REFLEXIVE_PATH_SELECTOR}
+WITH gds.graph.project(
+    $graph_name,
+    source,
+    target,
+    {{
+        relationshipType: type(relationship),
+        relationshipProperties: {{
+            weight: coalesce(relationship.weight, 1.0)
+        }}
+    }}
+) AS projection
+RETURN projection.graphName AS graphName,
+       projection.nodeCount AS nodeCount,
+       projection.relationshipCount AS relationshipCount
 """,
-        {
-            "graph_name": graph_name,
-            "relationship_projection": relationship_projection,
-        },
+        {"graph_name": graph_name},
     )
+    if not rows:
+        return 0
+    return int(rows[0].get("relationshipCount") or 0)
 
 
 def _stream_pagerank(
@@ -164,7 +162,7 @@ LIMIT $result_limit
             "result_limit": result_limit,
         },
     )
-    impacted_entities = [_impacted_entity(row) for row in rows]
+    impacted_entities = [_pagerank_entity(row) for row in rows]
     impacted_entities.sort(
         key=lambda entity: (-float(entity["score"]), str(entity["stable_node_id"])),
     )
@@ -180,9 +178,9 @@ def _read_activated_paths(
     channel_multiplier = _context_multiplier(context.channel_multipliers)
     regime_multiplier = _context_multiplier(context.regime_multipliers)
     rows = client.execute_read(
-        """
+        f"""
 MATCH (source)-[relationship]->(target)
-WHERE type(relationship) IN $relationship_types
+WHERE {_REFLEXIVE_PATH_SELECTOR}
 WITH source,
      relationship,
      target,
@@ -220,7 +218,6 @@ ORDER BY path_score DESC,
 LIMIT $result_limit
 """,
         {
-            "relationship_types": list(FUNDAMENTAL_RELATIONSHIP_TYPES),
             "result_limit": result_limit,
             "channel_multiplier": channel_multiplier,
             "regime_multiplier": regime_multiplier,
@@ -260,7 +257,7 @@ def _activated_path(
     )
 
     return {
-        "channel": _FUNDAMENTAL_CHANNEL,
+        "channel": _REFLEXIVE_CHANNEL,
         "source_node_id": row.get("source_node_id"),
         "source_entity_id": row.get("source_entity_id"),
         "source_labels": _string_list(row.get("source_labels")),
@@ -274,10 +271,10 @@ def _activated_path(
     }
 
 
-def _impacted_entity(row: dict[str, Any]) -> dict[str, Any]:
+def _pagerank_entity(row: dict[str, Any]) -> dict[str, Any]:
     stable_node_id = str(row.get("stable_node_id") or row.get("node_id") or "")
     return {
-        "channel": _FUNDAMENTAL_CHANNEL,
+        "channel": _REFLEXIVE_CHANNEL,
         "node_id": row.get("node_id"),
         "canonical_entity_id": row.get("canonical_entity_id"),
         "labels": _string_list(row.get("labels")),
@@ -307,7 +304,7 @@ def _impacted_entities_from_paths(
         impact = impacted_by_node_id.setdefault(
             node_id,
             {
-                "channel": _FUNDAMENTAL_CHANNEL,
+                "channel": _REFLEXIVE_CHANNEL,
                 "node_id": target_node_id,
                 "canonical_entity_id": path.get("target_entity_id"),
                 "labels": _string_list(path.get("target_labels")),
@@ -334,7 +331,7 @@ def _impacted_entities_from_paths(
 
 
 def _context_multiplier(multipliers: dict[str, float]) -> float:
-    return float(multipliers.get(_FUNDAMENTAL_CHANNEL, 1.0))
+    return float(multipliers.get(_REFLEXIVE_CHANNEL, 1.0))
 
 
 def _float_value(value: Any, *, default: float) -> float:

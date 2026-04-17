@@ -1,4 +1,4 @@
-"""Fundamental single-channel propagation over a temporary GDS projection."""
+"""Event propagation over EVENT_IMPACT relationships."""
 
 from __future__ import annotations
 
@@ -17,16 +17,11 @@ from graph_engine.propagation.scoring import build_score_explanation
 from graph_engine.schema.definitions import RelationshipType
 from graph_engine.status import GraphStatusManager, require_ready_read
 
-FUNDAMENTAL_RELATIONSHIP_TYPES = (
-    RelationshipType.SUPPLY_CHAIN.value,
-    RelationshipType.OWNERSHIP.value,
-    RelationshipType.INDUSTRY_CHAIN.value,
-    RelationshipType.SECTOR_MEMBERSHIP.value,
-)
-_FUNDAMENTAL_CHANNEL = "fundamental"
+EVENT_RELATIONSHIP_TYPES = (RelationshipType.EVENT_IMPACT.value,)
+_EVENT_CHANNEL = "event"
 
 
-def run_fundamental_propagation(
+def run_event_propagation(
     context: PropagationContext,
     client: Neo4jClient,
     *,
@@ -35,16 +30,16 @@ def run_fundamental_propagation(
     max_iterations: int = 20,
     result_limit: int = 100,
 ) -> PropagationResult:
-    """Run weighted PageRank for the fundamental channel and explain edge paths."""
+    """Run weighted PageRank for the event channel and explain event impact paths."""
 
-    if _FUNDAMENTAL_CHANNEL not in context.enabled_channels:
-        raise PermissionError("fundamental propagation requires the fundamental channel")
+    if _EVENT_CHANNEL not in context.enabled_channels:
+        raise PermissionError("event propagation requires the event channel")
     if max_iterations < 1:
         raise ValueError("max_iterations must be greater than zero")
     if result_limit < 1:
         raise ValueError("result_limit must be greater than zero")
 
-    ready_status = require_ready_read(status_manager, "fundamental propagation")
+    ready_status = require_ready_read(status_manager, "event propagation")
     if ready_status.graph_generation_id != context.graph_generation_id:
         raise ValueError(
             "PropagationContext graph_generation_id disagrees with Neo4jGraphStatus: "
@@ -70,17 +65,14 @@ def run_fundamental_propagation(
     finally:
         drop_projection_if_exists(client, projection_name)
 
-    # Keep PageRank as the GDS topology pass, but rank persisted impacts by the
-    # documented five-factor path scores so the snapshot outputs stay coherent.
     impacted_entities = _impacted_entities_from_paths(
         activated_paths,
         pagerank_entities,
         result_limit=result_limit,
     )
-
     channel_breakdown: dict[str, Any] = {
-        _FUNDAMENTAL_CHANNEL: {
-            "relationship_types": list(FUNDAMENTAL_RELATIONSHIP_TYPES),
+        _EVENT_CHANNEL: {
+            "relationship_types": list(EVENT_RELATIONSHIP_TYPES),
             "path_count": len(activated_paths),
             "impacted_entity_count": len(impacted_entities),
             "total_path_score": sum(float(path["score"]) for path in activated_paths),
@@ -100,7 +92,7 @@ def run_fundamental_propagation(
 def _default_projection_name(context: PropagationContext) -> str:
     cycle_component = re.sub(r"[^A-Za-z0-9_]", "_", context.cycle_id).strip("_")
     cycle_component = (cycle_component or "cycle")[:64]
-    return f"graph_engine_fundamental_{cycle_component}_{uuid4().hex[:8]}"
+    return f"graph_engine_event_{cycle_component}_{uuid4().hex[:8]}"
 
 
 def _create_projection(client: Neo4jClient, graph_name: str) -> None:
@@ -115,7 +107,7 @@ def _create_projection(client: Neo4jClient, graph_name: str) -> None:
                 },
             },
         }
-        for relationship_type in FUNDAMENTAL_RELATIONSHIP_TYPES
+        for relationship_type in EVENT_RELATIONSHIP_TYPES
     }
     execute_gds_write(
         client,
@@ -164,7 +156,7 @@ LIMIT $result_limit
             "result_limit": result_limit,
         },
     )
-    impacted_entities = [_impacted_entity(row) for row in rows]
+    impacted_entities = [_pagerank_entity(row) for row in rows]
     impacted_entities.sort(
         key=lambda entity: (-float(entity["score"]), str(entity["stable_node_id"])),
     )
@@ -220,7 +212,7 @@ ORDER BY path_score DESC,
 LIMIT $result_limit
 """,
         {
-            "relationship_types": list(FUNDAMENTAL_RELATIONSHIP_TYPES),
+            "relationship_types": list(EVENT_RELATIONSHIP_TYPES),
             "result_limit": result_limit,
             "channel_multiplier": channel_multiplier,
             "regime_multiplier": regime_multiplier,
@@ -260,7 +252,7 @@ def _activated_path(
     )
 
     return {
-        "channel": _FUNDAMENTAL_CHANNEL,
+        "channel": _EVENT_CHANNEL,
         "source_node_id": row.get("source_node_id"),
         "source_entity_id": row.get("source_entity_id"),
         "source_labels": _string_list(row.get("source_labels")),
@@ -274,10 +266,10 @@ def _activated_path(
     }
 
 
-def _impacted_entity(row: dict[str, Any]) -> dict[str, Any]:
+def _pagerank_entity(row: dict[str, Any]) -> dict[str, Any]:
     stable_node_id = str(row.get("stable_node_id") or row.get("node_id") or "")
     return {
-        "channel": _FUNDAMENTAL_CHANNEL,
+        "channel": _EVENT_CHANNEL,
         "node_id": row.get("node_id"),
         "canonical_entity_id": row.get("canonical_entity_id"),
         "labels": _string_list(row.get("labels")),
@@ -307,7 +299,7 @@ def _impacted_entities_from_paths(
         impact = impacted_by_node_id.setdefault(
             node_id,
             {
-                "channel": _FUNDAMENTAL_CHANNEL,
+                "channel": _EVENT_CHANNEL,
                 "node_id": target_node_id,
                 "canonical_entity_id": path.get("target_entity_id"),
                 "labels": _string_list(path.get("target_labels")),
@@ -334,7 +326,7 @@ def _impacted_entities_from_paths(
 
 
 def _context_multiplier(multipliers: dict[str, float]) -> float:
-    return float(multipliers.get(_FUNDAMENTAL_CHANNEL, 1.0))
+    return float(multipliers.get(_EVENT_CHANNEL, 1.0))
 
 
 def _float_value(value: Any, *, default: float) -> float:

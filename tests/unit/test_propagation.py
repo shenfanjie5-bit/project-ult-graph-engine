@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from graph_engine.models import Neo4jGraphStatus, PropagationContext
 from graph_engine.propagation import (
@@ -161,10 +162,62 @@ def test_build_propagation_context_reads_regime_context_only() -> None:
     )
 
     assert reader.calls == ["world-state-1"]
+    assert context.enabled_channels == ["fundamental"]
     assert context.channel_multipliers == {"fundamental": 1.25}
     assert context.regime_multipliers == {"fundamental": 0.8}
     assert context.decay_policy == {"half_life_days": 30}
     assert "main_core" not in sys.modules
+
+
+def test_propagation_context_accepts_all_channels_and_rejects_duplicates() -> None:
+    context = PropagationContext(
+        cycle_id="cycle-1",
+        world_state_ref="world-state-1",
+        graph_generation_id=1,
+        enabled_channels=["fundamental", "event", "reflexive"],
+        channel_multipliers={"fundamental": 1.0, "event": 1.0, "reflexive": 1.0},
+        regime_multipliers={"fundamental": 1.0, "event": 1.0, "reflexive": 1.0},
+        decay_policy={},
+        regime_context={},
+    )
+
+    assert context.enabled_channels == ["fundamental", "event", "reflexive"]
+
+    with pytest.raises(ValidationError, match="duplicates"):
+        PropagationContext(
+            cycle_id="cycle-1",
+            world_state_ref="world-state-1",
+            graph_generation_id=1,
+            enabled_channels=["event", "event"],
+            channel_multipliers={"event": 1.0},
+            regime_multipliers={"event": 1.0},
+            decay_policy={},
+            regime_context={},
+        )
+
+
+def test_build_propagation_context_reads_multipliers_for_requested_channels() -> None:
+    reader = StaticRegimeReader(
+        {
+            "channel_multipliers": {"event": 2.5},
+            "regime_multipliers": {"reflexive": 0.25},
+            "decay_policy": {"half_life_days": 3},
+        }
+    )
+
+    context = build_propagation_context(
+        "cycle-1",
+        "world-state-1",
+        7,
+        regime_reader=reader,
+        enabled_channels=["event", "reflexive"],
+    )
+
+    assert reader.calls == ["world-state-1"]
+    assert context.enabled_channels == ["event", "reflexive"]
+    assert context.channel_multipliers == {"event": 2.5, "reflexive": 1.0}
+    assert context.regime_multipliers == {"event": 1.0, "reflexive": 0.25}
+    assert context.decay_policy == {"half_life_days": 3}
 
 
 def test_build_propagation_context_rejects_non_ready_status_before_reading() -> None:
