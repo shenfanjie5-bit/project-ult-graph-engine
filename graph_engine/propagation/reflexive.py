@@ -13,14 +13,12 @@ from graph_engine.propagation._gds import (
     execute_gds_read,
     execute_gds_write,
 )
+from graph_engine.propagation.channels import effective_channel_selector
 from graph_engine.propagation.scoring import build_score_explanation
 from graph_engine.status import GraphStatusManager, hold_ready_read
 
 _REFLEXIVE_CHANNEL = "reflexive"
-_REFLEXIVE_PATH_SELECTOR = (
-    'coalesce(relationship.propagation_channel, relationship.channel, '
-    'relationship.impact_channel) = "reflexive"'
-)
+_REFLEXIVE_PATH_SELECTOR = effective_channel_selector(_REFLEXIVE_CHANNEL)
 
 
 def run_reflexive_propagation(

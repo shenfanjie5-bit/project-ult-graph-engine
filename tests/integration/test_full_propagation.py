@@ -147,9 +147,20 @@ def test_compute_graph_snapshots_generates_three_channel_impact_snapshot() -> No
         (path["edge_id"], path["channel"])
         for path in impact_snapshot.activated_paths
     }
+    channels_by_edge_id: dict[str, set[str]] = {}
+    for path in impact_snapshot.activated_paths:
+        channels_by_edge_id.setdefault(str(path["edge_id"]), set()).add(str(path["channel"]))
+
     assert (supply_edge_id, "fundamental") in path_channels_by_edge
     assert (event_edge_id, "event") in path_channels_by_edge
     assert (reflexive_edge_id, "reflexive") in path_channels_by_edge
+    assert channels_by_edge_id[reflexive_edge_id] == {"reflexive"}
+    duplicated_edges = {
+        edge_id: channels
+        for edge_id, channels in channels_by_edge_id.items()
+        if len(channels) > 1
+    }
+    assert duplicated_edges == {}
     assert set(impact_snapshot.channel_breakdown) == {
         "fundamental",
         "event",

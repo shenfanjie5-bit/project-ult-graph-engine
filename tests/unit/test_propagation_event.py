@@ -63,7 +63,7 @@ class FakeEventGDSClient:
                 },
             ]
         if "MATCH (source)-[relationship]->(target)" in query:
-            rows = list(self.path_rows)
+            rows = self._event_rows()
             rows.sort(
                 key=lambda row: (
                     -_path_score(row, params),
@@ -81,8 +81,20 @@ class FakeEventGDSClient:
         query: str,
         parameters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        self.write_calls.append((query, parameters or {}))
+        params = parameters or {}
+        self.write_calls.append((query, params))
+        if "gds.graph.project" in query:
+            return [
+                {
+                    "graphName": params.get("graph_name"),
+                    "nodeCount": 2 if self._event_rows() else 0,
+                    "relationshipCount": len(self._event_rows()),
+                }
+            ]
         return []
+
+    def _event_rows(self) -> list[dict[str, Any]]:
+        return [row for row in self.path_rows if _effective_channel(row) == "event"]
 
 
 def test_run_event_propagation_requires_event_channel_before_neo4j_reads() -> None:
@@ -179,9 +191,11 @@ def test_run_event_propagation_uses_projection_and_explains_paths() -> None:
     assert "gds.graph.drop" in write_queries[2]
     assert all(" SET " not in query and " DELETE " not in query for query in write_queries)
 
-    projection_params = client.write_calls[1][1]
+    projection_query, projection_params = client.write_calls[1]
     assert projection_params["graph_name"] == "unit-event"
-    assert set(projection_params["relationship_projection"]) == set(EVENT_RELATIONSHIP_TYPES)
+    assert "coalesce(relationship.propagation_channel" in projection_query
+    assert 'WHEN "EVENT_IMPACT" THEN "event"' in projection_query
+    assert '= "event"' in projection_query
 
     pagerank_call = next(
         (query, params)
@@ -197,7 +211,8 @@ def test_run_event_propagation_uses_projection_and_explains_paths() -> None:
         if "MATCH (source)-[relationship]->(target)" in query
     )
     assert "ORDER BY path_score DESC" in path_call[0]
-    assert path_call[1]["relationship_types"] == list(EVENT_RELATIONSHIP_TYPES)
+    assert "coalesce(relationship.propagation_channel" in path_call[0]
+    assert 'WHEN "EVENT_IMPACT" THEN "event"' in path_call[0]
 
     assert [path["edge_id"] for path in result.activated_paths] == ["edge-top", "edge-mid"]
     assert result.activated_paths[0]["channel"] == "event"
@@ -214,6 +229,15 @@ def test_run_event_propagation_uses_projection_and_explains_paths() -> None:
     assert result.impacted_entities[0]["path_count"] == 1
     assert result.channel_breakdown["event"] == {
         "relationship_types": list(EVENT_RELATIONSHIP_TYPES),
+        "path_selector": (
+            'coalesce(relationship.propagation_channel, relationship.channel, '
+            'relationship.impact_channel, CASE type(relationship) '
+            'WHEN "SUPPLY_CHAIN" THEN "fundamental" '
+            'WHEN "OWNERSHIP" THEN "fundamental" '
+            'WHEN "INDUSTRY_CHAIN" THEN "fundamental" '
+            'WHEN "SECTOR_MEMBERSHIP" THEN "fundamental" '
+            'WHEN "EVENT_IMPACT" THEN "event" ELSE null END) = "event"'
+        ),
         "path_count": 2,
         "impacted_entity_count": 2,
         "total_path_score": 2.5,
@@ -223,7 +247,20 @@ def test_run_event_propagation_uses_projection_and_explains_paths() -> None:
 
 
 def test_run_event_propagation_cleans_up_projection_on_exception() -> None:
-    client = FakeEventGDSClient(exists_results=[False, True], fail_on_pagerank=True)
+    client = FakeEventGDSClient(
+        exists_results=[False, True],
+        fail_on_pagerank=True,
+        path_rows=[
+            _path_row(
+                edge_id="edge-1",
+                target_node_id="node-b",
+                target_entity_id="entity-b",
+                relation_weight=1.0,
+                evidence_confidence=1.0,
+                recency_decay=1.0,
+            ),
+        ],
+    )
 
     with pytest.raises(RuntimeError, match="pagerank failed"):
         run_event_propagation(
@@ -294,6 +331,9 @@ def _path_row(
     relation_weight: float,
     evidence_confidence: float,
     recency_decay: float,
+    propagation_channel: str | None = None,
+    channel: str | None = None,
+    impact_channel: str | None = None,
 ) -> dict[str, Any]:
     return {
         "source_node_id": "node-a",
@@ -307,7 +347,19 @@ def _path_row(
         "relation_weight": relation_weight,
         "evidence_confidence": evidence_confidence,
         "recency_decay": recency_decay,
+        "propagation_channel": propagation_channel,
+        "channel": channel,
+        "impact_channel": impact_channel,
     }
+
+
+def _effective_channel(row: dict[str, Any]) -> str | None:
+    return (
+        row.get("propagation_channel")
+        or row.get("channel")
+        or row.get("impact_channel")
+        or ("event" if row.get("relationship_type") in EVENT_RELATIONSHIP_TYPES else None)
+    )
 
 
 def _path_score(row: dict[str, Any], params: dict[str, Any]) -> float:

@@ -74,56 +74,27 @@ class FakeGDSClient:
                 },
             ]
         if "MATCH (source)-[relationship]->(target)" in query:
-            if self.path_rows is not None:
-                rows = list(self.path_rows)
-                if "ORDER BY path_score DESC" in query:
-                    rows.sort(
-                        key=lambda row: (
-                            -_path_score(row, params),
-                            str(row["source_node_id"]),
-                            str(row["relationship_type"]),
-                            str(row["target_node_id"]),
-                            str(row["edge_id"]),
-                        ),
-                    )
-                else:
-                    rows.sort(
-                        key=lambda row: (
-                            str(row["source_node_id"]),
-                            str(row["relationship_type"]),
-                            str(row["target_node_id"]),
-                            str(row["edge_id"]),
-                        ),
-                    )
-                return rows[: int(params.get("result_limit", len(rows)))]
-            return [
-                {
-                    "source_node_id": "node-a",
-                    "source_entity_id": "entity-a",
-                    "source_labels": ["Entity"],
-                    "target_node_id": "node-b",
-                    "target_entity_id": "entity-b",
-                    "target_labels": ["Entity"],
-                    "edge_id": "edge-1",
-                    "relationship_type": "SUPPLY_CHAIN",
-                    "relation_weight": 0.5,
-                    "evidence_confidence": None,
-                    "recency_decay": None,
-                },
-                {
-                    "source_node_id": "node-b",
-                    "source_entity_id": "entity-b",
-                    "source_labels": ["Entity"],
-                    "target_node_id": "node-c",
-                    "target_entity_id": "entity-c",
-                    "target_labels": ["Entity"],
-                    "edge_id": "edge-2",
-                    "relationship_type": "OWNERSHIP",
-                    "relation_weight": 0.8,
-                    "evidence_confidence": 0.5,
-                    "recency_decay": 0.5,
-                },
-            ]
+            rows = self._fundamental_rows()
+            if "ORDER BY path_score DESC" in query:
+                rows.sort(
+                    key=lambda row: (
+                        -_path_score(row, params),
+                        str(row["source_node_id"]),
+                        str(row["relationship_type"]),
+                        str(row["target_node_id"]),
+                        str(row["edge_id"]),
+                    ),
+                )
+            else:
+                rows.sort(
+                    key=lambda row: (
+                        str(row["source_node_id"]),
+                        str(row["relationship_type"]),
+                        str(row["target_node_id"]),
+                        str(row["edge_id"]),
+                    ),
+                )
+            return rows[: int(params.get("result_limit", len(rows)))]
         return []
 
     def execute_write(
@@ -131,8 +102,21 @@ class FakeGDSClient:
         query: str,
         parameters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        self.write_calls.append((query, parameters or {}))
+        params = parameters or {}
+        self.write_calls.append((query, params))
+        if "gds.graph.project" in query:
+            return [
+                {
+                    "graphName": params.get("graph_name"),
+                    "nodeCount": 2 if self._fundamental_rows() else 0,
+                    "relationshipCount": len(self._fundamental_rows()),
+                }
+            ]
         return []
+
+    def _fundamental_rows(self) -> list[dict[str, Any]]:
+        rows = self.path_rows if self.path_rows is not None else _default_path_rows()
+        return [row for row in rows if _effective_channel(row) == "fundamental"]
 
 
 def test_compute_path_score_uses_documented_multiplication() -> None:
@@ -279,11 +263,12 @@ def test_run_fundamental_propagation_uses_gds_projection_and_explains_paths() ->
     assert "gds.graph.drop" in write_queries[2]
     assert all(" SET " not in query and " DELETE " not in query for query in write_queries)
 
-    projection_params = client.write_calls[1][1]
+    projection_query, projection_params = client.write_calls[1]
     assert projection_params["graph_name"] == "unit-fundamental"
-    assert set(projection_params["relationship_projection"]) == set(
-        FUNDAMENTAL_RELATIONSHIP_TYPES
-    )
+    assert "MATCH (source)-[relationship]->(target)" in projection_query
+    assert "coalesce(relationship.propagation_channel" in projection_query
+    assert 'WHEN "OWNERSHIP" THEN "fundamental"' in projection_query
+    assert '= "fundamental"' in projection_query
 
     pagerank_call = next(
         (query, params)
@@ -313,6 +298,48 @@ def test_run_fundamental_propagation_uses_gds_projection_and_explains_paths() ->
         "score": 0.5,
     }
     assert result.channel_breakdown["fundamental"]["path_count"] == 2
+
+
+def test_run_fundamental_propagation_excludes_relationships_tagged_for_other_channels() -> None:
+    client = FakeGDSClient(
+        path_rows=[
+            _path_row(
+                edge_id="edge-fundamental",
+                relationship_type="SUPPLY_CHAIN",
+                target_node_id="node-fundamental",
+                target_entity_id="entity-fundamental",
+                relation_weight=1.0,
+            ),
+            _path_row(
+                edge_id="edge-reflexive-ownership",
+                relationship_type="OWNERSHIP",
+                target_node_id="node-reflexive",
+                target_entity_id="entity-reflexive",
+                relation_weight=100.0,
+                propagation_channel="reflexive",
+            ),
+        ],
+    )
+
+    result = run_fundamental_propagation(
+        _context(),
+        client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+        graph_name="unit-fundamental",
+    )
+
+    assert [path["edge_id"] for path in result.activated_paths] == ["edge-fundamental"]
+    assert result.channel_breakdown["fundamental"]["path_count"] == 1
+    projection_query = next(
+        query for query, _ in client.write_calls if "gds.graph.project" in query
+    )
+    path_query = next(
+        query
+        for query, _ in client.read_calls
+        if "MATCH (source)-[relationship]->(target)" in query
+    )
+    assert 'relationship.impact_channel, CASE type(relationship)' in projection_query
+    assert 'relationship.impact_channel, CASE type(relationship)' in path_query
 
 
 def test_run_fundamental_propagation_blocks_non_ready_before_neo4j_reads() -> None:
@@ -556,6 +583,73 @@ def _status_manager(
                 writer_lock_token=writer_lock_token,
             ),
         ),
+    )
+
+
+def _path_row(
+    *,
+    edge_id: str,
+    relationship_type: str,
+    target_node_id: str,
+    target_entity_id: str,
+    relation_weight: float,
+    evidence_confidence: float | None = 1.0,
+    recency_decay: float | None = 1.0,
+    propagation_channel: str | None = None,
+    channel: str | None = None,
+    impact_channel: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "source_node_id": "node-a",
+        "source_entity_id": "entity-a",
+        "source_labels": ["Entity"],
+        "target_node_id": target_node_id,
+        "target_entity_id": target_entity_id,
+        "target_labels": ["Entity"],
+        "edge_id": edge_id,
+        "relationship_type": relationship_type,
+        "relation_weight": relation_weight,
+        "evidence_confidence": evidence_confidence,
+        "recency_decay": recency_decay,
+        "propagation_channel": propagation_channel,
+        "channel": channel,
+        "impact_channel": impact_channel,
+    }
+
+
+def _default_path_rows() -> list[dict[str, Any]]:
+    return [
+        _path_row(
+            edge_id="edge-1",
+            relationship_type="SUPPLY_CHAIN",
+            target_node_id="node-b",
+            target_entity_id="entity-b",
+            relation_weight=0.5,
+            evidence_confidence=None,
+            recency_decay=None,
+        ),
+        _path_row(
+            edge_id="edge-2",
+            relationship_type="OWNERSHIP",
+            target_node_id="node-c",
+            target_entity_id="entity-c",
+            relation_weight=0.8,
+            evidence_confidence=0.5,
+            recency_decay=0.5,
+        ),
+    ]
+
+
+def _effective_channel(row: dict[str, Any]) -> str | None:
+    return (
+        row.get("propagation_channel")
+        or row.get("channel")
+        or row.get("impact_channel")
+        or (
+            "fundamental"
+            if row.get("relationship_type") in FUNDAMENTAL_RELATIONSHIP_TYPES
+            else None
+        )
     )
 
 
