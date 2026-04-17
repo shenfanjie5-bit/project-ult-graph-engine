@@ -97,6 +97,37 @@ def test_postgresql_status_store_rejects_competing_reload_and_sync_transitions()
         _drop_table(database_url, table_name)
 
 
+def test_postgresql_status_store_bootstrap_migrates_legacy_syncing_status() -> None:
+    psycopg = pytest.importorskip("psycopg")
+
+    database_url = _database_url()
+    table_name = _table_name()
+    _create_legacy_syncing_status_row(psycopg, database_url, table_name)
+    store = PostgreSQLStatusStore(database_url, table_name=table_name)
+
+    try:
+        store.bootstrap()
+
+        status = store.read_current_status()
+        assert status is not None
+        assert status.graph_status == "failed"
+        assert status.writer_lock_token is None
+        assert status.last_verified_at is None
+
+        with pytest.raises(Exception):
+            with psycopg.connect(database_url) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+UPDATE "{table_name}"
+SET graph_status = 'syncing'
+WHERE status_key = 'current'
+""",
+                    )
+    finally:
+        _drop_table(database_url, table_name)
+
+
 def _begin_sync(database_url: str, table_name: str, barrier: Barrier) -> str:
     store = BarrierStatusStore(database_url, table_name=table_name, barrier=barrier)
     manager = GraphStatusManager(store, clock=lambda: NOW)
@@ -149,3 +180,58 @@ def _drop_table(database_url: str, table_name: str) -> None:
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+
+
+def _create_legacy_syncing_status_row(
+    psycopg: Any,
+    database_url: str,
+    table_name: str,
+) -> None:
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+            cursor.execute(
+                f"""
+CREATE TABLE "{table_name}" (
+    status_key text PRIMARY KEY,
+    graph_status text NOT NULL CHECK (
+        graph_status IN ('ready', 'rebuilding', 'failed', 'syncing')
+    ),
+    graph_generation_id bigint NOT NULL CHECK (graph_generation_id >= 0),
+    node_count bigint NOT NULL CHECK (node_count >= 0),
+    edge_count bigint NOT NULL CHECK (edge_count >= 0),
+    key_label_counts jsonb NOT NULL CHECK (jsonb_typeof(key_label_counts) = 'object'),
+    checksum text NOT NULL CHECK (checksum <> ''),
+    last_verified_at timestamptz NULL,
+    last_reload_at timestamptz NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+)
+""",
+            )
+            cursor.execute(
+                f"""
+INSERT INTO "{table_name}" (
+    status_key,
+    graph_status,
+    graph_generation_id,
+    node_count,
+    edge_count,
+    key_label_counts,
+    checksum,
+    last_verified_at,
+    last_reload_at
+)
+VALUES (
+    'current',
+    'syncing',
+    8,
+    2,
+    1,
+    '{{"Entity": 2}}'::jsonb,
+    'legacy-syncing',
+    %s,
+    NULL
+)
+""",
+                (NOW,),
+            )

@@ -350,6 +350,21 @@ def test_mark_failed_rejects_failed_state() -> None:
         manager.mark_failed()
 
 
+def test_mark_failed_rejects_active_writer_lock() -> None:
+    store = InMemoryStatusStore(
+        _status(graph_status="ready", writer_lock_token="incremental-sync"),
+    )
+
+    with pytest.raises(ValueError, match="writer lock"):
+        GraphStatusManager(store, clock=lambda: NOW).mark_failed()
+
+    assert store.writes == []
+    assert store.status == _status(
+        graph_status="ready",
+        writer_lock_token="incremental-sync",
+    )
+
+
 def test_mark_failed_rejects_missing_status() -> None:
     manager = GraphStatusManager(InMemoryStatusStore())
 

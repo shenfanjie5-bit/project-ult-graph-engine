@@ -13,6 +13,8 @@ from typing import Any, Protocol
 
 from graph_engine.models import Neo4jGraphStatus
 
+_GRAPH_STATUS_CHECK_CONSTRAINT = "neo4j_graph_status_graph_status_check"
+
 
 class StatusStore(Protocol):
     """Persistence boundary for the singleton Neo4j graph status row."""
@@ -131,6 +133,8 @@ ADD COLUMN IF NOT EXISTS writer_lock_token text NULL CHECK (
 )
 """,
                     )
+                    self._normalize_legacy_syncing_status(cursor)
+                    self._recreate_graph_status_check_constraint(cursor)
             self._bootstrapped = True
 
     def ensure_schema(self) -> None:
@@ -276,6 +280,47 @@ RETURNING status_key
         if self._auto_bootstrap and not self._bootstrapped:
             self.bootstrap()
 
+    def _normalize_legacy_syncing_status(self, cursor: Any) -> None:
+        cursor.execute(
+            f"""
+UPDATE {self._table_name}
+SET graph_status = 'failed',
+    writer_lock_token = NULL,
+    last_verified_at = NULL,
+    checksum = CASE WHEN checksum = '' THEN 'failed' ELSE checksum END,
+    updated_at = now()
+WHERE graph_status = 'syncing'
+""",
+        )
+
+    def _recreate_graph_status_check_constraint(self, cursor: Any) -> None:
+        cursor.execute(
+            """
+SELECT conname
+FROM pg_constraint
+WHERE conrelid = %s::regclass
+  AND contype = 'c'
+  AND pg_get_constraintdef(oid) ILIKE '%%graph_status%%'
+""",
+            (self._table_name,),
+        )
+        constraint_names = [str(row[0]) for row in cursor.fetchall()]
+        for constraint_name in constraint_names:
+            cursor.execute(
+                f"""
+ALTER TABLE {self._table_name}
+DROP CONSTRAINT IF EXISTS {_quote_identifier(constraint_name)}
+""",
+            )
+
+        cursor.execute(
+            f"""
+ALTER TABLE {self._table_name}
+ADD CONSTRAINT {_quote_identifier(_GRAPH_STATUS_CHECK_CONSTRAINT)}
+CHECK (graph_status IN ('ready', 'rebuilding', 'failed'))
+""",
+        )
+
     @contextmanager
     def _transaction(self) -> Iterator[Any]:
         connection = self._connection_factory()
@@ -315,6 +360,12 @@ def _quote_qualified_identifier(identifier: str) -> str:
     if not parts or any(_IDENTIFIER_RE.fullmatch(part) is None for part in parts):
         raise ValueError(f"invalid PostgreSQL identifier: {identifier!r}")
     return ".".join(f'"{part}"' for part in parts)
+
+
+def _quote_identifier(identifier: str) -> str:
+    if _IDENTIFIER_RE.fullmatch(identifier) is None:
+        raise ValueError(f"invalid PostgreSQL identifier: {identifier!r}")
+    return f'"{identifier}"'
 
 
 def _status_write_values(status: Neo4jGraphStatus) -> tuple[Any, ...]:

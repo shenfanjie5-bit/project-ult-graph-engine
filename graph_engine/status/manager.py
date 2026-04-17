@@ -187,6 +187,10 @@ class GraphStatusManager:
 
         current = self.store.read_current_status()
         current_state = current.graph_status if current is not None else None
+        if current is not None and current.writer_lock_token is not None:
+            raise ValueError(
+                "cannot transition graph_status with active writer lock to 'failed'",
+            )
         if current_state not in {"rebuilding", "ready"}:
             raise ValueError(
                 "cannot transition graph_status from "
