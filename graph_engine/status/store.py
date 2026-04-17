@@ -15,3 +15,11 @@ class StatusStore(Protocol):
 
     def write_current_status(self, status: Neo4jGraphStatus) -> None:
         """Persist the current status row."""
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        """Atomically persist next_status only if the current row still matches."""

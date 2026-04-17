@@ -31,6 +31,17 @@ class InMemoryStatusStore:
     def write_current_status(self, status: Neo4jGraphStatus) -> None:
         self.status = status
 
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        if self.status != expected_status:
+            return False
+        self.write_current_status(next_status)
+        return True
+
 
 class StaticSnapshotReader:
     def __init__(self, snapshot: GraphSnapshot) -> None:

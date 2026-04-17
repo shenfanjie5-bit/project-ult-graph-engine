@@ -66,7 +66,7 @@ class GraphStatusManager:
             last_verified_at=None,
             last_reload_at=current.last_reload_at if current is not None else None,
         )
-        self.store.write_current_status(status)
+        self._commit_transition(current, status)
         return status
 
     def mark_ready(
@@ -112,7 +112,7 @@ class GraphStatusManager:
             last_verified_at=now,
             last_reload_at=now if reload_completed else current.last_reload_at,
         )
-        self.store.write_current_status(status)
+        self._commit_transition(current, status)
         return status
 
     def mark_failed(
@@ -144,7 +144,7 @@ class GraphStatusManager:
             last_verified_at=None,
             last_reload_at=current.last_reload_at,
         )
-        self.store.write_current_status(status)
+        self._commit_transition(current, status)
         return status
 
     def mark_verified(self, snapshot: GraphSnapshot) -> Neo4jGraphStatus:
@@ -168,8 +168,21 @@ class GraphStatusManager:
             last_verified_at=self._clock(),
             last_reload_at=current.last_reload_at,
         )
-        self.store.write_current_status(status)
+        self._commit_transition(current, status)
         return status
+
+    def _commit_transition(
+        self,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> None:
+        if not self.store.compare_and_write_current_status(
+            expected_status=expected_status,
+            next_status=next_status,
+        ):
+            raise RuntimeError(
+                "stale graph_status transition rejected because current status changed",
+            )
 
 
 def _utc_now() -> datetime:

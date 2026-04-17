@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Literal
 from unittest.mock import MagicMock
@@ -29,6 +30,41 @@ class InMemoryStatusStore:
     def write_current_status(self, status: Neo4jGraphStatus) -> None:
         self.status = status
         self.writes.append(status)
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        if self.status != expected_status:
+            return False
+        self.write_current_status(next_status)
+        return True
+
+
+class InterleavingStatusStore(InMemoryStatusStore):
+    def __init__(
+        self,
+        status: Neo4jGraphStatus,
+        interleaved_status: Neo4jGraphStatus,
+    ) -> None:
+        super().__init__(status)
+        self.interleaved_status = interleaved_status
+        self.compare_calls = 0
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        self.compare_calls += 1
+        self.status = self.interleaved_status
+        return super().compare_and_write_current_status(
+            expected_status=expected_status,
+            next_status=next_status,
+        )
 
 
 class StaticSnapshotReader:
@@ -202,6 +238,41 @@ def test_mark_ready_rejects_generation_backtracking() -> None:
         )
 
 
+def test_mark_ready_rejects_stale_rebuilding_status_before_write() -> None:
+    interleaved_status = _status(graph_status="failed", graph_generation_id=8)
+    store = InterleavingStatusStore(
+        _status(graph_status="rebuilding", graph_generation_id=8),
+        interleaved_status,
+    )
+
+    with pytest.raises(RuntimeError, match="stale graph_status transition"):
+        GraphStatusManager(store, clock=lambda: NOW).mark_ready(
+            node_count=1,
+            edge_count=0,
+            key_label_counts={"Entity": 1},
+            checksum="ready-checksum",
+        )
+
+    assert store.status == interleaved_status
+    assert store.writes == []
+    assert store.compare_calls == 1
+
+
+def test_mark_rebuilding_rejects_stale_ready_status_before_write() -> None:
+    interleaved_status = _status(graph_status="failed", graph_generation_id=8)
+    store = InterleavingStatusStore(
+        _status(graph_status="ready", graph_generation_id=8),
+        interleaved_status,
+    )
+
+    with pytest.raises(RuntimeError, match="stale graph_status transition"):
+        GraphStatusManager(store, clock=lambda: NOW).mark_rebuilding()
+
+    assert store.status == interleaved_status
+    assert store.writes == []
+    assert store.compare_calls == 1
+
+
 @pytest.mark.parametrize("source_status", ["ready", "rebuilding"])
 def test_mark_failed_allows_ready_and_rebuilding(
     source_status: Literal["ready", "rebuilding"],
@@ -236,6 +307,21 @@ def test_mark_failed_rejects_missing_status() -> None:
 
     with pytest.raises(ValueError, match="None"):
         manager.mark_failed()
+
+
+def test_mark_failed_rejects_stale_ready_status_before_write() -> None:
+    interleaved_status = _status(graph_status="rebuilding", graph_generation_id=8)
+    store = InterleavingStatusStore(
+        _status(graph_status="ready", graph_generation_id=8),
+        interleaved_status,
+    )
+
+    with pytest.raises(RuntimeError, match="stale graph_status transition"):
+        GraphStatusManager(store, clock=lambda: NOW).mark_failed()
+
+    assert store.status == interleaved_status
+    assert store.writes == []
+    assert store.compare_calls == 1
 
 
 def test_require_ready_returns_ready_status() -> None:
@@ -276,6 +362,23 @@ def test_mark_verified_rejects_generation_mismatch() -> None:
 
     with pytest.raises(ValueError, match="graph_generation_id"):
         manager.mark_verified(_snapshot(graph_generation_id=8))
+
+
+def test_mark_verified_rejects_stale_ready_status_before_write() -> None:
+    interleaved_status = _status(graph_status="failed", graph_generation_id=9)
+    store = InterleavingStatusStore(
+        _status(graph_status="ready", graph_generation_id=9),
+        interleaved_status,
+    )
+
+    with pytest.raises(RuntimeError, match="stale graph_status transition"):
+        GraphStatusManager(store, clock=lambda: NOW).mark_verified(
+            _snapshot(graph_generation_id=9),
+        )
+
+    assert store.status == interleaved_status
+    assert store.writes == []
+    assert store.compare_calls == 1
 
 
 def test_check_live_graph_consistency_returns_true_for_matching_snapshot() -> None:
@@ -356,6 +459,7 @@ def test_check_live_graph_consistency_can_skip_ready_guard_for_maintenance() -> 
 )
 def test_check_live_graph_consistency_returns_false_for_mismatches(
     snapshot_updates: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = FakeLiveGraphClient(_metrics_rows())
     snapshot = _snapshot_from_live_client(client, graph_generation_id=3).model_copy(
@@ -366,6 +470,7 @@ def test_check_live_graph_consistency_returns_false_for_mismatches(
         clock=lambda: NOW,
     )
     client.calls = []
+    caplog.set_level(logging.WARNING, logger="graph_engine.status.consistency")
 
     assert (
         check_live_graph_consistency(
@@ -376,11 +481,19 @@ def test_check_live_graph_consistency_returns_false_for_mismatches(
         )
         is False
     )
+    assert any(
+        getattr(record, "snapshot_ref", None) == "snapshot-1"
+        and getattr(record, "failure_stage", None) == "result_validation"
+        for record in caplog.records
+    )
 
 
-def test_check_live_graph_consistency_reader_error_fails_closed() -> None:
+def test_check_live_graph_consistency_reader_error_fails_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     client = FakeLiveGraphClient(_metrics_rows())
     manager = GraphStatusManager(InMemoryStatusStore(_status(graph_generation_id=3)))
+    caplog.set_level(logging.ERROR, logger="graph_engine.status.consistency")
 
     result = check_live_graph_consistency(
         "snapshot-1",
@@ -391,12 +504,20 @@ def test_check_live_graph_consistency_reader_error_fails_closed() -> None:
 
     assert result is False
     assert client.calls == []
+    assert any(
+        getattr(record, "snapshot_ref", None) == "snapshot-1"
+        and getattr(record, "failure_stage", None) == "snapshot_read"
+        for record in caplog.records
+    )
 
 
-def test_check_live_graph_consistency_client_error_fails_closed() -> None:
+def test_check_live_graph_consistency_client_error_fails_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     client = FakeLiveGraphClient(_metrics_rows(), error=RuntimeError("neo4j failed"))
     snapshot = _snapshot_from_rows(graph_generation_id=3)
     manager = GraphStatusManager(InMemoryStatusStore(_status(graph_generation_id=3)))
+    caplog.set_level(logging.ERROR, logger="graph_engine.status.consistency")
 
     result = check_live_graph_consistency(
         "snapshot-1",
@@ -406,6 +527,11 @@ def test_check_live_graph_consistency_client_error_fails_closed() -> None:
     )
 
     assert result is False
+    assert any(
+        getattr(record, "snapshot_ref", None) == "snapshot-1"
+        and getattr(record, "failure_stage", None) == "live_graph_read"
+        for record in caplog.records
+    )
 
 
 def test_check_live_graph_consistency_malformed_client_result_fails_closed() -> None:

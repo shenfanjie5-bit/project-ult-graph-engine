@@ -2,49 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, Protocol
+import logging
+from typing import Protocol
 
 from graph_engine.client import Neo4jClient
+from graph_engine.live_metrics import read_live_graph_metrics
 from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
-from graph_engine.snapshots.generator import _checksum_payload, _sorted_payload_list
 from graph_engine.status.manager import GraphStatusManager
 
-_LIVE_GRAPH_METRICS_QUERY = """
-CALL {
-    MATCH (node)
-    WITH node
-    ORDER BY coalesce(node.node_id, elementId(node)) ASC
-    RETURN count(node) AS node_count,
-           collect({
-               labels: labels(node),
-               node_id: node.node_id,
-               canonical_entity_id: node.canonical_entity_id,
-               properties: properties(node)
-           }) AS nodes
-}
-CALL {
-    MATCH (node)
-    UNWIND labels(node) AS label
-    WITH label, count(*) AS count
-    ORDER BY label ASC
-    RETURN collect({label: label, count: count}) AS label_counts
-}
-CALL {
-    MATCH (source)-[relationship]->(target)
-    WITH source, relationship, target
-    ORDER BY coalesce(relationship.edge_id, elementId(relationship)) ASC
-    RETURN count(relationship) AS edge_count,
-           collect({
-               source_node_id: source.node_id,
-               target_node_id: target.node_id,
-               relationship_type: type(relationship),
-               edge_id: relationship.edge_id,
-               properties: properties(relationship)
-           }) AS relationships
-}
-RETURN node_count, edge_count, label_counts, nodes, relationships
-"""
+_LOGGER = logging.getLogger(__name__)
 
 
 class CanonicalSnapshotReader(Protocol):
@@ -68,18 +34,55 @@ def check_live_graph_consistency(
 
     try:
         snapshot = snapshot_reader.read_graph_snapshot(snapshot_ref)
+    except Exception:
+        _LOGGER.exception(
+            "live graph consistency snapshot read failed",
+            extra={"snapshot_ref": snapshot_ref, "failure_stage": "snapshot_read"},
+        )
+        return False
+
+    try:
         node_count, edge_count, key_label_counts, checksum = _read_live_graph_metrics(client)
-    except Exception:  # noqa: BLE001 - consistency checks fail closed.
+    except Exception:
+        _LOGGER.exception(
+            "live graph consistency live graph read failed",
+            extra={"snapshot_ref": snapshot_ref, "failure_stage": "live_graph_read"},
+        )
         return False
 
     if status is not None and snapshot.graph_generation_id != status.graph_generation_id:
+        _LOGGER.warning(
+            "live graph consistency generation mismatch",
+            extra={
+                "snapshot_ref": snapshot_ref,
+                "failure_stage": "result_validation",
+                "snapshot_generation_id": snapshot.graph_generation_id,
+                "status_generation_id": status.graph_generation_id,
+            },
+        )
         return False
-    return (
-        snapshot.node_count == node_count
-        and snapshot.edge_count == edge_count
-        and snapshot.key_label_counts == key_label_counts
-        and snapshot.checksum == checksum
-    )
+
+    mismatches = [
+        field_name
+        for field_name, snapshot_value, live_value in (
+            ("node_count", snapshot.node_count, node_count),
+            ("edge_count", snapshot.edge_count, edge_count),
+            ("key_label_counts", snapshot.key_label_counts, key_label_counts),
+            ("checksum", snapshot.checksum, checksum),
+        )
+        if snapshot_value != live_value
+    ]
+    if mismatches:
+        _LOGGER.warning(
+            "live graph consistency metric mismatch",
+            extra={
+                "snapshot_ref": snapshot_ref,
+                "failure_stage": "result_validation",
+                "mismatches": mismatches,
+            },
+        )
+        return False
+    return True
 
 
 def _resolve_status(
@@ -101,64 +104,4 @@ def _resolve_status(
 
 
 def _read_live_graph_metrics(client: Neo4jClient) -> tuple[int, int, dict[str, int], str]:
-    rows = client.execute_read(_LIVE_GRAPH_METRICS_QUERY)
-    row = _single_metrics_row(rows)
-    node_count = _int_field(row, "node_count")
-    edge_count = _int_field(row, "edge_count")
-    key_label_counts = _label_counts(row["label_counts"])
-    nodes = _list_field(row, "nodes")
-    relationships = _list_field(row, "relationships")
-
-    payload = {
-        "node_count": node_count,
-        "edge_count": edge_count,
-        "nodes": _sorted_payload_list(nodes),
-        "relationships": _sorted_payload_list(relationships),
-    }
-    return node_count, edge_count, key_label_counts, _checksum_payload(payload)
-
-
-def _single_metrics_row(rows: object) -> Mapping[str, Any]:
-    if not isinstance(rows, list) or len(rows) != 1:
-        raise ValueError("Neo4j graph metrics query returned malformed rows")
-    row = rows[0]
-    if not isinstance(row, Mapping):
-        raise ValueError("Neo4j graph metrics query returned a malformed row")
-    required_fields = {"node_count", "edge_count", "label_counts", "nodes", "relationships"}
-    if not required_fields <= row.keys():
-        raise ValueError("Neo4j graph metrics query returned an incomplete row")
-    return row
-
-
-def _int_field(row: Mapping[str, Any], field_name: str) -> int:
-    value = row[field_name]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"Neo4j graph metrics field {field_name!r} is malformed")
-    if value < 0:
-        raise ValueError(f"Neo4j graph metrics field {field_name!r} cannot be negative")
-    return value
-
-
-def _list_field(row: Mapping[str, Any], field_name: str) -> list[Any]:
-    value = row[field_name]
-    if not isinstance(value, list):
-        raise ValueError(f"Neo4j graph metrics field {field_name!r} is malformed")
-    return value
-
-
-def _label_counts(value: object) -> dict[str, int]:
-    if not isinstance(value, list):
-        raise ValueError("Neo4j graph metrics field 'label_counts' is malformed")
-
-    counts: dict[str, int] = {}
-    for item in value:
-        if not isinstance(item, Mapping):
-            raise ValueError("Neo4j graph metrics field 'label_counts' is malformed")
-        label = item.get("label")
-        count = item.get("count")
-        if not isinstance(label, str):
-            raise ValueError("Neo4j graph metrics label count is missing a string label")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ValueError("Neo4j graph metrics label count is malformed")
-        counts[label] = count
-    return counts
+    return read_live_graph_metrics(client, strict=True)
