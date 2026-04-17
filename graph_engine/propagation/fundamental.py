@@ -10,6 +10,7 @@ from graph_engine.client import Neo4jClient
 from graph_engine.models import PropagationContext, PropagationResult
 from graph_engine.propagation.scoring import build_score_explanation
 from graph_engine.schema.definitions import RelationshipType
+from graph_engine.status import GraphStatusManager
 
 FUNDAMENTAL_RELATIONSHIP_TYPES = (
     RelationshipType.SUPPLY_CHAIN.value,
@@ -24,11 +25,16 @@ def run_fundamental_propagation(
     context: PropagationContext,
     client: Neo4jClient,
     *,
+    status_manager: GraphStatusManager | None = None,
     graph_name: str | None = None,
     max_iterations: int = 20,
     result_limit: int = 100,
 ) -> PropagationResult:
     """Run weighted PageRank for the fundamental channel and explain edge paths."""
+
+    if status_manager is None:
+        raise ValueError("fundamental propagation requires status_manager")
+    status_manager.require_ready()
 
     if _FUNDAMENTAL_CHANNEL not in context.enabled_channels:
         raise PermissionError("fundamental propagation requires the fundamental channel")

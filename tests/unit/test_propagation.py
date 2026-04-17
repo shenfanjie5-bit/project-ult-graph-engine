@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -13,6 +13,7 @@ from graph_engine.propagation import (
     compute_path_score,
     run_fundamental_propagation,
 )
+from graph_engine.status import GraphStatusManager
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 
@@ -132,6 +133,28 @@ class FakeGDSClient:
         return []
 
 
+class InMemoryStatusStore:
+    def __init__(self, status: Neo4jGraphStatus) -> None:
+        self.status = status
+
+    def read_current_status(self) -> Neo4jGraphStatus | None:
+        return self.status
+
+    def write_current_status(self, status: Neo4jGraphStatus) -> None:
+        self.status = status
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        if self.status != expected_status:
+            return False
+        self.write_current_status(next_status)
+        return True
+
+
 def test_compute_path_score_uses_documented_multiplication() -> None:
     assert compute_path_score(
         relation_weight=0.8,
@@ -197,6 +220,7 @@ def test_run_fundamental_propagation_uses_gds_projection_and_explains_paths() ->
     result = run_fundamental_propagation(
         context,
         client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
         graph_name="unit-fundamental",
         max_iterations=5,
         result_limit=10,
@@ -248,8 +272,16 @@ def test_run_fundamental_propagation_generates_unique_default_projection_names()
     first_client = FakeGDSClient()
     second_client = FakeGDSClient()
 
-    run_fundamental_propagation(_context(), first_client)  # type: ignore[arg-type]
-    run_fundamental_propagation(_context(), second_client)  # type: ignore[arg-type]
+    run_fundamental_propagation(  # type: ignore[arg-type]
+        _context(),
+        first_client,
+        status_manager=_status_manager(),
+    )
+    run_fundamental_propagation(  # type: ignore[arg-type]
+        _context(),
+        second_client,
+        status_manager=_status_manager(),
+    )
 
     first_project = next(
         params["graph_name"]
@@ -302,6 +334,7 @@ def test_impacted_entities_use_five_factor_path_scores() -> None:
     result = run_fundamental_propagation(
         _context(),
         client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
         graph_name="unit-fundamental",
     )
 
@@ -361,6 +394,7 @@ def test_activated_paths_limit_applies_after_five_factor_scoring() -> None:
     result = run_fundamental_propagation(
         _context(),
         client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
         graph_name="unit-fundamental",
         result_limit=2,
     )
@@ -389,12 +423,31 @@ def test_run_fundamental_propagation_cleans_up_projection_on_exception() -> None
         run_fundamental_propagation(
             _context(),
             client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
             graph_name="unit-fundamental",
         )
 
     write_queries = [query for query, _ in client.write_calls]
     assert any("gds.graph.project" in query for query in write_queries)
     assert any("gds.graph.drop" in query for query in write_queries)
+
+
+@pytest.mark.parametrize("graph_status", ["syncing", "rebuilding", "failed"])
+def test_run_fundamental_propagation_blocks_non_ready_status_before_reads(
+    graph_status: Literal["syncing", "rebuilding", "failed"],
+) -> None:
+    client = FakeGDSClient()
+
+    with pytest.raises(PermissionError, match="ready"):
+        run_fundamental_propagation(
+            _context(),
+            client,  # type: ignore[arg-type]
+            status_manager=_status_manager(graph_status=graph_status),
+            graph_name="unit-fundamental",
+        )
+
+    assert client.read_calls == []
+    assert client.write_calls == []
 
 
 def _context() -> PropagationContext:
@@ -407,6 +460,29 @@ def _context() -> PropagationContext:
         regime_multipliers={"fundamental": 0.5},
         decay_policy={},
         regime_context={},
+    )
+
+
+def _status_manager(
+    *,
+    graph_status: Literal["ready", "syncing", "rebuilding", "failed"] = "ready",
+) -> GraphStatusManager:
+    return GraphStatusManager(InMemoryStatusStore(_status(graph_status=graph_status)))
+
+
+def _status(
+    *,
+    graph_status: Literal["ready", "syncing", "rebuilding", "failed"] = "ready",
+) -> Neo4jGraphStatus:
+    return Neo4jGraphStatus(
+        graph_status=graph_status,
+        graph_generation_id=1,
+        node_count=2,
+        edge_count=1,
+        key_label_counts={"Entity": 2},
+        checksum="abc123",
+        last_verified_at=NOW if graph_status == "ready" else None,
+        last_reload_at=None,
     )
 
 

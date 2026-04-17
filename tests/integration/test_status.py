@@ -97,7 +97,14 @@ CREATE (source)-[:SUPPLY_CHAIN {
                     "edge_id": edge_id,
                 },
             )
-            snapshot = build_graph_snapshot("cycle-status", 11, client)
+            snapshot = build_graph_snapshot(
+                "cycle-status",
+                11,
+                client,
+                status_manager=GraphStatusManager(
+                    InMemoryStatusStore(_status(graph_generation_id=11)),
+                ),
+            )
             status_manager = GraphStatusManager(
                 InMemoryStatusStore(_status_from_snapshot(snapshot)),
                 clock=lambda: NOW,
@@ -143,6 +150,19 @@ def _status_from_snapshot(snapshot: GraphSnapshot) -> Neo4jGraphStatus:
         edge_count=snapshot.edge_count,
         key_label_counts=snapshot.key_label_counts,
         checksum=snapshot.checksum,
+        last_verified_at=NOW,
+        last_reload_at=None,
+    )
+
+
+def _status(*, graph_generation_id: int) -> Neo4jGraphStatus:
+    return Neo4jGraphStatus(
+        graph_status="ready",
+        graph_generation_id=graph_generation_id,
+        node_count=0,
+        edge_count=0,
+        key_label_counts={},
+        checksum="bootstrap",
         last_verified_at=NOW,
         last_reload_at=None,
     )

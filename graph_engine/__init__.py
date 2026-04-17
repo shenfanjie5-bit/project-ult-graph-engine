@@ -15,6 +15,7 @@ from graph_engine.models import (
     PropagationResult,
     PromotionPlan,
 )
+from graph_engine.query import query_subgraph, simulate_readonly_impact
 from graph_engine.reload import (
     CanonicalReader,
     ColdReloadTimeoutError,
@@ -66,6 +67,8 @@ __all__ = [
     "get_constraint_statements",
     "get_index_statements",
     "load_config_from_env",
+    "query_subgraph",
     "rebuild_gds_projection",
     "require_ready_status",
+    "simulate_readonly_impact",
 ]

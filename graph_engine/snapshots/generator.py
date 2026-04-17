@@ -19,6 +19,7 @@ from graph_engine.models import (
 from graph_engine.propagation.context import RegimeContextReader, build_propagation_context
 from graph_engine.propagation.fundamental import run_fundamental_propagation
 from graph_engine.snapshots.writer import SnapshotWriter
+from graph_engine.status import GraphStatusManager
 
 
 class GraphStatusReader(Protocol):
@@ -32,9 +33,12 @@ def build_graph_snapshot(
     cycle_id: str,
     graph_generation_id: int,
     client: Neo4jClient,
+    *,
+    status_manager: GraphStatusManager | None = None,
 ) -> GraphSnapshot:
     """Read live graph metrics and return a deterministic structural snapshot."""
 
+    _resolve_ready_graph_status(status_manager)
     node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
     return _graph_snapshot_from_metrics(
         cycle_id,
@@ -80,14 +84,14 @@ def compute_graph_snapshots(
     graph_generation_id: int | None = None,
     regime_reader: RegimeContextReader,
     snapshot_writer: SnapshotWriter,
+    status_manager: GraphStatusManager | None = None,
     graph_status: Neo4jGraphStatus | None = None,
     status_reader: GraphStatusReader | None = None,
     graph_name: str | None = None,
 ) -> tuple[GraphSnapshot, GraphImpactSnapshot]:
     """Run fundamental propagation and write graph plus impact snapshots."""
 
-    ready_status = _resolve_ready_graph_status(graph_status, status_reader)
-    _require_publication_status_reader(status_reader)
+    ready_status = _resolve_ready_graph_status(status_manager)
     _validate_generation_input(graph_generation_id, ready_status)
     node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
     _validate_status_metrics(
@@ -108,6 +112,7 @@ def compute_graph_snapshots(
     propagation_result = run_fundamental_propagation(
         context,
         client,
+        status_manager=status_manager,
         graph_name=graph_name,
     )
     graph_snapshot = _graph_snapshot_from_metrics(
@@ -125,7 +130,7 @@ def compute_graph_snapshots(
     )
     _validate_publication_status_and_metrics(
         ready_status,
-        status_reader,
+        status_manager,
         client,
     )
     snapshot_writer.write_snapshots(graph_snapshot, impact_snapshot)
@@ -133,32 +138,13 @@ def compute_graph_snapshots(
 
 
 def _resolve_ready_graph_status(
-    graph_status: Neo4jGraphStatus | None,
-    status_reader: GraphStatusReader | None,
+    status_manager: GraphStatusManager | None,
 ) -> Neo4jGraphStatus:
-    if graph_status is None:
-        if status_reader is None:
-            raise ValueError(
-                "formal snapshot computation requires graph_status or status_reader",
-            )
-        graph_status = status_reader.read_graph_status()
-
-    if graph_status.graph_status != "ready":
-        raise PermissionError(
-            "snapshot computation requires graph_status='ready'; "
-            f"received {graph_status.graph_status!r}",
-        )
-    return graph_status
-
-
-def _require_publication_status_reader(
-    status_reader: GraphStatusReader | None,
-) -> None:
-    if status_reader is None:
+    if status_manager is None:
         raise ValueError(
-            "formal snapshot publication requires status_reader "
-            "for write-boundary validation",
+            "formal snapshot computation requires status_manager",
         )
+    return status_manager.require_ready()
 
 
 def _validate_generation_input(
@@ -210,20 +196,16 @@ def _validate_status_metrics(
 
 def _validate_publication_status_and_metrics(
     ready_status: Neo4jGraphStatus,
-    status_reader: GraphStatusReader | None,
+    status_manager: GraphStatusManager | None,
     client: Neo4jClient,
 ) -> None:
-    if status_reader is None:
-        raise ValueError(
-            "formal snapshot publication requires status_reader "
-            "for write-boundary validation",
-        )
-
-    current_status = status_reader.read_graph_status()
-    if current_status.graph_status != "ready":
+    try:
+        current_status = _resolve_ready_graph_status(status_manager)
+    except PermissionError as exc:
         raise RuntimeError(
             "ready graph status changed before snapshot publication",
-        )
+        ) from exc
+
     _validate_status_matches_ready_status(current_status, ready_status)
 
     node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
