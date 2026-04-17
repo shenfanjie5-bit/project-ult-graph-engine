@@ -129,6 +129,21 @@ class GraphSnapshot(BaseModel):
     created_at: datetime
 
 
+class ColdReloadPlan(BaseModel):
+    """Runtime plan for rebuilding Neo4j from canonical graph truth."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    snapshot_ref: str = Field(min_length=1)
+    cycle_id: str = Field(min_length=1)
+    expected_snapshot: GraphSnapshot
+    node_records: list[GraphNodeRecord]
+    edge_records: list[GraphEdgeRecord]
+    assertion_records: list[GraphAssertionRecord]
+    projection_name: str = Field(min_length=1)
+    created_at: datetime
+
+
 class GraphImpactSnapshot(BaseModel):
     """Propagation impact snapshot emitted for downstream read-only consumers."""
 
