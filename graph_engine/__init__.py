@@ -9,6 +9,7 @@ from graph_engine.models import (
     GraphEdgeRecord,
     GraphImpactSnapshot,
     GraphNodeRecord,
+    GraphQueryResult,
     GraphSnapshot,
     Neo4jGraphStatus,
     PropagationContext,
@@ -16,7 +17,7 @@ from graph_engine.models import (
     PromotionPlan,
     ReadonlySimulationRequest,
 )
-from graph_engine.query import query_subgraph, simulate_readonly_impact
+from graph_engine.query import query_propagation_paths, query_subgraph, simulate_readonly_impact
 from graph_engine.reload import (
     CanonicalReader,
     ColdReloadTimeoutError,
@@ -53,6 +54,7 @@ __all__ = [
     "GraphEdgeRecord",
     "GraphImpactSnapshot",
     "GraphNodeRecord",
+    "GraphQueryResult",
     "GraphSnapshot",
     "GraphStatusManager",
     "Neo4jClient",
@@ -75,6 +77,7 @@ __all__ = [
     "get_index_statements",
     "hold_ready_read",
     "load_config_from_env",
+    "query_propagation_paths",
     "query_subgraph",
     "rebuild_gds_projection",
     "require_ready_status",

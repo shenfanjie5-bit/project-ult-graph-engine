@@ -136,6 +136,17 @@ class ReadonlySimulationRequest(BaseModel):
     result_limit: int = Field(default=100, ge=1)
 
 
+class GraphQueryResult(BaseModel):
+    """Status-gated read-only live graph query result."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    graph_generation_id: int = Field(ge=0)
+    subgraph_nodes: list[dict[str, Any]]
+    subgraph_edges: list[dict[str, Any]]
+    status: Literal["ready"]
+
+
 class GraphSnapshot(BaseModel):
     """Structural snapshot of the promoted graph for a cycle."""
 
