@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,6 +18,7 @@ from benchmarks.run_benchmark import (
     BenchmarkResult,
     benchmark_consistency_check,
     benchmark_gds_projection_create,
+    benchmark_read_api_queries,
     main,
     run_full_benchmark_suite,
     validate_benchmark_artifact,
@@ -199,6 +201,35 @@ def test_check_budgets_returns_true_only_when_all_budgeted_results_pass() -> Non
 
     assert check_budgets(passing_results, DEFAULT_BUDGETS) is True
     assert check_budgets(failing_results, DEFAULT_BUDGETS) is False
+
+
+def test_benchmark_read_api_queries_times_status_gated_read_apis() -> None:
+    client = MagicMock()
+
+    def execute_read(query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        if "node_count" in query and "edge_count" in query:
+            return [{"node_count": 100, "edge_count": 200}]
+        return []
+
+    client.execute_read.side_effect = execute_read
+
+    results = benchmark_read_api_queries(
+        client,
+        "missing-entity",
+        graph_generation_id=7,
+        depth=2,
+        result_limit=5,
+    )
+
+    assert [result.operation for result in results] == [
+        "query_subgraph",
+        "query_propagation_paths",
+        "simulate_readonly_impact",
+    ]
+    assert all(result.node_count == 100 for result in results)
+    assert all(result.edge_count == 200 for result in results)
+    assert all(result.passed for result in results)
+    assert client.execute_write.call_args_list == []
 
 
 def test_write_benchmark_artifacts_records_json_and_text_report(tmp_path: Path) -> None:

@@ -62,7 +62,14 @@ def check_budgets(
 
 
 def _result_passes_budget(result: BenchmarkResult, budget: dict[str, float]) -> bool:
-    if result.operation in {"pagerank", "path_traversal", "propagation"}:
+    if result.operation in {
+        "pagerank",
+        "path_traversal",
+        "propagation",
+        "query_subgraph",
+        "query_propagation_paths",
+        "simulate_readonly_impact",
+    }:
         return result.passed and result.duration_seconds < budget["propagation"]
     if result.operation == "consistency_check":
         return result.passed and result.duration_seconds < budget["consistency_check"]
@@ -76,7 +83,14 @@ def _result_passes_budget(result: BenchmarkResult, budget: dict[str, float]) -> 
 
 
 def _budget_label(operation: str, budget: dict[str, float]) -> str:
-    if operation in {"pagerank", "path_traversal", "propagation"}:
+    if operation in {
+        "pagerank",
+        "path_traversal",
+        "propagation",
+        "query_subgraph",
+        "query_propagation_paths",
+        "simulate_readonly_impact",
+    }:
         return f"budget=propagation<{budget['propagation']:.1f}s"
     if operation == "consistency_check":
         return f"budget=consistency_check<{budget['consistency_check']:.1f}s"
@@ -86,4 +100,3 @@ def _budget_label(operation: str, budget: dict[str, float]) -> str:
             f"(hard<{budget['cold_reload_hard']:.1f}s)"
         )
     return "budget=n/a"
-

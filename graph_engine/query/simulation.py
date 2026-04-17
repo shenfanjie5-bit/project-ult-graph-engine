@@ -78,13 +78,21 @@ def simulate_readonly_impact(
                 f"status={ready_status.graph_generation_id}",
             )
 
-        nodes, edges = _read_subgraph(
+        bounded_subgraph = _read_subgraph(
             seed_list,
             depth,
             client=client,
             result_limit=result_limit,
         )
-        subgraph = _subgraph_payload(seed_list, depth, nodes, edges)
+        nodes, edges = bounded_subgraph
+        subgraph = _subgraph_payload(
+            seed_list,
+            depth,
+            result_limit,
+            nodes,
+            edges,
+            bounded_subgraph.truncation,
+        )
 
         if not nodes or not edges:
             propagation_result = _empty_propagation_result(
@@ -123,6 +131,9 @@ def simulate_readonly_impact(
         "graph_generation_id": context.graph_generation_id,
         "seed_entities": seed_list,
         "depth": depth,
+        "result_limit": result_limit,
+        "truncated": bounded_subgraph.truncated,
+        "truncation": bounded_subgraph.truncation,
         "subgraph": subgraph,
         "activated_paths": propagation_result.activated_paths,
         "impacted_entities": propagation_result.impacted_entities,
@@ -473,14 +484,19 @@ def _safe_projection_component(value: str) -> str:
 def _subgraph_payload(
     seed_entities: list[str],
     depth: int,
+    result_limit: int,
     nodes: list[dict[str, Any]],
     edges: list[dict[str, Any]],
+    truncation: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         "seed_entities": seed_entities,
         "depth": depth,
+        "result_limit": result_limit,
         "nodes": nodes,
         "relationships": edges,
+        "truncated": bool(truncation.get("truncated")),
+        "truncation": dict(truncation),
     }
 
 

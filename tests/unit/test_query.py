@@ -22,9 +22,17 @@ _MUTATION_PATTERN = re.compile(r"\b(MERGE|SET|DELETE|CREATE)\b", re.IGNORECASE)
 
 
 class FakeQueryClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        nodes: list[dict[str, Any]] | None = None,
+        edges: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.nodes = _node_rows() if nodes is None else nodes
+        self.edges = _edge_rows() if edges is None else edges
         self.read_calls: list[tuple[str, dict[str, Any]]] = []
         self.write_calls: list[tuple[str, dict[str, Any]]] = []
+        self.expansion_row_counts: list[int] = []
 
     def execute_read(
         self,
@@ -34,12 +42,12 @@ class FakeQueryClient:
         call_parameters = parameters or {}
         self.read_calls.append((query, call_parameters))
         assert _MUTATION_PATTERN.search(query) is None
-        if "RETURN nodes, relationships" in query:
-            return [{"nodes": _node_rows(), "relationships": _edge_rows()}]
-        if " AS paths" in query:
-            if "RETURN [] AS paths" in query:
-                return [{"paths": []}]
-            return [{"paths": _path_rows(call_parameters.get("channels"))}]
+        assert "[*" not in query
+        assert "collect(path)" not in query
+        if "RETURN node_key," in query:
+            return self._seed_rows(call_parameters)
+        if "RETURN relationship_key," in query:
+            return self._frontier_rows(query, call_parameters)
         return []
 
     def execute_write(
@@ -49,6 +57,63 @@ class FakeQueryClient:
     ) -> list[dict[str, Any]]:
         self.write_calls.append((query, parameters or {}))
         raise AssertionError("query APIs must not call execute_write")
+
+    def _seed_rows(self, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        seed_entities = set(parameters.get("seed_entities", []))
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for node in self.nodes:
+            node_key = _node_key(node)
+            if node_key in seen:
+                continue
+            if node.get("canonical_entity_id") in seed_entities or node.get("node_id") in seed_entities:
+                seen.add(node_key)
+                rows.append({"node_key": node_key, "node": node})
+        rows.sort(key=lambda row: str(row["node_key"]))
+        return rows[: int(parameters.get("per_depth_limit", len(rows)))]
+
+    def _frontier_rows(
+        self,
+        query: str,
+        parameters: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        frontier = set(parameters.get("frontier_node_keys", []))
+        visited_relationships = set(parameters.get("visited_relationship_keys", []))
+        nodes_by_id = {_node_key(node): node for node in self.nodes}
+        rows: list[dict[str, Any]] = []
+        for edge in self.edges:
+            edge_key = _edge_key(edge)
+            if edge_key in visited_relationships:
+                continue
+            source_key = str(edge["source_node_id"])
+            target_key = str(edge["target_node_id"])
+            if source_key not in frontier and target_key not in frontier:
+                continue
+            source = nodes_by_id[source_key]
+            target = nodes_by_id[target_key]
+            neighbor = target if source_key in frontier else source
+            row = {
+                "relationship_key": edge_key,
+                "source_key": source_key,
+                "target_key": target_key,
+                "neighbor_key": _node_key(neighbor),
+                "channel": _edge_channel(edge) if " AS channel" in query else None,
+                "source": source,
+                "target": target,
+                "neighbor": neighbor,
+                "relationship": edge,
+            }
+            rows.append(row)
+        rows.sort(
+            key=lambda row: (
+                str(row["relationship_key"]),
+                str(row["source_key"]),
+                str(row["target_key"]),
+            ),
+        )
+        limited_rows = rows[: int(parameters.get("per_depth_limit", len(rows)))]
+        self.expansion_row_counts.append(len(limited_rows))
+        return limited_rows
 
 
 class GateAwareClient(FakeQueryClient):
@@ -206,14 +271,24 @@ def test_query_subgraph_reads_inside_ready_gate_and_normalizes_result() -> None:
     assert events == ["enter", "exit"]
     assert result.graph_generation_id == 42
     assert result.status == "ready"
-    assert [node["node_id"] for node in result.subgraph_nodes] == ["node-a", "node-b"]
+    assert result.seed_entities == ["entity-b", "node-a"]
+    assert result.depth == 2
+    assert result.result_limit == 10
+    assert result.truncated is False
+    assert [node["node_id"] for node in result.subgraph_nodes] == [
+        "node-a",
+        "node-b",
+        "node-c",
+    ]
     assert result.subgraph_nodes[1]["properties"] == {"name": "Beta", "rank": 2}
     assert [edge["edge_id"] for edge in result.subgraph_edges] == ["edge-1", "edge-2"]
     assert result.subgraph_edges[0]["weight"] == 0.7
-    assert len(client.read_calls) == 1
-    query, parameters = client.read_calls[0]
-    assert "*0..2" in query
-    assert parameters == {"result_limit": 10, "seed_entities": ["entity-b", "node-a"]}
+    assert len(client.read_calls) == 3
+    assert all("[*" not in query for query, _ in client.read_calls)
+    assert client.read_calls[0][1] == {
+        "per_depth_limit": 11,
+        "seed_entities": ["entity-b", "node-a"],
+    }
 
 
 def test_query_subgraph_uses_generation_from_status_not_neo4j_rows() -> None:
@@ -312,13 +387,10 @@ def test_query_propagation_paths_filters_channels_and_normalizes_paths() -> None
         }
     ]
     query, parameters = client.read_calls[0]
-    assert "*1..2" in query
-    assert "propagation_channel" in query
-    assert parameters == {
-        "channels": ["event"],
-        "result_limit": 5,
-        "seed_entities": ["entity-a"],
-    }
+    assert "MATCH (seed)" in query
+    assert all("[*" not in read_query for read_query, _ in client.read_calls)
+    assert any("propagation_channel" in read_query for read_query, _ in client.read_calls)
+    assert parameters == {"per_depth_limit": 6, "seed_entities": ["entity-a"]}
 
 
 def test_query_propagation_paths_depth_zero_returns_empty_path_summary() -> None:
@@ -332,7 +404,52 @@ def test_query_propagation_paths_depth_zero_returns_empty_path_summary() -> None
     )
 
     assert paths == []
-    assert "*1.." not in client.read_calls[0][0]
+    assert client.read_calls == []
+
+
+def test_query_subgraph_caps_dense_cyclic_frontiers_and_reports_truncation() -> None:
+    nodes, edges = _dense_cyclic_graph(node_count=12)
+    client = FakeQueryClient(nodes=nodes, edges=edges)
+
+    result = query_subgraph(
+        ["dense-entity-0"],
+        4,
+        client=client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+        result_limit=5,
+    )
+
+    assert result.truncated is True
+    assert result.truncation["frontier_limit_reached"] is True
+    assert 1 in result.truncation["truncated_depths"]
+    assert len(result.subgraph_nodes) <= 5
+    assert len(result.subgraph_edges) <= 5
+    returned_node_ids = {node["node_id"] for node in result.subgraph_nodes}
+    assert all(
+        edge["source_node_id"] in returned_node_ids and edge["target_node_id"] in returned_node_ids
+        for edge in result.subgraph_edges
+    )
+    assert max(client.expansion_row_counts) <= 6
+    assert all("[*" not in query and "collect(path)" not in query for query, _ in client.read_calls)
+
+
+def test_query_propagation_paths_caps_dense_cyclic_frontiers() -> None:
+    nodes, edges = _dense_cyclic_graph(node_count=12)
+    client = FakeQueryClient(nodes=nodes, edges=edges)
+
+    paths = query_propagation_paths(
+        ["dense-entity-0"],
+        4,
+        client=client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+        result_limit=3,
+    )
+
+    assert len(paths) <= 3
+    assert paths.truncated is True  # type: ignore[attr-defined]
+    assert paths.truncation["frontier_limit_reached"] is True  # type: ignore[attr-defined]
+    assert max(client.expansion_row_counts) <= 4
+    assert all("[*" not in query and "collect(path)" not in query for query, _ in client.read_calls)
 
 
 def test_query_apis_do_not_call_execute_write() -> None:
@@ -383,6 +500,12 @@ def _node_rows() -> list[dict[str, Any]]:
                 "properties_json": '{"name": "Beta"}',
                 "rank": 2,
             },
+        },
+        {
+            "node_id": "node-c",
+            "canonical_entity_id": "entity-c",
+            "labels": ["Entity"],
+            "properties": {"name": "Gamma"},
         },
     ]
 
@@ -451,6 +574,59 @@ def _path_rows(channels: list[str] | None) -> list[dict[str, Any]]:
     if channels is None:
         return paths
     return [path for path in paths if path["channel"] in channels]
+
+
+def _dense_cyclic_graph(node_count: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    nodes = [
+        {
+            "node_id": f"dense-node-{index}",
+            "canonical_entity_id": f"dense-entity-{index}",
+            "labels": ["Entity"],
+            "properties": {"index": index},
+        }
+        for index in range(node_count)
+    ]
+    edges: list[dict[str, Any]] = []
+    for index in range(1, node_count):
+        edges.append(
+            {
+                "edge_id": f"dense-star-{index:02d}",
+                "source_node_id": "dense-node-0",
+                "target_node_id": f"dense-node-{index}",
+                "relationship_type": "SUPPLY_CHAIN",
+                "properties": {},
+                "weight": 1.0,
+            },
+        )
+    for index in range(node_count):
+        edges.append(
+            {
+                "edge_id": f"dense-cycle-{index:02d}",
+                "source_node_id": f"dense-node-{index}",
+                "target_node_id": f"dense-node-{(index + 1) % node_count}",
+                "relationship_type": "EVENT_IMPACT",
+                "properties": {"propagation_channel": "event"},
+                "weight": 0.5,
+            },
+        )
+    return nodes, edges
+
+
+def _node_key(node: dict[str, Any]) -> str:
+    return str(node["node_id"])
+
+
+def _edge_key(edge: dict[str, Any]) -> str:
+    return str(edge["edge_id"])
+
+
+def _edge_channel(edge: dict[str, Any]) -> str:
+    properties = edge.get("properties", {})
+    if properties.get("propagation_channel") is not None:
+        return str(properties["propagation_channel"])
+    if edge["relationship_type"] == "EVENT_IMPACT":
+        return "event"
+    return "fundamental"
 
 
 def _status_manager(

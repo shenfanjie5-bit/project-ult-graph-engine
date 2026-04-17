@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from benchmarks.generate_synthetic import (
     clear_graph,
@@ -18,8 +19,11 @@ from benchmarks.generate_synthetic import (
 )
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
+from graph_engine.models import Neo4jGraphStatus, ReadonlySimulationRequest
+from graph_engine.query import query_propagation_paths, query_subgraph, simulate_readonly_impact
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import SchemaManager
+from graph_engine.status import GraphStatusManager
 
 _DEFAULT_GRAPH_NAME = "graph_engine_benchmark"
 _LITE_TARGET_NODE_COUNT = 100_000
@@ -312,6 +316,92 @@ def benchmark_path_traversal(
     )
 
 
+def benchmark_read_api_queries(
+    client: Neo4jClient,
+    seed_entity_id: str,
+    *,
+    graph_generation_id: int = 1,
+    depth: int = 4,
+    result_limit: int = 100,
+) -> list[BenchmarkResult]:
+    """Run the public bounded read APIs against one seed entity."""
+
+    if not seed_entity_id:
+        raise ValueError("seed_entity_id must be non-empty")
+    if depth <= 0:
+        raise ValueError("depth must be positive")
+    if result_limit <= 0:
+        raise ValueError("result_limit must be positive")
+
+    node_count, edge_count = _live_graph_counts(client)
+    status_manager = GraphStatusManager(
+        _StaticBenchmarkStatusStore(
+            Neo4jGraphStatus(
+                graph_status="ready",
+                graph_generation_id=graph_generation_id,
+                node_count=node_count,
+                edge_count=edge_count,
+                key_label_counts={},
+                checksum="benchmark",
+                last_verified_at=datetime.now(UTC),
+                last_reload_at=None,
+            ),
+        ),
+    )
+    simulation_request = ReadonlySimulationRequest(
+        cycle_id="benchmark",
+        world_state_ref="benchmark",
+        graph_generation_id=graph_generation_id,
+        depth=min(depth, 6),
+        enabled_channels=["fundamental", "event", "reflexive"],
+        channel_multipliers={"fundamental": 1.0, "event": 1.0, "reflexive": 1.0},
+        regime_multipliers={"fundamental": 1.0, "event": 1.0, "reflexive": 1.0},
+        decay_policy={"default": 1.0},
+        regime_context={"benchmark": True},
+        result_limit=result_limit,
+        max_iterations=20,
+        projection_name="graph_engine_benchmark_readonly_sim",
+    )
+
+    return [
+        _time_read_api_operation(
+            "query_subgraph",
+            node_count,
+            edge_count,
+            lambda: query_subgraph(
+                [seed_entity_id],
+                min(depth, 4),
+                client=client,
+                status_manager=status_manager,
+                result_limit=result_limit,
+            ),
+        ),
+        _time_read_api_operation(
+            "query_propagation_paths",
+            node_count,
+            edge_count,
+            lambda: query_propagation_paths(
+                [seed_entity_id],
+                min(depth, 4),
+                client=client,
+                status_manager=status_manager,
+                result_limit=result_limit,
+            ),
+        ),
+        _time_read_api_operation(
+            "simulate_readonly_impact",
+            node_count,
+            edge_count,
+            lambda: simulate_readonly_impact(
+                [seed_entity_id],
+                simulation_request,
+                client=client,
+                status_manager=status_manager,
+            ),
+        ),
+    ]
+
+
 def benchmark_cold_reload_simulation(
     client: Neo4jClient,
     nodes: list[dict[str, Any]],
@@ -391,6 +481,7 @@ def run_full_benchmark_suite(
         benchmark_gds_projection_create(client, _DEFAULT_GRAPH_NAME),
         benchmark_pagerank(client, _DEFAULT_GRAPH_NAME),
         benchmark_path_traversal(client, nodes[0]["node_id"]),
+        *benchmark_read_api_queries(client, nodes[0]["canonical_entity_id"]),
         benchmark_cold_reload_simulation(client, nodes, edges),
     ]
     return results
@@ -461,6 +552,51 @@ def _benchmark_command(args: argparse.Namespace) -> str:
     if args.record_report is not None:
         parts.append(f"--record-report {args.record_report}")
     return " ".join(parts)
+
+
+class _StaticBenchmarkStatusStore:
+    def __init__(self, status: Neo4jGraphStatus) -> None:
+        self.status = status
+
+    @contextmanager
+    def ready_read_lock(self) -> Iterator[None]:
+        yield
+
+    def read_current_status(self) -> Neo4jGraphStatus | None:
+        return self.status
+
+    def write_current_status(self, status: Neo4jGraphStatus) -> None:
+        self.status = status
+
+    def compare_and_write_current_status(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus | None,
+        next_status: Neo4jGraphStatus,
+    ) -> bool:
+        if self.status != expected_status:
+            return False
+        self.status = next_status
+        return True
+
+
+def _time_read_api_operation(
+    operation: str,
+    node_count: int,
+    edge_count: int,
+    callback: Any,
+) -> BenchmarkResult:
+    start = time.perf_counter()
+    callback()
+    duration_seconds = time.perf_counter() - start
+    return BenchmarkResult(
+        operation=operation,
+        node_count=node_count,
+        edge_count=edge_count,
+        duration_seconds=duration_seconds,
+        memory_mb=None,
+        passed=duration_seconds < _default_budget("propagation"),
+    )
 
 
 def _benchmark_result_to_dict(result: BenchmarkResult) -> dict[str, Any]:
