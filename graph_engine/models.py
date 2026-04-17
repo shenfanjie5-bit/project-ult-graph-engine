@@ -162,7 +162,7 @@ class Neo4jGraphStatus(BaseModel):
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    graph_status: Literal["ready", "rebuilding", "failed"]
+    graph_status: Literal["ready", "syncing", "rebuilding", "failed"]
     graph_generation_id: int = Field(ge=0)
     node_count: int = Field(ge=0)
     edge_count: int = Field(ge=0)

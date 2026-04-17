@@ -55,26 +55,47 @@ def _sync_live_graph_with_status_barrier(
 ) -> None:
     """Mirror a promotion only while the ready status token still holds."""
 
-    ready_status = status_manager.require_ready()
-    if not status_manager.store.compare_and_write_current_status(
-        expected_status=ready_status,
-        next_status=ready_status,
-    ):
-        raise RuntimeError(
-            "stale graph_status writer barrier rejected before promotion live sync",
-        )
+    ready_status, syncing_status = status_manager.begin_sync()
 
-    sync_live_graph(plan, client)
-    _require_status_token_unchanged(status_manager, ready_status)
+    try:
+        _require_status_token_unchanged(
+            status_manager,
+            syncing_status,
+            "before promotion live sync",
+        )
+        sync_live_graph(plan, client)
+        _require_status_token_unchanged(
+            status_manager,
+            syncing_status,
+            "after promotion live sync",
+        )
+        status_manager.finish_sync(
+            expected_status=syncing_status,
+            ready_status=ready_status,
+        )
+    except Exception:
+        _mark_sync_failed_safely(status_manager, syncing_status)
+        raise
 
 
 def _require_status_token_unchanged(
     status_manager: GraphStatusManager,
-    ready_status: Neo4jGraphStatus,
+    expected_status: Neo4jGraphStatus,
+    stage: str,
 ) -> None:
     current_status = status_manager.get_status()
-    if current_status != ready_status:
+    if current_status != expected_status:
         raise RuntimeError(
-            "graph_status changed during promotion live sync; "
+            f"graph_status changed {stage}; "
             "live graph mutation must be replayed",
         )
+
+
+def _mark_sync_failed_safely(
+    status_manager: GraphStatusManager,
+    syncing_status: Neo4jGraphStatus,
+) -> None:
+    try:
+        status_manager.mark_sync_failed(expected_status=syncing_status)
+    except Exception:  # noqa: BLE001 - preserve the original promotion sync failure.
+        return

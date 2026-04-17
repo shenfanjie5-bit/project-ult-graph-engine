@@ -159,9 +159,16 @@ def test_mark_rebuilding_rejects_existing_rebuilding_state() -> None:
         manager.mark_rebuilding()
 
 
-@pytest.mark.parametrize("source_status", ["ready", "failed"])
+def test_mark_rebuilding_rejects_active_syncing_state() -> None:
+    manager = GraphStatusManager(InMemoryStatusStore(_status(graph_status="syncing")))
+
+    with pytest.raises(ValueError, match="syncing"):
+        manager.mark_rebuilding()
+
+
+@pytest.mark.parametrize("source_status", ["ready", "syncing", "failed"])
 def test_mark_ready_only_allows_rebuilding(
-    source_status: Literal["ready", "failed"],
+    source_status: Literal["ready", "syncing", "failed"],
 ) -> None:
     manager = GraphStatusManager(InMemoryStatusStore(_status(graph_status=source_status)))
 
@@ -258,6 +265,43 @@ def test_mark_ready_rejects_stale_rebuilding_status_before_write() -> None:
     assert store.compare_calls == 1
 
 
+def test_sync_writer_token_blocks_rebuilding_until_released() -> None:
+    store = InMemoryStatusStore(_status(graph_status="ready", graph_generation_id=8))
+    manager = GraphStatusManager(store, clock=lambda: NOW)
+
+    ready_status, syncing_status = manager.begin_sync()
+
+    assert ready_status == _status(graph_status="ready", graph_generation_id=8)
+    assert store.status == syncing_status
+    assert syncing_status.graph_status == "syncing"
+    with pytest.raises(ValueError, match="syncing"):
+        manager.mark_rebuilding()
+
+    released = manager.finish_sync(
+        expected_status=syncing_status,
+        ready_status=ready_status,
+    )
+
+    assert released == ready_status
+    assert store.status == ready_status
+
+
+def test_sync_writer_token_failure_marks_status_failed() -> None:
+    store = InMemoryStatusStore(_status(graph_status="ready", graph_generation_id=8))
+    manager = GraphStatusManager(store, clock=lambda: NOW)
+    _, syncing_status = manager.begin_sync()
+
+    failed = manager.mark_sync_failed(
+        expected_status=syncing_status,
+        checksum="sync-failed",
+    )
+
+    assert failed.graph_status == "failed"
+    assert failed.graph_generation_id == syncing_status.graph_generation_id
+    assert failed.checksum == "sync-failed"
+    assert store.status == failed
+
+
 def test_mark_rebuilding_rejects_stale_ready_status_before_write() -> None:
     interleaved_status = _status(graph_status="failed", graph_generation_id=8)
     store = InterleavingStatusStore(
@@ -273,9 +317,9 @@ def test_mark_rebuilding_rejects_stale_ready_status_before_write() -> None:
     assert store.compare_calls == 1
 
 
-@pytest.mark.parametrize("source_status", ["ready", "rebuilding"])
-def test_mark_failed_allows_ready_and_rebuilding(
-    source_status: Literal["ready", "rebuilding"],
+@pytest.mark.parametrize("source_status", ["ready", "syncing", "rebuilding"])
+def test_mark_failed_allows_ready_syncing_and_rebuilding(
+    source_status: Literal["ready", "syncing", "rebuilding"],
 ) -> None:
     store = InMemoryStatusStore(_status(graph_status=source_status, graph_generation_id=6))
 
@@ -331,9 +375,9 @@ def test_require_ready_returns_ready_status() -> None:
     assert GraphStatusManager(InMemoryStatusStore(ready_status)).require_ready() is ready_status
 
 
-@pytest.mark.parametrize("graph_status", ["rebuilding", "failed"])
+@pytest.mark.parametrize("graph_status", ["syncing", "rebuilding", "failed"])
 def test_require_ready_rejects_non_ready_status(
-    graph_status: Literal["rebuilding", "failed"],
+    graph_status: Literal["syncing", "rebuilding", "failed"],
 ) -> None:
     status = _status(graph_status=graph_status)
 
@@ -551,7 +595,7 @@ def test_check_live_graph_consistency_malformed_client_result_fails_closed() -> 
 
 def _status(
     *,
-    graph_status: Literal["ready", "rebuilding", "failed"] = "ready",
+    graph_status: Literal["ready", "syncing", "rebuilding", "failed"] = "ready",
     graph_generation_id: int = 3,
     node_count: int = 2,
     edge_count: int = 1,

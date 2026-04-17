@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timezone
+from typing import Literal
 
 from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
 from graph_engine.status.store import StatusStore
@@ -69,6 +70,57 @@ class GraphStatusManager:
         self._commit_transition(current, status)
         return status
 
+    def begin_sync(self) -> tuple[Neo4jGraphStatus, Neo4jGraphStatus]:
+        """Acquire an exclusive live-graph writer token for incremental sync."""
+
+        current = self.require_ready()
+        status = _copy_status_with_graph_status(current, "syncing")
+        self._commit_transition(current, status)
+        return current, status
+
+    def finish_sync(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus,
+        ready_status: Neo4jGraphStatus,
+    ) -> Neo4jGraphStatus:
+        """Release an incremental sync writer token back to its ready status."""
+
+        if expected_status.graph_status != "syncing":
+            raise ValueError("finish_sync requires expected graph_status='syncing'")
+        if ready_status.graph_status != "ready":
+            raise ValueError("finish_sync requires ready graph_status='ready'")
+
+        self._commit_transition(expected_status, ready_status)
+        return ready_status
+
+    def mark_sync_failed(
+        self,
+        *,
+        expected_status: Neo4jGraphStatus,
+        node_count: int = 0,
+        edge_count: int = 0,
+        key_label_counts: dict[str, int] | None = None,
+        checksum: str = "failed",
+    ) -> Neo4jGraphStatus:
+        """Release a failed incremental sync by exposing live graph failure."""
+
+        if expected_status.graph_status != "syncing":
+            raise ValueError("mark_sync_failed requires expected graph_status='syncing'")
+
+        status = Neo4jGraphStatus(
+            graph_status="failed",
+            graph_generation_id=expected_status.graph_generation_id,
+            node_count=node_count,
+            edge_count=edge_count,
+            key_label_counts={} if key_label_counts is None else dict(key_label_counts),
+            checksum=checksum,
+            last_verified_at=None,
+            last_reload_at=expected_status.last_reload_at,
+        )
+        self._commit_transition(expected_status, status)
+        return status
+
     def mark_ready(
         self,
         *,
@@ -127,7 +179,7 @@ class GraphStatusManager:
 
         current = self.store.read_current_status()
         current_state = current.graph_status if current is not None else None
-        if current_state not in {"rebuilding", "ready"}:
+        if current_state not in {"rebuilding", "ready", "syncing"}:
             raise ValueError(
                 "cannot transition graph_status from "
                 f"{current_state!r} to 'failed'",
@@ -187,3 +239,19 @@ class GraphStatusManager:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _copy_status_with_graph_status(
+    status: Neo4jGraphStatus,
+    graph_status: Literal["ready", "syncing", "rebuilding", "failed"],
+) -> Neo4jGraphStatus:
+    return Neo4jGraphStatus(
+        graph_status=graph_status,
+        graph_generation_id=status.graph_generation_id,
+        node_count=status.node_count,
+        edge_count=status.edge_count,
+        key_label_counts=dict(status.key_label_counts),
+        checksum=status.checksum,
+        last_verified_at=None if graph_status != "ready" else status.last_verified_at,
+        last_reload_at=status.last_reload_at,
+    )
