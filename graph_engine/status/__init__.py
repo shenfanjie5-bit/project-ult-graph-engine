@@ -5,11 +5,13 @@ from graph_engine.status.consistency import (
     check_live_graph_consistency,
 )
 from graph_engine.status.manager import GraphStatusManager, require_ready_status
-from graph_engine.status.store import StatusStore
+from graph_engine.status.store import PostgreSQLStatusStore, PostgresStatusStore, StatusStore
 
 __all__ = [
     "CanonicalSnapshotReader",
     "GraphStatusManager",
+    "PostgreSQLStatusStore",
+    "PostgresStatusStore",
     "StatusStore",
     "check_live_graph_consistency",
     "require_ready_status",

@@ -31,6 +31,8 @@ from graph_engine.schema import (
 from graph_engine.status import (
     CanonicalSnapshotReader,
     GraphStatusManager,
+    PostgreSQLStatusStore,
+    PostgresStatusStore,
     StatusStore,
     check_live_graph_consistency,
     require_ready_status,
@@ -54,6 +56,8 @@ __all__ = [
     "Neo4jConfig",
     "Neo4jGraphStatus",
     "NodeLabel",
+    "PostgreSQLStatusStore",
+    "PostgresStatusStore",
     "PromotionPlan",
     "PropagationContext",
     "PropagationResult",
