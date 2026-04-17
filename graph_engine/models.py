@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any, Literal, Self, get_args
 
@@ -167,7 +168,42 @@ class ReadonlySimulationRequest(BaseModel):
         ]
         if unknown_channels:
             raise ValueError(f"unknown propagation channels: {unknown_channels}")
+        invalid_channels = [
+            channel
+            for channel, multiplier in multipliers.items()
+            if not math.isfinite(float(multiplier)) or float(multiplier) < 0.0
+        ]
+        if invalid_channels:
+            raise ValueError(
+                "multipliers must be finite non-negative values for channels: "
+                f"{invalid_channels}",
+            )
         return multipliers
+
+    @model_validator(mode="after")
+    def _enabled_channels_require_multipliers(self) -> Self:
+        missing_channel_multipliers = [
+            channel
+            for channel in self.enabled_channels
+            if channel not in self.channel_multipliers
+        ]
+        if missing_channel_multipliers:
+            raise ValueError(
+                "channel_multipliers must include every enabled channel: "
+                f"{missing_channel_multipliers}",
+            )
+
+        missing_regime_multipliers = [
+            channel
+            for channel in self.enabled_channels
+            if channel not in self.regime_multipliers
+        ]
+        if missing_regime_multipliers:
+            raise ValueError(
+                "regime_multipliers must include every enabled channel: "
+                f"{missing_regime_multipliers}",
+            )
+        return self
 
 
 class GraphQueryResult(BaseModel):

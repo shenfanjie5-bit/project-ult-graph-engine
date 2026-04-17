@@ -96,6 +96,10 @@ def simulate_readonly_impact(
                 client,
                 node_ids=_node_ids(nodes),
                 edges=edges,
+                projection_names=_projection_names(
+                    projection_name,
+                    context.enabled_channels,
+                ),
             )
             propagation_result = _run_scoped_propagation(
                 context,
@@ -131,12 +135,12 @@ def _run_scoped_propagation(
     request: ReadonlySimulationRequest,
     *,
     projection_name: str,
-    client: _SimulationClient,
+    client: "_ReadonlyProjectionClient",
     ready_status: Neo4jGraphStatus,
 ) -> PropagationResult:
     projection_names = _projection_names(projection_name, request.enabled_channels)
+    _assert_projection_names_available(client, projection_names)
     try:
-        _drop_projections(client, projection_names, suppress_missing_gds=False)
         return run_full_propagation(
             _simulation_context(request),
             cast(Neo4jClient, client),
@@ -146,17 +150,15 @@ def _run_scoped_propagation(
             result_limit=request.result_limit,
         )
     finally:
-        _drop_projections(client, projection_names, suppress_missing_gds=True)
+        _drop_projections(client, client.created_projection_names, suppress_missing_gds=True)
 
 
 def _default_projection_name(context: ReadonlySimulationRequest) -> str:
     if context.projection_name is not None:
-        return _safe_projection_name(context.projection_name)
+        return _unique_projection_name(context.projection_name)
 
     cycle_component = _safe_projection_component(context.cycle_id)
-    return _safe_projection_name(
-        f"graph_engine_readonly_sim_{cycle_component}_{uuid4().hex[:8]}",
-    )
+    return _unique_projection_name(f"graph_engine_readonly_sim_{cycle_component}")
 
 
 def _drop_projection_if_exists(client: _SimulationClient, graph_name: str) -> None:
@@ -244,10 +246,17 @@ class _ReadonlyProjectionClient:
         *,
         node_ids: list[str],
         edges: list[dict[str, Any]],
+        projection_names: list[str],
     ) -> None:
         self._client = client
         self._node_ids = node_ids
         self._edge_ids_by_channel = _edge_ids_by_channel(edges)
+        self._owned_projection_names = set(projection_names)
+        self._created_projection_names: set[str] = set()
+
+    @property
+    def created_projection_names(self) -> list[str]:
+        return sorted(self._created_projection_names)
 
     def execute_read(
         self,
@@ -255,16 +264,22 @@ class _ReadonlyProjectionClient:
         parameters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         params = parameters or {}
+        if _is_gds_graph_exists(query):
+            graph_name = _graph_name_from_parameters(params)
+            return self._read_owned_projection_exists(graph_name)
         if _is_activated_path_read(query):
             channel = _channel_from_query(query, params)
-            if channel is not None:
-                return _read_scoped_activated_path_rows(
-                    self._client,
-                    channel=channel,
-                    node_ids=self._node_ids,
-                    edge_ids=self._edge_ids_by_channel.get(channel, []),
-                    parameters=params,
+            if channel is None:
+                raise PermissionError(
+                    "readonly simulation activated-path reads require a resolvable channel",
                 )
+            return _read_scoped_activated_path_rows(
+                self._client,
+                channel=channel,
+                node_ids=self._node_ids,
+                edge_ids=self._edge_ids_by_channel.get(channel, []),
+                parameters=params,
+            )
         return self._client.execute_read(query, parameters)
 
     def execute_write(
@@ -275,6 +290,8 @@ class _ReadonlyProjectionClient:
         params = parameters or {}
         if "gds.graph.project" in query:
             graph_name = _graph_name_from_parameters(params)
+            self._require_owned_projection(graph_name)
+            self._ensure_projection_available(graph_name)
             channel = _channel_from_query(query, params)
             edge_ids = (
                 self._edge_ids_by_channel.get(channel, [])
@@ -287,6 +304,8 @@ class _ReadonlyProjectionClient:
                 self._node_ids,
                 edge_ids,
             )
+            if relationship_count > 0:
+                self._created_projection_names.add(graph_name)
             return [
                 {
                     "graphName": graph_name,
@@ -295,8 +314,38 @@ class _ReadonlyProjectionClient:
                 }
             ]
         if "gds.graph.drop" in query:
-            return self._client.execute_write(query, parameters)
+            graph_name = _graph_name_from_parameters(params)
+            self._require_owned_projection(graph_name)
+            if graph_name not in self._created_projection_names:
+                raise PermissionError(
+                    "readonly simulation cannot drop a projection it did not create",
+                )
+            rows = self._client.execute_write(query, parameters)
+            self._created_projection_names.discard(graph_name)
+            return rows
         raise PermissionError("readonly simulation only permits GDS projection writes")
+
+    def _read_owned_projection_exists(self, graph_name: str) -> list[dict[str, Any]]:
+        self._require_owned_projection(graph_name)
+        rows = execute_gds_read(
+            self._client,
+            "CALL gds.graph.exists($graph_name) YIELD exists RETURN exists",
+            {"graph_name": graph_name},
+        )
+        if rows and rows[0].get("exists") is True and graph_name not in self._created_projection_names:
+            raise ValueError(f"GDS projection name already exists: {graph_name}")
+        return rows
+
+    def _ensure_projection_available(self, graph_name: str) -> None:
+        rows = self._read_owned_projection_exists(graph_name)
+        if rows and rows[0].get("exists") is True:
+            raise ValueError(f"GDS projection name already exists: {graph_name}")
+
+    def _require_owned_projection(self, graph_name: str) -> None:
+        if graph_name not in self._owned_projection_names:
+            raise PermissionError(
+                "readonly simulation can only manage projections owned by this invocation",
+            )
 
 
 def _read_scoped_activated_path_rows(
@@ -379,11 +428,35 @@ def _drop_projections(
             raise
 
 
+def _assert_projection_names_available(
+    client: _SimulationClient,
+    projection_names: list[str],
+) -> None:
+    for projection_name in projection_names:
+        rows = execute_gds_read(
+            cast(Neo4jClient, client),
+            "CALL gds.graph.exists($graph_name) YIELD exists RETURN exists",
+            {"graph_name": projection_name},
+        )
+        if rows and rows[0].get("exists") is True:
+            raise ValueError(f"GDS projection name already exists: {projection_name}")
+
+
 def _projection_names(base_name: str, enabled_channels: list[PropagationChannel]) -> list[str]:
-    names = [base_name]
-    if len(enabled_channels) > 1:
-        names.extend(f"{base_name}-{channel}" for channel in enabled_channels)
+    if len(enabled_channels) == 1:
+        names = [base_name]
+    else:
+        names = [f"{base_name}-{channel}" for channel in enabled_channels]
     return list(dict.fromkeys(names))
+
+
+def _unique_projection_name(value: str) -> str:
+    owner_token = uuid4().hex[:12]
+    max_prefix_length = _PROJECTION_NAME_LIMIT - len(owner_token) - 1
+    prefix = _safe_projection_name(value)[:max_prefix_length].strip("_-")
+    if not prefix:
+        prefix = "graph_engine_readonly_sim"
+    return f"{prefix}_{owner_token}"
 
 
 def _safe_projection_name(value: str) -> str:
@@ -418,11 +491,14 @@ def _empty_propagation_result(
 ) -> PropagationResult:
     channel_breakdown: dict[str, Any] = {
         channel: {
-            "status": "skipped",
+            "status": "empty",
             "reason": reason,
+            "path_selector": effective_channel_selector(channel),
             "path_count": 0,
             "impacted_entity_count": 0,
             "total_path_score": 0.0,
+            "channel_multiplier": float(request.channel_multipliers[channel]),
+            "regime_multiplier": float(request.regime_multipliers[channel]),
         }
         for channel in request.enabled_channels
     }
@@ -495,6 +571,10 @@ def _all_edge_ids(edge_ids_by_channel: Mapping[str, list[str]]) -> list[str]:
     return _unique_text_values(
         edge_id for edge_ids in edge_ids_by_channel.values() for edge_id in edge_ids
     )
+
+
+def _is_gds_graph_exists(query: str) -> bool:
+    return "gds.graph.exists" in query
 
 
 def _is_activated_path_read(query: str) -> bool:

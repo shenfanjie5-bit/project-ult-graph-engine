@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 
 import pytest
+from pydantic import ValidationError
 
 import graph_engine.query.simulation as simulation_module
 from graph_engine.models import Neo4jGraphStatus, PropagationContext, PropagationResult
@@ -165,7 +166,7 @@ def test_simulate_readonly_impact_returns_interim_propagation_envelope() -> None
     assert result["graph_generation_id"] == 1
     assert result["seed_entities"] == ["entity-a"]
     assert result["depth"] == 2
-    assert result["projection_name"] == "unsafe_projection_DROP_GRAPH"
+    assert re.fullmatch(r"unsafe_projection_DROP_GRAPH_[0-9a-f]{12}", result["projection_name"])
     assert "snapshot_id" not in result
     assert "impact_snapshot_id" not in result
     assert [path["edge_id"] for path in result["activated_paths"]] == ["edge-fundamental"]
@@ -240,14 +241,15 @@ def test_ready_read_barrier_covers_subgraph_projection_and_propagation() -> None
 def test_projection_is_dropped_after_success() -> None:
     client = FakeSimulationClient()
 
-    simulate_readonly_impact(
+    result = simulate_readonly_impact(
         ["entity-a"],
         _request(projection_name="unit-projection"),
         client=client,  # type: ignore[arg-type]
         status_manager=_status_manager(),
     )
 
-    assert client.projections["unit-projection"] is False
+    assert re.fullmatch(r"unit-projection_[0-9a-f]{12}", result["projection_name"])
+    assert client.projections[result["projection_name"]] is False
     write_queries = [query for query, _ in client.write_calls]
     assert any("gds.graph.project" in query for query in write_queries)
     assert write_queries[-1].strip().startswith("CALL gds.graph.drop")
@@ -264,7 +266,58 @@ def test_projection_is_dropped_after_propagation_error() -> None:
             status_manager=_status_manager(),
         )
 
-    assert client.projections["unit-projection"] is False
+    dropped_projection_names = [
+        parameters["graph_name"]
+        for query, parameters in client.write_calls
+        if "gds.graph.drop" in query
+    ]
+    assert len(dropped_projection_names) == 1
+    assert re.fullmatch(r"unit-projection_[0-9a-f]{12}", dropped_projection_names[0])
+    assert client.projections[dropped_projection_names[0]] is False
+
+
+def test_caller_projection_name_is_prefix_and_does_not_drop_existing_exact_name() -> None:
+    client = FakeSimulationClient()
+    client.projections["unit-projection"] = True
+
+    result = simulate_readonly_impact(
+        ["entity-a"],
+        _request(projection_name="unit-projection"),
+        client=client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+    )
+
+    assert result["projection_name"] != "unit-projection"
+    assert re.fullmatch(r"unit-projection_[0-9a-f]{12}", result["projection_name"])
+    assert client.projections["unit-projection"] is True
+    dropped_projection_names = [
+        parameters["graph_name"]
+        for query, parameters in client.write_calls
+        if "gds.graph.drop" in query
+    ]
+    assert "unit-projection" not in dropped_projection_names
+
+
+def test_projection_name_collision_rejects_without_dropping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FixedUUID:
+        hex = "0123456789abcdef0123456789abcdef"
+
+    monkeypatch.setattr(simulation_module, "uuid4", lambda: FixedUUID())
+    client = FakeSimulationClient()
+    client.projections["unit-projection_0123456789ab"] = True
+
+    with pytest.raises(ValueError, match="already exists"):
+        simulate_readonly_impact(
+            ["entity-a"],
+            _request(projection_name="unit-projection"),
+            client=client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
+        )
+
+    assert client.projections["unit-projection_0123456789ab"] is True
+    assert not any("gds.graph.drop" in query for query, _ in client.write_calls)
 
 
 def test_gds_missing_errors_are_normalized() -> None:
@@ -299,7 +352,9 @@ def test_empty_subgraph_returns_empty_interim_without_running_propagation(
     assert result["interim"] is True
     assert result["activated_paths"] == []
     assert result["impacted_entities"] == []
+    assert result["channel_breakdown"]["fundamental"]["status"] == "empty"
     assert result["channel_breakdown"]["fundamental"]["reason"] == "empty_subgraph"
+    assert result["channel_breakdown"]["fundamental"]["path_count"] == 0
     assert client.write_calls == []
 
 
@@ -345,12 +400,53 @@ def test_run_full_propagation_receives_request_controls(
         status_manager=_status_manager(),
     )
 
-    assert calls[0]["graph_name"] == "unit-projection"
+    assert re.fullmatch(r"unit-projection_[0-9a-f]{12}", calls[0]["graph_name"])
     assert calls[0]["max_iterations"] == 3
     assert calls[0]["result_limit"] == 7
     assert calls[0]["context"].enabled_channels == ["fundamental"]
     assert result["activated_paths"] == [{"edge_id": "from-runner", "channel": "fundamental"}]
     assert result["impacted_entities"] == [{"node_id": "node-b", "channel": "fundamental"}]
+
+
+def test_activated_path_read_requires_resolvable_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeSimulationClient()
+
+    def run_full(
+        context: PropagationContext,
+        run_client: Any,
+        *,
+        status_manager: Any,
+        graph_name: str | None = None,
+        max_iterations: int = 20,
+        result_limit: int = 100,
+    ) -> PropagationResult:
+        run_client.execute_read(
+            """
+MATCH (source)-[relationship]->(target)
+WITH source, relationship, target, 1.0 AS path_score
+RETURN path_score
+""",
+            {"result_limit": result_limit},
+        )
+        return PropagationResult(
+            cycle_id=context.cycle_id,
+            graph_generation_id=context.graph_generation_id,
+            activated_paths=[],
+            impacted_entities=[],
+            channel_breakdown={"fundamental": {"path_count": 0}},
+        )
+
+    monkeypatch.setattr(simulation_module, "run_full_propagation", run_full)
+
+    with pytest.raises(PermissionError, match="resolvable channel"):
+        simulate_readonly_impact(
+            ["entity-a"],
+            _request(),
+            client=client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
+        )
 
 
 def test_simulation_module_has_no_snapshot_writer_runtime_dependency() -> None:
@@ -359,6 +455,37 @@ def test_simulation_module_has_no_snapshot_writer_runtime_dependency() -> None:
     assert "SnapshotWriter" not in source
     assert "snapshots.writer" not in source
     assert "write_snapshots" not in source
+
+
+@pytest.mark.parametrize(
+    ("request_update", "match"),
+    [
+        ({"channel_multipliers": {"fundamental": -1.0}}, "finite non-negative"),
+        ({"channel_multipliers": {"fundamental": float("nan")}}, "finite non-negative"),
+        ({"regime_multipliers": {"fundamental": float("inf")}}, "finite non-negative"),
+        ({"channel_multipliers": {}}, "must include every enabled channel"),
+        ({"regime_multipliers": {}}, "must include every enabled channel"),
+    ],
+)
+def test_readonly_request_rejects_invalid_runtime_multipliers(
+    request_update: dict[str, Any],
+    match: str,
+) -> None:
+    payload = {
+        "cycle_id": "cycle-1",
+        "world_state_ref": "world-state-1",
+        "graph_generation_id": 1,
+        "depth": 2,
+        "enabled_channels": ["fundamental"],
+        "channel_multipliers": {"fundamental": 1.0},
+        "regime_multipliers": {"fundamental": 1.0},
+        "decay_policy": {"default": 1.0},
+        "regime_context": {"risk_regime": "baseline"},
+    }
+    payload.update(request_update)
+
+    with pytest.raises(ValidationError, match=match):
+        ReadonlySimulationRequest(**payload)
 
 
 def test_readonly_projection_scopes_paths_to_seed_subgraph() -> None:
