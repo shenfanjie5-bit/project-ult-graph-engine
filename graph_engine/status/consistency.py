@@ -8,7 +8,7 @@ from typing import Protocol
 from graph_engine.client import Neo4jClient
 from graph_engine.live_metrics import read_live_graph_metrics
 from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
-from graph_engine.status.manager import GraphStatusManager
+from graph_engine.status.manager import GraphStatusManager, hold_ready_read
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,8 +30,33 @@ def check_live_graph_consistency(
 ) -> bool:
     """Return whether live Neo4j metrics match the canonical graph snapshot."""
 
-    status = _resolve_status(status_manager, require_ready=require_ready)
+    if require_ready:
+        if status_manager is None:
+            raise ValueError("status_manager is required when require_ready=True")
+        with hold_ready_read(status_manager, "live graph consistency") as status:
+            return _check_live_graph_consistency_after_status(
+                snapshot_ref,
+                client=client,
+                snapshot_reader=snapshot_reader,
+                status=status,
+            )
 
+    current_status = _resolve_status(status_manager)
+    return _check_live_graph_consistency_after_status(
+        snapshot_ref,
+        client=client,
+        snapshot_reader=snapshot_reader,
+        status=current_status,
+    )
+
+
+def _check_live_graph_consistency_after_status(
+    snapshot_ref: str,
+    *,
+    client: Neo4jClient,
+    snapshot_reader: CanonicalSnapshotReader,
+    status: Neo4jGraphStatus | None,
+) -> bool:
     try:
         snapshot = snapshot_reader.read_graph_snapshot(snapshot_ref)
     except Exception:
@@ -87,14 +112,7 @@ def check_live_graph_consistency(
 
 def _resolve_status(
     status_manager: GraphStatusManager | None,
-    *,
-    require_ready: bool,
 ) -> Neo4jGraphStatus | None:
-    if require_ready:
-        if status_manager is None:
-            raise ValueError("status_manager is required when require_ready=True")
-        return status_manager.require_ready()
-
     if status_manager is None:
         return None
     try:

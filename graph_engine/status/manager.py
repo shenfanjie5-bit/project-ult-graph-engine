@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
@@ -48,6 +49,13 @@ class GraphStatusManager:
         """Return the current ready status or block non-ready graph reads."""
 
         return require_ready_status(self.get_status())
+
+    @contextmanager
+    def ready_read(self) -> Iterator[Neo4jGraphStatus]:
+        """Hold the shared ready-read lock while live graph reads execute."""
+
+        with self.store.ready_read_lock():
+            yield self.require_ready()
 
     def mark_rebuilding(self) -> Neo4jGraphStatus:
         """Move an empty, ready, or failed status into rebuilding."""
@@ -253,15 +261,17 @@ class GraphStatusManager:
             )
 
 
-def require_ready_read(
+@contextmanager
+def hold_ready_read(
     status_manager: GraphStatusManager | None,
     operation: str,
-) -> Neo4jGraphStatus:
-    """Return the ready status required before a public Neo4j read operation."""
+) -> Iterator[Neo4jGraphStatus]:
+    """Hold the ready-read lock required during a public Neo4j read operation."""
 
     if status_manager is None:
         raise ValueError(f"{operation} requires status_manager")
-    return status_manager.require_ready()
+    with status_manager.ready_read() as ready_status:
+        yield ready_status
 
 
 def _utc_now() -> datetime:

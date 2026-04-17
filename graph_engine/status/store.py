@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
+import hashlib
 import importlib
+import json
 import os
 import re
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from threading import Lock
 from typing import Any, Protocol
 
@@ -18,6 +19,9 @@ _GRAPH_STATUS_CHECK_CONSTRAINT = "neo4j_graph_status_graph_status_check"
 
 class StatusStore(Protocol):
     """Persistence boundary for the singleton Neo4j graph status row."""
+
+    def ready_read_lock(self) -> AbstractContextManager[None]:
+        """Hold a shared persistence lock for a ready live-graph read."""
 
     def read_current_status(self) -> Neo4jGraphStatus | None:
         """Return the current status row, or None before bootstrap."""
@@ -40,9 +44,13 @@ class PostgreSQLStatusStore:
     The store keeps one row in ``neo4j_graph_status`` by default.  It expects
     PostgreSQL ``READ COMMITTED`` isolation or stronger: compare-and-set writes
     are a single ``UPDATE ... WHERE`` statement, so PostgreSQL locks the row and
-    rechecks the expected fields after any competing transaction commits.  Empty
-    store bootstrap uses the singleton primary key with ``ON CONFLICT DO
-    NOTHING`` so only one process can create the first status row.
+    rechecks the expected fields after any competing transaction commits.  Ready
+    reads hold a shared advisory lock on a dedicated connection for the duration
+    of the read body, and status writes take the matching exclusive advisory lock
+    so distinct store instances backed by the same row share the same read/write
+    barrier.  Empty store bootstrap uses the singleton primary key with
+    ``ON CONFLICT DO NOTHING`` so only one process can create the first status
+    row.
     """
 
     def __init__(
@@ -169,6 +177,45 @@ WHERE status_key = %s
             return None
         return _status_from_row(row)
 
+    @contextmanager
+    def ready_read_lock(self) -> Iterator[None]:
+        """Hold a shared PostgreSQL advisory lock for a live-graph read."""
+
+        self._ensure_bootstrap()
+        connection = self._connection_factory()
+        locked = False
+        lock_key: int | None = None
+        try:
+            with connection.cursor() as cursor:
+                lock_key = self._resolve_advisory_lock_key(cursor)
+                cursor.execute(
+                    "SELECT pg_advisory_lock_shared(%s)",
+                    (lock_key,),
+                )
+                locked = True
+            connection.commit()
+            yield
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            if locked:
+                assert lock_key is not None
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT pg_advisory_unlock_shared(%s)",
+                            (lock_key,),
+                        )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.close()
+            else:
+                connection.close()
+
     def write_current_status(self, status: Neo4jGraphStatus) -> None:
         """Persist the current status row without comparing the previous value."""
 
@@ -176,6 +223,7 @@ WHERE status_key = %s
         values = _status_write_values(status)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._acquire_exclusive_status_lock(cursor)
                 cursor.execute(
                     f"""
 INSERT INTO {self._table_name} (
@@ -222,6 +270,7 @@ ON CONFLICT (status_key) DO UPDATE SET
         expected_values = _status_write_values(expected_status)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._acquire_exclusive_status_lock(cursor)
                 cursor.execute(
                     f"""
 UPDATE {self._table_name}
@@ -254,6 +303,7 @@ RETURNING status_key
     def _insert_if_missing(self, next_values: tuple[Any, ...]) -> bool:
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._acquire_exclusive_status_lock(cursor)
                 cursor.execute(
                     f"""
 INSERT INTO {self._table_name} (
@@ -275,6 +325,20 @@ RETURNING status_key
                     (self._status_key, *next_values),
                 )
                 return cursor.fetchone() is not None
+
+    def _acquire_exclusive_status_lock(self, cursor: Any) -> None:
+        lock_key = self._resolve_advisory_lock_key(cursor)
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(%s)",
+            (lock_key,),
+        )
+
+    def _resolve_advisory_lock_key(self, cursor: Any) -> int:
+        cursor.execute("SELECT %s::regclass::oid", (self._table_name,))
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL did not return a status table OID")
+        return _advisory_lock_key(int(row[0]), self._status_key)
 
     def _ensure_bootstrap(self) -> None:
         if self._auto_bootstrap and not self._bootstrapped:
@@ -366,6 +430,16 @@ def _quote_identifier(identifier: str) -> str:
     if _IDENTIFIER_RE.fullmatch(identifier) is None:
         raise ValueError(f"invalid PostgreSQL identifier: {identifier!r}")
     return f'"{identifier}"'
+
+
+def _advisory_lock_key(relation_oid: int, status_key: str) -> int:
+    lock_name = f"{relation_oid}\0{status_key}".encode()
+    digest = hashlib.blake2b(
+        lock_name,
+        digest_size=8,
+        person=b"ge-status",
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
 
 
 def _status_write_values(status: Neo4jGraphStatus) -> tuple[Any, ...]:

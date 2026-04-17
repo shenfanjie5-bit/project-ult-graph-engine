@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, Literal
 from unittest.mock import MagicMock
@@ -109,6 +110,9 @@ class SequentialStatusStore:
         self.calls += 1
         index = min(self.calls - 1, len(self.graph_statuses) - 1)
         return self.graph_statuses[index]
+
+    def ready_read_lock(self) -> nullcontext[None]:
+        return nullcontext()
 
     def write_current_status(self, status: Neo4jGraphStatus) -> None:
         self.graph_statuses = [status]

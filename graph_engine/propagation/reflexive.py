@@ -14,7 +14,7 @@ from graph_engine.propagation._gds import (
     execute_gds_write,
 )
 from graph_engine.propagation.scoring import build_score_explanation
-from graph_engine.status import GraphStatusManager, require_ready_read
+from graph_engine.status import GraphStatusManager, hold_ready_read
 
 _REFLEXIVE_CHANNEL = "reflexive"
 _REFLEXIVE_PATH_SELECTOR = (
@@ -41,35 +41,35 @@ def run_reflexive_propagation(
     if result_limit < 1:
         raise ValueError("result_limit must be greater than zero")
 
-    ready_status = require_ready_read(status_manager, "reflexive propagation")
-    if ready_status.graph_generation_id != context.graph_generation_id:
-        raise ValueError(
-            "PropagationContext graph_generation_id disagrees with Neo4jGraphStatus: "
-            f"context={context.graph_generation_id}, "
-            f"status={ready_status.graph_generation_id}",
-        )
+    with hold_ready_read(status_manager, "reflexive propagation") as ready_status:
+        if ready_status.graph_generation_id != context.graph_generation_id:
+            raise ValueError(
+                "PropagationContext graph_generation_id disagrees with Neo4jGraphStatus: "
+                f"context={context.graph_generation_id}, "
+                f"status={ready_status.graph_generation_id}",
+            )
 
-    projection_name = graph_name or _default_projection_name(context)
-    drop_projection_if_exists(client, projection_name)
-    try:
-        relationship_count = _create_projection(client, projection_name)
-        if relationship_count == 0:
-            pagerank_entities: list[dict[str, Any]] = []
-            activated_paths: list[dict[str, Any]] = []
-        else:
-            pagerank_entities = _stream_pagerank(
-                client,
-                projection_name,
-                max_iterations=max_iterations,
-                result_limit=result_limit,
-            )
-            activated_paths = _read_activated_paths(
-                context,
-                client,
-                result_limit=result_limit,
-            )
-    finally:
+        projection_name = graph_name or _default_projection_name(context)
         drop_projection_if_exists(client, projection_name)
+        try:
+            relationship_count = _create_projection(client, projection_name)
+            if relationship_count == 0:
+                pagerank_entities: list[dict[str, Any]] = []
+                activated_paths: list[dict[str, Any]] = []
+            else:
+                pagerank_entities = _stream_pagerank(
+                    client,
+                    projection_name,
+                    max_iterations=max_iterations,
+                    result_limit=result_limit,
+                )
+                activated_paths = _read_activated_paths(
+                    context,
+                    client,
+                    result_limit=result_limit,
+                )
+        finally:
+            drop_projection_if_exists(client, projection_name)
 
     impacted_entities = _impacted_entities_from_paths(
         activated_paths,

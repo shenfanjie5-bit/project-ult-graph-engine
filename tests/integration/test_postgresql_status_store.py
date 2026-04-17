@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from threading import Barrier
+from threading import Barrier, Event
 from typing import Any
 from uuid import uuid4
 
@@ -97,6 +97,121 @@ def test_postgresql_status_store_rejects_competing_reload_and_sync_transitions()
         _drop_table(database_url, table_name)
 
 
+def test_postgresql_ready_read_lock_blocks_competing_store_writer() -> None:
+    pytest.importorskip("psycopg")
+
+    database_url = _database_url()
+    table_name = _table_name()
+    store = PostgreSQLStatusStore(database_url, table_name=table_name)
+    store.write_current_status(_status())
+
+    reader_entered = Event()
+    release_reader = Event()
+    writer_started = Event()
+
+    class ObservedWriterStore(PostgreSQLStatusStore):
+        def compare_and_write_current_status(
+            self,
+            *,
+            expected_status: Neo4jGraphStatus | None,
+            next_status: Neo4jGraphStatus,
+        ) -> bool:
+            writer_started.set()
+            return super().compare_and_write_current_status(
+                expected_status=expected_status,
+                next_status=next_status,
+            )
+
+    def hold_reader() -> Neo4jGraphStatus:
+        reader_store = PostgreSQLStatusStore(database_url, table_name=table_name)
+        with GraphStatusManager(reader_store, clock=lambda: NOW).ready_read() as status:
+            reader_entered.set()
+            release_reader.wait(timeout=10)
+            return status
+
+    def begin_sync() -> tuple[Neo4jGraphStatus, Neo4jGraphStatus]:
+        writer_store = ObservedWriterStore(database_url, table_name=table_name)
+        return GraphStatusManager(writer_store, clock=lambda: NOW).begin_sync()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            reader_future = executor.submit(hold_reader)
+            assert reader_entered.wait(timeout=10)
+
+            writer_future = executor.submit(begin_sync)
+            assert writer_started.wait(timeout=10)
+            assert not writer_future.done()
+
+            release_reader.set()
+            ready_status, locked_status = writer_future.result(timeout=20)
+            assert reader_future.result(timeout=20) == _status()
+
+        assert ready_status == _status()
+        assert locked_status.graph_status == "ready"
+        assert locked_status.writer_lock_token is not None
+    finally:
+        release_reader.set()
+        _drop_table(database_url, table_name)
+
+
+def test_postgresql_ready_read_lock_uses_resolved_relation_for_schema_qualified_store() -> None:
+    pytest.importorskip("psycopg")
+
+    database_url = _database_url()
+    table_name = _table_name()
+    qualified_table_name = f"public.{table_name}"
+    store = PostgreSQLStatusStore(database_url, table_name=qualified_table_name)
+    store.write_current_status(_status())
+
+    reader_entered = Event()
+    release_reader = Event()
+    writer_started = Event()
+
+    class ObservedWriterStore(PostgreSQLStatusStore):
+        def compare_and_write_current_status(
+            self,
+            *,
+            expected_status: Neo4jGraphStatus | None,
+            next_status: Neo4jGraphStatus,
+        ) -> bool:
+            writer_started.set()
+            return super().compare_and_write_current_status(
+                expected_status=expected_status,
+                next_status=next_status,
+            )
+
+    def hold_reader() -> Neo4jGraphStatus:
+        reader_store = PostgreSQLStatusStore(database_url, table_name=table_name)
+        with GraphStatusManager(reader_store, clock=lambda: NOW).ready_read() as status:
+            reader_entered.set()
+            release_reader.wait(timeout=10)
+            return status
+
+    def begin_sync() -> tuple[Neo4jGraphStatus, Neo4jGraphStatus]:
+        writer_store = ObservedWriterStore(database_url, table_name=qualified_table_name)
+        return GraphStatusManager(writer_store, clock=lambda: NOW).begin_sync()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            reader_future = executor.submit(hold_reader)
+            assert reader_entered.wait(timeout=10)
+
+            writer_future = executor.submit(begin_sync)
+            assert writer_started.wait(timeout=10)
+            assert not writer_future.done()
+
+            release_reader.set()
+            ready_status, locked_status = writer_future.result(timeout=20)
+            assert reader_future.result(timeout=20) == _status()
+
+        assert ready_status == _status()
+        assert locked_status.graph_status == "ready"
+        assert locked_status.writer_lock_token is not None
+    finally:
+        release_reader.set()
+        _drop_public_table(database_url, table_name)
+
+
 def test_postgresql_status_store_bootstrap_migrates_legacy_syncing_status() -> None:
     psycopg = pytest.importorskip("psycopg")
 
@@ -180,6 +295,13 @@ def _drop_table(database_url: str, table_name: str) -> None:
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+
+
+def _drop_public_table(database_url: str, table_name: str) -> None:
+    psycopg = pytest.importorskip("psycopg")
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f'DROP TABLE IF EXISTS public."{table_name}"')
 
 
 def _create_legacy_syncing_status_row(

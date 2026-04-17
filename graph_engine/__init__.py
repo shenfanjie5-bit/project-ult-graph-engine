@@ -37,7 +37,7 @@ from graph_engine.status import (
     PostgresStatusStore,
     StatusStore,
     check_live_graph_consistency,
-    require_ready_read,
+    hold_ready_read,
     require_ready_status,
 )
 
@@ -73,10 +73,10 @@ __all__ = [
     "cold_reload",
     "get_constraint_statements",
     "get_index_statements",
+    "hold_ready_read",
     "load_config_from_env",
     "query_subgraph",
     "rebuild_gds_projection",
-    "require_ready_read",
     "require_ready_status",
     "simulate_readonly_impact",
 ]
