@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any, Literal, Self, get_args
 
@@ -132,8 +133,77 @@ class ReadonlySimulationRequest(BaseModel):
     cycle_id: str = Field(min_length=1)
     world_state_ref: str = Field(min_length=1)
     graph_generation_id: int = Field(ge=0)
-    depth: int = Field(default=1, ge=0)
-    result_limit: int = Field(default=100, ge=1)
+    depth: int = Field(default=2, ge=0, le=6)
+    enabled_channels: list[PropagationChannel] = Field(min_length=1)
+    channel_multipliers: dict[str, float]
+    regime_multipliers: dict[str, float]
+    decay_policy: dict[str, Any]
+    regime_context: dict[str, Any]
+    result_limit: int = Field(default=100, ge=1, le=1000)
+    max_iterations: int = Field(default=20, ge=1)
+    projection_name: str | None = Field(default=None, min_length=1)
+
+    @field_validator("enabled_channels")
+    @classmethod
+    def _validate_enabled_channels(
+        cls,
+        enabled_channels: list[PropagationChannel],
+    ) -> list[PropagationChannel]:
+        if not enabled_channels:
+            raise ValueError("enabled_channels must not be empty")
+        unknown_channels = [
+            channel for channel in enabled_channels if channel not in _ALLOWED_PROPAGATION_CHANNELS
+        ]
+        if unknown_channels:
+            raise ValueError(f"unknown propagation channels: {unknown_channels}")
+        if len(set(enabled_channels)) != len(enabled_channels):
+            raise ValueError("enabled_channels must not contain duplicates")
+        return enabled_channels
+
+    @field_validator("channel_multipliers", "regime_multipliers")
+    @classmethod
+    def _validate_multiplier_keys(cls, multipliers: dict[str, float]) -> dict[str, float]:
+        unknown_channels = [
+            channel for channel in multipliers if channel not in _ALLOWED_PROPAGATION_CHANNELS
+        ]
+        if unknown_channels:
+            raise ValueError(f"unknown propagation channels: {unknown_channels}")
+        invalid_channels = [
+            channel
+            for channel, multiplier in multipliers.items()
+            if not math.isfinite(float(multiplier)) or float(multiplier) < 0.0
+        ]
+        if invalid_channels:
+            raise ValueError(
+                "multipliers must be finite non-negative values for channels: "
+                f"{invalid_channels}",
+            )
+        return multipliers
+
+    @model_validator(mode="after")
+    def _enabled_channels_require_multipliers(self) -> Self:
+        missing_channel_multipliers = [
+            channel
+            for channel in self.enabled_channels
+            if channel not in self.channel_multipliers
+        ]
+        if missing_channel_multipliers:
+            raise ValueError(
+                "channel_multipliers must include every enabled channel: "
+                f"{missing_channel_multipliers}",
+            )
+
+        missing_regime_multipliers = [
+            channel
+            for channel in self.enabled_channels
+            if channel not in self.regime_multipliers
+        ]
+        if missing_regime_multipliers:
+            raise ValueError(
+                "regime_multipliers must include every enabled channel: "
+                f"{missing_regime_multipliers}",
+            )
+        return self
 
 
 class GraphQueryResult(BaseModel):

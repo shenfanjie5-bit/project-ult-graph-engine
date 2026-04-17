@@ -8,12 +8,11 @@ from typing import Any, Iterator, Literal
 import pytest
 from pydantic import ValidationError
 
-from graph_engine.models import GraphQueryResult, Neo4jGraphStatus, ReadonlySimulationRequest
+from graph_engine.models import GraphQueryResult, Neo4jGraphStatus
 from graph_engine.query import (
     MAX_QUERY_DEPTH,
     query_propagation_paths,
     query_subgraph,
-    simulate_readonly_impact,
 )
 from graph_engine.status import GraphStatusManager
 from tests.fakes import InMemoryStatusStore
@@ -352,36 +351,6 @@ def test_query_apis_do_not_call_execute_write() -> None:
         status_manager=_status_manager(),
     )
 
-    assert client.write_calls == []
-
-
-def test_simulate_readonly_impact_keeps_existing_readonly_adapter() -> None:
-    client = FakeQueryClient()
-
-    result = simulate_readonly_impact(
-        ["entity-a"],
-        ReadonlySimulationRequest(
-            cycle_id="cycle-1",
-            world_state_ref="world-state-1",
-            graph_generation_id=1,
-            depth=1,
-            result_limit=1,
-        ),
-        client=client,  # type: ignore[arg-type]
-        status_manager=_status_manager(),
-    )
-
-    assert result["graph_generation_id"] == 1
-    assert result["subgraph"]["depth"] == 1
-    assert result["impacted_entities"] == [
-        {
-            "canonical_entity_id": "entity-a",
-            "is_seed": True,
-            "labels": ["Entity"],
-            "node_id": "node-a",
-            "score": 1.0,
-        }
-    ]
     assert client.write_calls == []
 
 

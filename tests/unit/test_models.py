@@ -18,6 +18,7 @@ from graph_engine.models import (
     PropagationContext,
     PropagationResult,
     PromotionPlan,
+    ReadonlySimulationRequest,
 )
 
 NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
@@ -106,6 +107,31 @@ def _model_payloads() -> list[tuple[type[BaseModel], dict[str, Any]]]:
                 "activated_paths": [{"path": ["node-1", "node-2"]}],
                 "impacted_entities": [{"entity_id": "entity-2", "score": 0.5}],
                 "channel_breakdown": {"fundamental": {"score": 0.5}},
+            },
+        ),
+        (
+            ReadonlySimulationRequest,
+            {
+                "cycle_id": "cycle-1",
+                "world_state_ref": "world-state-1",
+                "graph_generation_id": 1,
+                "depth": 2,
+                "enabled_channels": ["fundamental", "event", "reflexive"],
+                "channel_multipliers": {
+                    "fundamental": 1.0,
+                    "event": 1.0,
+                    "reflexive": 1.0,
+                },
+                "regime_multipliers": {
+                    "fundamental": 1.0,
+                    "event": 1.0,
+                    "reflexive": 1.0,
+                },
+                "decay_policy": {"default": 1.0},
+                "regime_context": {"risk_regime": "baseline"},
+                "result_limit": 100,
+                "max_iterations": 20,
+                "projection_name": "graph_engine_readonly_sim_cycle_1",
             },
         ),
         (
@@ -302,6 +328,38 @@ def test_propagation_context_requires_fundamental_channel() -> None:
             decay_policy={},
             regime_context={},
         )
+
+
+@pytest.mark.parametrize(
+    ("payload_update", "match"),
+    [
+        ({"depth": 7}, "less than or equal"),
+        ({"result_limit": 0}, "greater than or equal"),
+        ({"result_limit": 1001}, "less than or equal"),
+        ({"max_iterations": 0}, "greater than or equal"),
+        ({"enabled_channels": ["fundamental", "fundamental"]}, "duplicates"),
+        ({"enabled_channels": []}, "too_short"),
+        ({"channel_multipliers": {"unknown": 1.0}}, "unknown"),
+    ],
+)
+def test_readonly_simulation_request_validates_runtime_bounds(
+    payload_update: dict[str, Any],
+    match: str,
+) -> None:
+    payload = {
+        "cycle_id": "cycle-1",
+        "world_state_ref": "world-state-1",
+        "graph_generation_id": 1,
+        "enabled_channels": ["fundamental"],
+        "channel_multipliers": {"fundamental": 1.0},
+        "regime_multipliers": {"fundamental": 1.0},
+        "decay_policy": {},
+        "regime_context": {},
+    }
+    payload.update(payload_update)
+
+    with pytest.raises(ValidationError, match=match):
+        ReadonlySimulationRequest(**payload)
 
 
 def test_models_forbid_unexpected_fields() -> None:

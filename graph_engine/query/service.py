@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import Any, get_args
 
 from graph_engine.client import Neo4jClient
-from graph_engine.models import GraphQueryResult, PropagationChannel, ReadonlySimulationRequest
+from graph_engine.models import GraphQueryResult, PropagationChannel
 from graph_engine.propagation.channels import effective_channel_expression
 from graph_engine.status import GraphStatusManager
 
@@ -100,64 +100,6 @@ def query_propagation_paths(
     row = rows[0] if isinstance(rows, list) and rows else {}
     raw_paths = row.get("paths") if isinstance(row, dict) else None
     return _normalize_paths(raw_paths, channels=channel_filter, result_limit=validated_limit)
-
-
-def simulate_readonly_impact(
-    seed_entities: list[str],
-    context: ReadonlySimulationRequest,
-    *,
-    client: Neo4jClient,
-    status_manager: GraphStatusManager,
-) -> dict[str, Any]:
-    """Run the existing read-only local impact adapter without mutating Neo4j."""
-
-    seed_list = _validated_seed_entities(seed_entities)
-    validated_depth = _validated_depth(context.depth, max_depth=MAX_QUERY_DEPTH)
-    validated_limit = _validated_result_limit(context.result_limit)
-    if status_manager is None:
-        raise ValueError("simulate_readonly_impact requires status_manager")
-
-    with status_manager.ready_read() as ready_status:
-        if ready_status.graph_generation_id != context.graph_generation_id:
-            raise ValueError(
-                "ReadonlySimulationRequest graph_generation_id disagrees with Neo4jGraphStatus: "
-                f"context={context.graph_generation_id}, "
-                f"status={ready_status.graph_generation_id}",
-            )
-        nodes, edges = _read_subgraph(
-            seed_list,
-            validated_depth,
-            client=client,
-            result_limit=validated_limit,
-        )
-
-    subgraph = {
-        "seed_entities": seed_list,
-        "depth": validated_depth,
-        "nodes": nodes,
-        "relationships": edges,
-    }
-    impacted_entities = _impacted_entities_from_subgraph(
-        nodes,
-        set(seed_list),
-        result_limit=validated_limit,
-    )
-    return {
-        "cycle_id": context.cycle_id,
-        "world_state_ref": context.world_state_ref,
-        "graph_generation_id": context.graph_generation_id,
-        "seed_entities": seed_list,
-        "subgraph": subgraph,
-        "impacted_entities": impacted_entities,
-        "activated_paths": list(edges),
-        "channel_breakdown": {
-            "readonly": {
-                "depth": validated_depth,
-                "edge_count": len(edges),
-                "node_count": len(nodes),
-            },
-        },
-    }
 
 
 def _read_subgraph(
@@ -534,36 +476,6 @@ def _path_sort_key(path: Mapping[str, Any]) -> tuple[float, int, bool, str, str,
         _sort_text(path.get("relationship_type")),
         _sort_text(path.get("target_node_id")),
     )
-
-
-def _impacted_entities_from_subgraph(
-    nodes: list[dict[str, Any]],
-    seed_entities: set[str],
-    *,
-    result_limit: int,
-) -> list[dict[str, Any]]:
-    impacted_entities: list[dict[str, Any]] = []
-    for node in nodes:
-        node_id = node.get("node_id")
-        canonical_entity_id = node.get("canonical_entity_id")
-        is_seed = node_id in seed_entities or canonical_entity_id in seed_entities
-        impacted_entities.append(
-            {
-                "canonical_entity_id": canonical_entity_id,
-                "is_seed": is_seed,
-                "labels": _sorted_text_list(node.get("labels", [])),
-                "node_id": node_id,
-                "score": 1.0 if is_seed else 0.0,
-            }
-        )
-    impacted_entities.sort(
-        key=lambda entity: (
-            not bool(entity["is_seed"]),
-            _sort_text(entity.get("node_id")),
-            _sort_text(entity.get("canonical_entity_id")),
-        ),
-    )
-    return impacted_entities[:result_limit]
 
 
 def _sorted_text_list(value: Any) -> list[str]:
