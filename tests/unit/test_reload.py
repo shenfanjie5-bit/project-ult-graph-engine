@@ -595,7 +595,7 @@ def _edge_record() -> GraphEdgeRecord:
         source_node_id="node-1",
         target_node_id="node-2",
         relationship_type=RelationshipType.SUPPLY_CHAIN.value,
-        properties={"source": "filing"},
+        properties={"source": "filing", "evidence_refs": ["fact-edge-1"]},
         weight=0.7,
         created_at=NOW,
         updated_at=NOW,

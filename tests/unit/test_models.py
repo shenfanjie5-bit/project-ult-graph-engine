@@ -46,7 +46,7 @@ def _model_payloads() -> list[tuple[type[BaseModel], dict[str, Any]]]:
                 "source_node_id": "node-1",
                 "target_node_id": "node-2",
                 "relationship_type": "SUPPLY_CHAIN",
-                "properties": {"source": "filing"},
+                "properties": {"source": "filing", "evidence_refs": ["fact-1"]},
                 "weight": 0.7,
                 "created_at": NOW,
                 "updated_at": NOW,
@@ -282,12 +282,40 @@ def test_edge_weight_defaults_to_one() -> None:
         source_node_id="node-1",
         target_node_id="node-2",
         relationship_type="OWNERSHIP",
-        properties={},
+        properties={"evidence_ref": "fact-1"},
         created_at=NOW,
         updated_at=NOW,
     )
 
     assert edge.weight == 1.0
+    assert edge.properties["evidence_refs"] == ["fact-1"]
+
+
+def test_propagatable_edge_requires_evidence_refs() -> None:
+    with pytest.raises(ValidationError, match="evidence_ref"):
+        GraphEdgeRecord(
+            edge_id="edge-1",
+            source_node_id="node-1",
+            target_node_id="node-2",
+            relationship_type="SUPPLY_CHAIN",
+            properties={"source": "filing"},
+            created_at=NOW,
+            updated_at=NOW,
+        )
+
+
+def test_non_propagatable_edge_can_omit_evidence_refs() -> None:
+    edge = GraphEdgeRecord(
+        edge_id="edge-1",
+        source_node_id="node-1",
+        target_node_id="assertion-1",
+        relationship_type="ASSERTION_LINK",
+        properties={"role": "source"},
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+    assert edge.properties == {"role": "source"}
 
 
 def test_candidate_delta_rejects_invalid_validation_status() -> None:
