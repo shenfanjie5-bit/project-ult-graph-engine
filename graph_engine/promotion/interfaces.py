@@ -27,6 +27,13 @@ class EntityAnchorReader(Protocol):
         """Return the subset of entity ids that already exist as canonical anchors."""
 
 
+class GraphEndpointResolver(Protocol):
+    """Resolve graph endpoint node ids to their canonical entity anchors."""
+
+    def canonical_entity_ids_for_node_ids(self, node_ids: set[str]) -> dict[str, str]:
+        """Return canonical entity ids for existing graph endpoint node ids."""
+
+
 class CanonicalWriter(Protocol):
     """Persist promoted records into Layer A canonical storage."""
 

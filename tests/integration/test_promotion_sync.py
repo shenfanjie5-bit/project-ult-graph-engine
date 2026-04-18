@@ -51,6 +51,18 @@ class StaticEntityReader:
         return entity_ids & self.entity_ids
 
 
+class StaticGraphEndpointResolver:
+    def __init__(self, entity_ids_by_node_id: dict[str, str]) -> None:
+        self.entity_ids_by_node_id = entity_ids_by_node_id
+
+    def canonical_entity_ids_for_node_ids(self, node_ids: set[str]) -> dict[str, str]:
+        return {
+            node_id: entity_id
+            for node_id, entity_id in self.entity_ids_by_node_id.items()
+            if node_id in node_ids
+        }
+
+
 class CapturingCanonicalWriter:
     def __init__(self) -> None:
         self.plans: list[PromotionPlan] = []
@@ -97,7 +109,13 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
                     "selection-1",
                     candidate_reader=StaticCandidateReader(deltas),
                     entity_reader=StaticEntityReader(
-                        {source_node_id, target_node_id},
+                        {f"{source_node_id}-entity", f"{target_node_id}-entity"},
+                    ),
+                    endpoint_resolver=StaticGraphEndpointResolver(
+                        {
+                            source_node_id: f"{source_node_id}-entity",
+                            target_node_id: f"{target_node_id}-entity",
+                        },
                     ),
                     canonical_writer=writer,
                     client=client,

@@ -15,7 +15,7 @@ from graph_engine.models import (
     GraphNodeRecord,
     PromotionPlan,
 )
-from graph_engine.promotion.interfaces import EntityAnchorReader
+from graph_engine.promotion.interfaces import EntityAnchorReader, GraphEndpointResolver
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 
 _FORBIDDEN_PAYLOAD_FIELDS = {
@@ -50,6 +50,7 @@ _CONTRACT_RELATIONSHIP_TYPES = {
 def adapt_candidate_graph_delta(
     delta: CandidateGraphDelta,
     cycle_id: str,
+    endpoint_entity_ids: Mapping[str, str],
 ) -> FrozenGraphDelta:
     """Translate a contracts-defined delta into the internal promotion record."""
 
@@ -62,7 +63,7 @@ def adapt_candidate_graph_delta(
         delta_id=delta.delta_id,
         cycle_id=cycle_id,
         delta_type=promotion_delta_type,
-        source_entity_ids=_contract_endpoint_entity_ids(delta),
+        source_entity_ids=_contract_endpoint_entity_ids(delta, endpoint_entity_ids),
         payload={
             "edge": {
                 "edge_id": _contract_edge_id(delta, relationship_type),
@@ -77,6 +78,46 @@ def adapt_candidate_graph_delta(
         },
         validation_status="frozen",
     )
+
+
+def resolve_contract_endpoint_entity_ids(
+    deltas: Sequence[CandidateGraphDelta],
+    endpoint_resolver: GraphEndpointResolver,
+) -> dict[str, str]:
+    """Map contract graph endpoint node ids to canonical entity anchors."""
+
+    node_ids = {
+        node_id
+        for delta in deltas
+        for node_id in _contract_endpoint_node_ids(delta)
+    }
+    if not node_ids:
+        return {}
+
+    endpoint_entity_ids = endpoint_resolver.canonical_entity_ids_for_node_ids(node_ids)
+    missing_node_ids = sorted(node_ids - set(endpoint_entity_ids))
+    if missing_node_ids:
+        raise ValueError(
+            "missing graph endpoint nodes: " + ", ".join(missing_node_ids),
+        )
+
+    resolved_endpoint_entity_ids: dict[str, str] = {}
+    invalid_anchor_node_ids: list[str] = []
+    for node_id in node_ids:
+        entity_id = endpoint_entity_ids[node_id]
+        if not isinstance(entity_id, str) or not entity_id.strip():
+            invalid_anchor_node_ids.append(node_id)
+            continue
+        resolved_endpoint_entity_ids[node_id] = entity_id.strip()
+
+    invalid_anchor_node_ids.sort()
+    if invalid_anchor_node_ids:
+        raise ValueError(
+            "graph endpoint nodes missing canonical entity anchors: "
+            + ", ".join(invalid_anchor_node_ids),
+        )
+
+    return resolved_endpoint_entity_ids
 
 
 def validate_entity_anchors(
@@ -124,10 +165,24 @@ def _contract_edge_id(delta: CandidateGraphDelta, relationship_type: str) -> str
     return "|".join((delta.source_node, relationship_type, delta.target_node))
 
 
-def _contract_endpoint_entity_ids(delta: CandidateGraphDelta) -> list[str]:
+def _contract_endpoint_node_ids(delta: CandidateGraphDelta) -> list[str]:
     if delta.source_node == delta.target_node:
         return [delta.source_node]
     return [delta.source_node, delta.target_node]
+
+
+def _contract_endpoint_entity_ids(
+    delta: CandidateGraphDelta,
+    endpoint_entity_ids: Mapping[str, str],
+) -> list[str]:
+    entity_ids: list[str] = []
+    for node_id in _contract_endpoint_node_ids(delta):
+        entity_id = endpoint_entity_ids.get(node_id)
+        if entity_id is None:
+            raise ValueError(f"missing graph endpoint nodes: {node_id}")
+        if entity_id not in entity_ids:
+            entity_ids.append(entity_id)
+    return entity_ids
 
 
 def _contract_edge_properties(delta: CandidateGraphDelta) -> dict[str, Any]:

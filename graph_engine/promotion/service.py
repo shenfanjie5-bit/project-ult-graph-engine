@@ -8,10 +8,12 @@ from graph_engine.promotion.interfaces import (
     CandidateDeltaReader,
     CanonicalWriter,
     EntityAnchorReader,
+    GraphEndpointResolver,
 )
 from graph_engine.promotion.planner import (
     adapt_candidate_graph_delta,
     build_promotion_plan,
+    resolve_contract_endpoint_entity_ids,
     validate_entity_anchors,
 )
 from graph_engine.status import GraphStatusManager
@@ -24,6 +26,7 @@ def promote_graph_deltas(
     *,
     candidate_reader: CandidateDeltaReader,
     entity_reader: EntityAnchorReader,
+    endpoint_resolver: GraphEndpointResolver,
     canonical_writer: CanonicalWriter,
     client: Neo4jClient | None = None,
     status_manager: GraphStatusManager | None = None,
@@ -37,8 +40,12 @@ def promote_graph_deltas(
         raise ValueError("status_manager is required when sync_to_live_graph is True")
 
     candidate_deltas = candidate_reader.read_candidate_graph_deltas(cycle_id, selection_ref)
+    endpoint_entity_ids = resolve_contract_endpoint_entity_ids(
+        candidate_deltas,
+        endpoint_resolver,
+    )
     deltas = [
-        adapt_candidate_graph_delta(delta, cycle_id)
+        adapt_candidate_graph_delta(delta, cycle_id, endpoint_entity_ids)
         for delta in candidate_deltas
     ]
     validate_entity_anchors(deltas, entity_reader)
