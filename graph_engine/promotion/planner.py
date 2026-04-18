@@ -1,4 +1,4 @@
-"""Build canonical graph promotion plans from frozen candidate deltas."""
+"""Build canonical graph promotion plans from internal promotion deltas."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from contracts.schemas import CandidateGraphDelta
+
 from graph_engine.models import (
-    CandidateGraphDelta,
     FrozenGraphDelta,
     GraphAssertionRecord,
     GraphEdgeRecord,
@@ -28,6 +29,25 @@ _VALID_NODE_LABELS = {label.value for label in NodeLabel}
 _VALID_RELATIONSHIP_TYPES = {relationship.value for relationship in RelationshipType}
 _STABLE_CONTRACT_EDGE_TIMESTAMP_BASE = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _STABLE_CONTRACT_EDGE_TIMESTAMP_SPAN_SECONDS = 10 * 365 * 24 * 60 * 60
+
+
+def freeze_contract_delta(
+    cycle_id: str,
+    contract_delta: CandidateGraphDelta,
+) -> FrozenGraphDelta:
+    """Adapt a contract graph delta into the internal promotion planner record."""
+
+    return FrozenGraphDelta(
+        delta_id=contract_delta.delta_id,
+        cycle_id=cycle_id,
+        delta_type="edge_add",
+        source_entity_ids=[
+            contract_delta.source_node,
+            contract_delta.target_node,
+        ],
+        payload=contract_delta.model_dump(),
+        validation_status="frozen",
+    )
 
 
 def validate_entity_anchors(

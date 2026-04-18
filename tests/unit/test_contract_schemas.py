@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from typing import get_args, get_origin, get_type_hints
+
 import contracts.schemas as contract_schemas
 
 import graph_engine
 from graph_engine import models
+from graph_engine.promotion import CandidateDeltaReader
 
 
 def test_public_graph_contracts_are_reexported_from_contracts() -> None:
@@ -60,6 +63,14 @@ def test_public_graph_contract_field_sets_are_pinned() -> None:
         "impact_score",
         "evidence_refs",
     }
+
+
+def test_candidate_delta_reader_exposes_contract_delta_shape() -> None:
+    hints = get_type_hints(CandidateDeltaReader.read_candidate_graph_deltas)
+    return_type = hints["return"]
+
+    assert get_origin(return_type) is list
+    assert get_args(return_type) == (contract_schemas.CandidateGraphDelta,)
 
 
 def test_internal_metric_and_frozen_delta_models_are_not_public_contracts() -> None:
