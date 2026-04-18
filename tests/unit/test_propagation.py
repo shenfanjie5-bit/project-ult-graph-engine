@@ -288,6 +288,7 @@ def test_run_fundamental_propagation_uses_gds_projection_and_explains_paths() ->
     ]
     assert result.impacted_entities[0]["pagerank_score"] == pytest.approx(0.2)
     assert result.activated_paths[0]["edge_id"] == "edge-1"
+    assert result.activated_paths[0]["evidence_refs"] == ["fact-edge-1"]
     assert result.activated_paths[0]["score"] == pytest.approx(0.5)
     assert result.activated_paths[0]["explanation"] == {
         "relation_weight": 0.5,
@@ -598,6 +599,7 @@ def _path_row(
     propagation_channel: str | None = None,
     channel: str | None = None,
     impact_channel: str | None = None,
+    evidence_refs: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "source_node_id": "node-a",
@@ -614,6 +616,7 @@ def _path_row(
         "propagation_channel": propagation_channel,
         "channel": channel,
         "impact_channel": impact_channel,
+        "evidence_refs": [f"fact-{edge_id}"] if evidence_refs is None else evidence_refs,
     }
 
 

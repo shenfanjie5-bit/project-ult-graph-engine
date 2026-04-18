@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
+from graph_engine.models import GraphMetricsSnapshot, Neo4jGraphStatus
 from graph_engine.status.store import StatusStore
 
 _SYNC_WRITER_LOCK_TOKEN = "incremental-sync"
@@ -221,7 +221,7 @@ class GraphStatusManager:
         self._commit_transition(current, status)
         return status
 
-    def mark_verified(self, snapshot: GraphSnapshot) -> Neo4jGraphStatus:
+    def mark_verified(self, snapshot: GraphMetricsSnapshot) -> Neo4jGraphStatus:
         """Refresh ready metrics from a canonical snapshot without bumping generation."""
 
         current = self.require_ready()

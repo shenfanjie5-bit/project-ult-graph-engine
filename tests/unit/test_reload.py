@@ -11,8 +11,8 @@ from graph_engine.client import Neo4jClient
 from graph_engine.models import (
     ColdReloadPlan,
     GraphEdgeRecord,
+    GraphMetricsSnapshot as GraphSnapshot,
     GraphNodeRecord,
-    GraphSnapshot,
     Neo4jGraphStatus,
     PromotionPlan,
 )

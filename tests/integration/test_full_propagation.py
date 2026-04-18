@@ -9,6 +9,7 @@ import pytest
 
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
+from graph_engine.live_metrics import read_live_graph_metrics
 from graph_engine.models import (
     GraphEdgeRecord,
     GraphImpactSnapshot,
@@ -19,7 +20,7 @@ from graph_engine.models import (
 )
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import SchemaManager
-from graph_engine.snapshots import build_graph_snapshot, compute_graph_snapshots
+from graph_engine.snapshots import compute_graph_snapshots
 from graph_engine.status import GraphStatusManager
 from graph_engine.sync import sync_live_graph
 from tests.fakes import InMemoryStatusStore
@@ -73,6 +74,9 @@ def test_compute_graph_snapshots_generates_three_channel_impact_snapshot() -> No
     supply_edge_id = f"{prefix}-supply-edge"
     event_edge_id = f"{prefix}-event-edge"
     reflexive_edge_id = f"{prefix}-reflexive-edge"
+    supply_evidence_ref = f"{prefix}-supply-fact"
+    event_evidence_ref = f"{prefix}-event-fact"
+    reflexive_evidence_ref = f"{prefix}-reflexive-fact"
     node_ids = [
         source_node_id,
         fundamental_target_id,
@@ -99,24 +103,20 @@ def test_compute_graph_snapshots_generates_three_channel_impact_snapshot() -> No
                     supply_edge_id=supply_edge_id,
                     event_edge_id=event_edge_id,
                     reflexive_edge_id=reflexive_edge_id,
+                    supply_evidence_ref=supply_evidence_ref,
+                    event_evidence_ref=event_evidence_ref,
+                    reflexive_evidence_ref=reflexive_evidence_ref,
                 ),
                 client,
             )
-            live_snapshot = build_graph_snapshot(
-                "cycle-1",
-                1,
-                client,
-                status_manager=GraphStatusManager(
-                    InMemoryStatusStore(_status_for_generation(1)),
-                ),
-            )
+            node_count, edge_count, key_label_counts, checksum = read_live_graph_metrics(client)
             graph_status = Neo4jGraphStatus(
                 graph_status="ready",
-                graph_generation_id=live_snapshot.graph_generation_id,
-                node_count=live_snapshot.node_count,
-                edge_count=live_snapshot.edge_count,
-                key_label_counts=live_snapshot.key_label_counts,
-                checksum=live_snapshot.checksum,
+                graph_generation_id=1,
+                node_count=node_count,
+                edge_count=edge_count,
+                key_label_counts=key_label_counts,
+                checksum=checksum,
                 last_verified_at=NOW,
                 last_reload_at=None,
             )
@@ -143,35 +143,11 @@ def test_compute_graph_snapshots_generates_three_channel_impact_snapshot() -> No
                 {"node_ids": node_ids},
             )
 
-    path_channels_by_edge = {
-        (path["edge_id"], path["channel"])
-        for path in impact_snapshot.activated_paths
-    }
-    channels_by_edge_id: dict[str, set[str]] = {}
-    for path in impact_snapshot.activated_paths:
-        channels_by_edge_id.setdefault(str(path["edge_id"]), set()).add(str(path["channel"]))
-
-    assert (supply_edge_id, "fundamental") in path_channels_by_edge
-    assert (event_edge_id, "event") in path_channels_by_edge
-    assert (reflexive_edge_id, "reflexive") in path_channels_by_edge
-    assert channels_by_edge_id[reflexive_edge_id] == {"reflexive"}
-    duplicated_edges = {
-        edge_id: channels
-        for edge_id, channels in channels_by_edge_id.items()
-        if len(channels) > 1
-    }
-    assert duplicated_edges == {}
-    assert set(impact_snapshot.channel_breakdown) == {
-        "fundamental",
-        "event",
-        "reflexive",
-        "merged",
-    }
-    assert impact_snapshot.channel_breakdown["merged"]["enabled_channels"] == [
-        "event",
-        "fundamental",
-        "reflexive",
-    ]
+    assert {supply_evidence_ref, event_evidence_ref, reflexive_evidence_ref} <= set(
+        impact_snapshot.evidence_refs
+    )
+    assert impact_snapshot.affected_entities
+    assert impact_snapshot.direction == "bullish"
     assert graph_snapshot.node_count >= 4
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
@@ -185,6 +161,9 @@ def _promotion_plan(
     supply_edge_id: str,
     event_edge_id: str,
     reflexive_edge_id: str,
+    supply_evidence_ref: str,
+    event_evidence_ref: str,
+    reflexive_evidence_ref: str,
 ) -> PromotionPlan:
     return PromotionPlan(
         cycle_id="cycle-1",
@@ -203,6 +182,7 @@ def _promotion_plan(
                 supply_edge_id,
                 RelationshipType.SUPPLY_CHAIN.value,
                 weight=2.0,
+                evidence_ref=supply_evidence_ref,
             ),
             _edge_record(
                 source_node_id,
@@ -210,6 +190,7 @@ def _promotion_plan(
                 event_edge_id,
                 RelationshipType.EVENT_IMPACT.value,
                 weight=3.0,
+                evidence_ref=event_evidence_ref,
             ),
             _edge_record(
                 source_node_id,
@@ -217,24 +198,12 @@ def _promotion_plan(
                 reflexive_edge_id,
                 RelationshipType.OWNERSHIP.value,
                 weight=4.0,
+                evidence_ref=reflexive_evidence_ref,
                 extra_properties={"propagation_channel": "reflexive"},
             ),
         ],
         assertion_records=[],
         created_at=NOW,
-    )
-
-
-def _status_for_generation(graph_generation_id: int) -> Neo4jGraphStatus:
-    return Neo4jGraphStatus(
-        graph_status="ready",
-        graph_generation_id=graph_generation_id,
-        node_count=0,
-        edge_count=0,
-        key_label_counts={},
-        checksum="pending",
-        last_verified_at=NOW,
-        last_reload_at=None,
     )
 
 
@@ -256,11 +225,13 @@ def _edge_record(
     relationship_type: str,
     *,
     weight: float,
+    evidence_ref: str,
     extra_properties: dict[str, Any] | None = None,
 ) -> GraphEdgeRecord:
     properties = {
         "integration_prefix": edge_id,
         "evidence_confidence": 1.0,
+        "evidence_refs": [evidence_ref],
         "recency_decay": 1.0,
     }
     properties.update(extra_properties or {})

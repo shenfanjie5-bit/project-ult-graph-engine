@@ -6,7 +6,31 @@ import math
 from datetime import datetime
 from typing import Any, Literal, Self, get_args
 
+from contracts.schemas import (
+    CandidateGraphDelta,
+    GraphImpactSnapshot,
+    GraphSnapshot,
+)
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+__all__ = [
+    "CandidateGraphDelta",
+    "ColdReloadPlan",
+    "FrozenGraphDelta",
+    "GraphAssertionRecord",
+    "GraphEdgeRecord",
+    "GraphImpactSnapshot",
+    "GraphMetricsSnapshot",
+    "GraphNodeRecord",
+    "GraphQueryResult",
+    "GraphSnapshot",
+    "Neo4jGraphStatus",
+    "PropagationChannel",
+    "PropagationContext",
+    "PropagationResult",
+    "PromotionPlan",
+    "ReadonlySimulationRequest",
+]
 
 PropagationChannel = Literal["fundamental", "event", "reflexive"]
 _ALLOWED_PROPAGATION_CHANNELS: frozenset[str] = frozenset(get_args(PropagationChannel))
@@ -54,8 +78,8 @@ class GraphAssertionRecord(BaseModel):
     created_at: datetime
 
 
-class CandidateGraphDelta(BaseModel):
-    """Validated or frozen candidate change waiting for graph promotion."""
+class FrozenGraphDelta(BaseModel):
+    """Internal frozen candidate change waiting for graph promotion."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -222,8 +246,8 @@ class GraphQueryResult(BaseModel):
     truncation: dict[str, Any] = Field(default_factory=dict)
 
 
-class GraphSnapshot(BaseModel):
-    """Structural snapshot of the promoted graph for a cycle."""
+class GraphMetricsSnapshot(BaseModel):
+    """Internal structural metrics used for status and consistency checks."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -244,25 +268,12 @@ class ColdReloadPlan(BaseModel):
 
     snapshot_ref: str = Field(min_length=1)
     cycle_id: str = Field(min_length=1)
-    expected_snapshot: GraphSnapshot
+    expected_snapshot: GraphMetricsSnapshot
     node_records: list[GraphNodeRecord]
     edge_records: list[GraphEdgeRecord]
     assertion_records: list[GraphAssertionRecord]
     projection_name: str = Field(min_length=1)
     created_at: datetime
-
-
-class GraphImpactSnapshot(BaseModel):
-    """Propagation impact snapshot emitted for downstream read-only consumers."""
-
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    cycle_id: str = Field(min_length=1)
-    impact_snapshot_id: str = Field(min_length=1)
-    regime_context_ref: str = Field(min_length=1)
-    activated_paths: list[dict[str, Any]]
-    impacted_entities: list[dict[str, Any]]
-    channel_breakdown: dict[str, Any]
 
 
 class Neo4jGraphStatus(BaseModel):

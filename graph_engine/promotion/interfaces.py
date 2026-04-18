@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from graph_engine.models import CandidateGraphDelta, PromotionPlan
+from graph_engine.models import FrozenGraphDelta, PromotionPlan
 
 
 class CandidateDeltaReader(Protocol):
@@ -14,7 +14,7 @@ class CandidateDeltaReader(Protocol):
         self,
         cycle_id: str,
         selection_ref: str,
-    ) -> list[CandidateGraphDelta]:
+    ) -> list[FrozenGraphDelta]:
         """Return candidate graph deltas selected for promotion."""
 
 

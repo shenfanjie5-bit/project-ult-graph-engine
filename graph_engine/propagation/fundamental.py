@@ -215,6 +215,10 @@ RETURN source.node_id AS source_node_id,
        labels(target) AS target_labels,
        relationship.edge_id AS edge_id,
        type(relationship) AS relationship_type,
+       relationship.evidence_refs AS evidence_refs,
+       relationship.evidence_ref AS evidence_ref,
+       source.canonical_id_rule_version AS source_canonical_id_rule_version,
+       target.canonical_id_rule_version AS target_canonical_id_rule_version,
        relation_weight,
        evidence_confidence,
        recency_decay,
@@ -275,6 +279,9 @@ def _activated_path(
         "target_labels": _string_list(row.get("target_labels")),
         "edge_id": row.get("edge_id"),
         "relationship_type": row.get("relationship_type"),
+        "evidence_refs": _evidence_refs_from_row(row),
+        "source_canonical_id_rule_version": row.get("source_canonical_id_rule_version"),
+        "target_canonical_id_rule_version": row.get("target_canonical_id_rule_version"),
         "score": explanation["score"],
         "explanation": explanation,
     }
@@ -353,3 +360,18 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return sorted(str(item) for item in value)
+
+
+def _evidence_refs_from_row(row: dict[str, Any]) -> list[str]:
+    refs: set[str] = set()
+    refs.update(_evidence_refs_from_value(row.get("evidence_refs")))
+    refs.update(_evidence_refs_from_value(row.get("evidence_ref")))
+    return sorted(refs)
+
+
+def _evidence_refs_from_value(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return sorted(str(item) for item in value if str(item))
+    return [str(value)] if str(value) else []

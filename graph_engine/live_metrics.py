@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from graph_engine.client import Neo4jClient
@@ -46,12 +47,35 @@ RETURN node_count, edge_count, label_counts, nodes, relationships
 """
 
 
+@dataclass(frozen=True)
+class LiveGraphMetrics:
+    """Validated live graph metrics and structural payloads."""
+
+    node_count: int
+    edge_count: int
+    key_label_counts: dict[str, int]
+    checksum: str
+    nodes: list[dict[str, Any]]
+    relationships: list[dict[str, Any]]
+
+
 def read_live_graph_metrics(
     client: Neo4jClient,
     *,
     strict: bool = True,
 ) -> tuple[int, int, dict[str, int], str]:
     """Read node/edge counts, label counts, and structural checksum."""
+
+    metrics = read_live_graph_metric_payload(client, strict=strict)
+    return metrics.node_count, metrics.edge_count, metrics.key_label_counts, metrics.checksum
+
+
+def read_live_graph_metric_payload(
+    client: Neo4jClient,
+    *,
+    strict: bool = True,
+) -> LiveGraphMetrics:
+    """Read live graph metrics with the normalized structural payload."""
 
     rows = client.execute_read(LIVE_GRAPH_METRICS_QUERY)
     if strict:
@@ -77,7 +101,14 @@ def read_live_graph_metrics(
         "nodes": sorted_payload_list(nodes),
         "relationships": sorted_payload_list(relationships),
     }
-    return node_count, edge_count, key_label_counts, checksum_payload(payload)
+    return LiveGraphMetrics(
+        node_count=node_count,
+        edge_count=edge_count,
+        key_label_counts=key_label_counts,
+        checksum=checksum_payload(payload),
+        nodes=[dict(node) for node in nodes],
+        relationships=[dict(relationship) for relationship in relationships],
+    )
 
 
 def sorted_payload_list(values: list[Any]) -> list[Any]:
