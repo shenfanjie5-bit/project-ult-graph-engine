@@ -1,14 +1,15 @@
-"""Build canonical graph promotion plans from frozen candidate deltas."""
+"""Build canonical graph promotion plans from internal promotion deltas."""
 
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
+
+from contracts.schemas import CandidateGraphDelta
 
 from graph_engine.models import (
-    CandidateGraphDelta,
     FrozenGraphDelta,
     GraphAssertionRecord,
     GraphEdgeRecord,
@@ -28,6 +29,103 @@ _VALID_NODE_LABELS = {label.value for label in NodeLabel}
 _VALID_RELATIONSHIP_TYPES = {relationship.value for relationship in RelationshipType}
 _STABLE_CONTRACT_EDGE_TIMESTAMP_BASE = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _STABLE_CONTRACT_EDGE_TIMESTAMP_SPAN_SECONDS = 10 * 365 * 24 * 60 * 60
+_InternalContractDeltaType = Literal["edge_add"]
+_CONTRACT_DELTA_TYPE_TO_INTERNAL: Mapping[str, _InternalContractDeltaType] = {
+    "upsert_edge": "edge_add",
+}
+
+
+def freeze_contract_delta(
+    cycle_id: str,
+    contract_delta: CandidateGraphDelta,
+    *,
+    node_entity_ids: Mapping[str, str],
+) -> FrozenGraphDelta:
+    """Adapt a contract graph delta into the internal promotion planner record."""
+
+    delta_type = _internal_delta_type_for_contract_delta(contract_delta)
+    source_entity_ids = _resolved_endpoint_entity_ids(contract_delta, node_entity_ids)
+    return FrozenGraphDelta(
+        delta_id=contract_delta.delta_id,
+        cycle_id=cycle_id,
+        delta_type=delta_type,
+        source_entity_ids=source_entity_ids,
+        payload=contract_delta.model_dump(),
+        validation_status="frozen",
+    )
+
+
+def freeze_contract_deltas(
+    cycle_id: str,
+    contract_deltas: Sequence[CandidateGraphDelta],
+    entity_reader: EntityAnchorReader,
+) -> list[FrozenGraphDelta]:
+    """Adapt contract graph deltas after resolving endpoint nodes to entity anchors."""
+
+    endpoint_node_ids = _supported_contract_endpoint_node_ids(contract_deltas)
+    node_entity_ids = (
+        entity_reader.canonical_entity_ids_for_node_ids(endpoint_node_ids)
+        if endpoint_node_ids
+        else {}
+    )
+    _validate_endpoint_entity_resolution(endpoint_node_ids, node_entity_ids)
+    return [
+        freeze_contract_delta(
+            cycle_id,
+            contract_delta,
+            node_entity_ids=node_entity_ids,
+        )
+        for contract_delta in contract_deltas
+    ]
+
+
+def _internal_delta_type_for_contract_delta(
+    contract_delta: CandidateGraphDelta,
+) -> _InternalContractDeltaType:
+    delta_type = _CONTRACT_DELTA_TYPE_TO_INTERNAL.get(contract_delta.delta_type)
+    if delta_type is None:
+        raise ValueError(
+            "unsupported contract delta_type "
+            f"{contract_delta.delta_type!r} for delta {contract_delta.delta_id}",
+        )
+    return delta_type
+
+
+def _supported_contract_endpoint_node_ids(
+    contract_deltas: Sequence[CandidateGraphDelta],
+) -> set[str]:
+    node_ids: set[str] = set()
+    for contract_delta in contract_deltas:
+        _internal_delta_type_for_contract_delta(contract_delta)
+        node_ids.add(contract_delta.source_node)
+        node_ids.add(contract_delta.target_node)
+    return node_ids
+
+
+def _validate_endpoint_entity_resolution(
+    endpoint_node_ids: set[str],
+    node_entity_ids: Mapping[str, str],
+) -> None:
+    missing_node_ids = sorted(
+        node_id
+        for node_id in endpoint_node_ids
+        if not node_entity_ids.get(node_id)
+    )
+    if missing_node_ids:
+        raise ValueError(
+            "missing canonical entity ids for graph nodes: "
+            + ", ".join(missing_node_ids),
+        )
+
+
+def _resolved_endpoint_entity_ids(
+    contract_delta: CandidateGraphDelta,
+    node_entity_ids: Mapping[str, str],
+) -> list[str]:
+    return [
+        node_entity_ids[contract_delta.source_node],
+        node_entity_ids[contract_delta.target_node],
+    ]
 
 
 def validate_entity_anchors(
