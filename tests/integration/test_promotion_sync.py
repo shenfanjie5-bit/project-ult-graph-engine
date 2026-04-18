@@ -97,7 +97,7 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
                     "selection-1",
                     candidate_reader=StaticCandidateReader(deltas),
                     entity_reader=StaticEntityReader(
-                        {source_node_id},
+                        {source_node_id, target_node_id},
                     ),
                     canonical_writer=writer,
                     client=client,

@@ -62,7 +62,7 @@ def adapt_candidate_graph_delta(
         delta_id=delta.delta_id,
         cycle_id=cycle_id,
         delta_type=promotion_delta_type,
-        source_entity_ids=_contract_source_entity_ids(delta),
+        source_entity_ids=_contract_endpoint_entity_ids(delta),
         payload={
             "edge": {
                 "edge_id": _contract_edge_id(delta, relationship_type),
@@ -83,7 +83,7 @@ def validate_entity_anchors(
     deltas: Sequence[FrozenGraphDelta],
     entity_reader: EntityAnchorReader,
 ) -> None:
-    """Fail if any source entity ids referenced by deltas are missing."""
+    """Fail if any entity anchors referenced by deltas are missing."""
 
     entity_ids = {
         entity_id
@@ -124,8 +124,10 @@ def _contract_edge_id(delta: CandidateGraphDelta, relationship_type: str) -> str
     return "|".join((delta.source_node, relationship_type, delta.target_node))
 
 
-def _contract_source_entity_ids(delta: CandidateGraphDelta) -> list[str]:
-    return [delta.source_node]
+def _contract_endpoint_entity_ids(delta: CandidateGraphDelta) -> list[str]:
+    if delta.source_node == delta.target_node:
+        return [delta.source_node]
+    return [delta.source_node, delta.target_node]
 
 
 def _contract_edge_properties(delta: CandidateGraphDelta) -> dict[str, Any]:
