@@ -9,6 +9,7 @@ import pytest
 
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
+from graph_engine.live_metrics import read_live_graph_metrics
 from graph_engine.models import (
     GraphEdgeRecord,
     GraphImpactSnapshot,
@@ -19,7 +20,7 @@ from graph_engine.models import (
 )
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import SchemaManager
-from graph_engine.snapshots import build_graph_snapshot, compute_graph_snapshots
+from graph_engine.snapshots import compute_graph_snapshots
 from graph_engine.status import GraphStatusManager
 from graph_engine.sync import sync_live_graph
 from tests.fakes import InMemoryStatusStore
@@ -102,21 +103,14 @@ def test_compute_graph_snapshots_generates_three_channel_impact_snapshot() -> No
                 ),
                 client,
             )
-            live_snapshot = build_graph_snapshot(
-                "cycle-1",
-                1,
-                client,
-                status_manager=GraphStatusManager(
-                    InMemoryStatusStore(_status_for_generation(1)),
-                ),
-            )
+            node_count, edge_count, key_label_counts, checksum = read_live_graph_metrics(client)
             graph_status = Neo4jGraphStatus(
                 graph_status="ready",
-                graph_generation_id=live_snapshot.graph_generation_id,
-                node_count=live_snapshot.node_count,
-                edge_count=live_snapshot.edge_count,
-                key_label_counts=live_snapshot.key_label_counts,
-                checksum=live_snapshot.checksum,
+                graph_generation_id=1,
+                node_count=node_count,
+                edge_count=edge_count,
+                key_label_counts=key_label_counts,
+                checksum=checksum,
                 last_verified_at=NOW,
                 last_reload_at=None,
             )
@@ -143,35 +137,11 @@ def test_compute_graph_snapshots_generates_three_channel_impact_snapshot() -> No
                 {"node_ids": node_ids},
             )
 
-    path_channels_by_edge = {
-        (path["edge_id"], path["channel"])
-        for path in impact_snapshot.activated_paths
-    }
-    channels_by_edge_id: dict[str, set[str]] = {}
-    for path in impact_snapshot.activated_paths:
-        channels_by_edge_id.setdefault(str(path["edge_id"]), set()).add(str(path["channel"]))
-
-    assert (supply_edge_id, "fundamental") in path_channels_by_edge
-    assert (event_edge_id, "event") in path_channels_by_edge
-    assert (reflexive_edge_id, "reflexive") in path_channels_by_edge
-    assert channels_by_edge_id[reflexive_edge_id] == {"reflexive"}
-    duplicated_edges = {
-        edge_id: channels
-        for edge_id, channels in channels_by_edge_id.items()
-        if len(channels) > 1
-    }
-    assert duplicated_edges == {}
-    assert set(impact_snapshot.channel_breakdown) == {
-        "fundamental",
-        "event",
-        "reflexive",
-        "merged",
-    }
-    assert impact_snapshot.channel_breakdown["merged"]["enabled_channels"] == [
-        "event",
-        "fundamental",
-        "reflexive",
-    ]
+    assert {supply_edge_id, event_edge_id, reflexive_edge_id} <= set(
+        impact_snapshot.evidence_refs
+    )
+    assert impact_snapshot.affected_entities
+    assert impact_snapshot.direction == "bullish"
     assert graph_snapshot.node_count >= 4
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
@@ -222,19 +192,6 @@ def _promotion_plan(
         ],
         assertion_records=[],
         created_at=NOW,
-    )
-
-
-def _status_for_generation(graph_generation_id: int) -> Neo4jGraphStatus:
-    return Neo4jGraphStatus(
-        graph_status="ready",
-        graph_generation_id=graph_generation_id,
-        node_count=0,
-        edge_count=0,
-        key_label_counts={},
-        checksum="pending",
-        last_verified_at=NOW,
-        last_reload_at=None,
     )
 
 

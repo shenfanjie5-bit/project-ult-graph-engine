@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import graph_engine.snapshots.generator as snapshot_generator
+from graph_engine.live_metrics import LiveGraphMetrics
 from graph_engine.models import (
     GraphImpactSnapshot,
     GraphSnapshot,
@@ -172,9 +173,11 @@ def test_build_graph_snapshot_reads_metrics_and_stable_checksum() -> None:
 
     assert first.node_count == 2
     assert first.edge_count == 1
-    assert first.key_label_counts == {"Entity": 2, "Sector": 1}
-    assert first.checksum == second.checksum
-    assert first.snapshot_id == second.snapshot_id
+    assert [node.node_id for node in first.nodes] == ["node-b", "node-a"]
+    assert first.nodes[0].entity is not None
+    assert first.nodes[0].entity.entity_id == "entity-b"
+    assert first.edges[0].relation_type == "SUPPLY_CHAIN"
+    assert first.graph_snapshot_id == second.graph_snapshot_id
     assert len(client.read_calls) == 2
 
     client.relationships[0] = {
@@ -187,7 +190,7 @@ def test_build_graph_snapshot_reads_metrics_and_stable_checksum() -> None:
         client,
         status_manager=status_manager,
     )
-    assert changed.checksum != first.checksum
+    assert changed.graph_snapshot_id != first.graph_snapshot_id
     assert len(client.read_calls) == 3
 
 
@@ -223,7 +226,7 @@ def test_build_graph_snapshot_blocks_active_writer_lock_before_reading() -> None
     client.execute_read.assert_not_called()
 
 
-def test_build_graph_impact_snapshot_preserves_propagation_payload() -> None:
+def test_build_graph_impact_snapshot_returns_contract_payload() -> None:
     propagation_result = _propagation_result()
 
     impact_snapshot = build_graph_impact_snapshot(
@@ -232,15 +235,12 @@ def test_build_graph_impact_snapshot_preserves_propagation_payload() -> None:
         propagation_result,
     )
 
-    assert impact_snapshot.regime_context_ref == "world-state-1"
-    assert impact_snapshot.activated_paths == propagation_result.activated_paths
-    assert impact_snapshot.impacted_entities == propagation_result.impacted_entities
-    assert impact_snapshot.channel_breakdown == {
-        "fundamental": {"path_count": 1},
-        "event": {},
-        "reflexive": {},
-        "merged": {},
-    }
+    assert impact_snapshot.version == "0.1.0"
+    assert [entity.entity_id for entity in impact_snapshot.target_entities] == ["node-2"]
+    assert [entity.entity_id for entity in impact_snapshot.affected_entities] == ["node-2"]
+    assert impact_snapshot.direction == "bullish"
+    assert impact_snapshot.impact_score == pytest.approx(0.4)
+    assert impact_snapshot.evidence_refs == ["edge-1"]
 
 
 def test_build_graph_impact_snapshot_id_tracks_full_propagation_payload() -> None:
@@ -405,12 +405,10 @@ def test_compute_graph_snapshots_uses_status_manager_and_derives_generation(
     )
 
     assert status_store.calls == 3
-    assert graph_snapshot.graph_generation_id == 7
+    assert graph_snapshot.graph_snapshot_id.startswith("graph-snapshot-cycle-1-7-")
     assert graph_snapshot.node_count == 2
     assert graph_snapshot.edge_count == 1
-    assert graph_snapshot.key_label_counts == {"Entity": 2}
-    assert graph_snapshot.checksum == "abc123"
-    assert impact_snapshot.regime_context_ref == "world-state-1"
+    assert impact_snapshot.cycle_id == "cycle-1"
     assert events == [
         "metrics",
         "context:7",
@@ -513,7 +511,6 @@ def test_compute_graph_snapshots_writes_once_after_both_snapshots(
     assert result == (graph_snapshot, impact_snapshot)
     assert graph_snapshot.node_count == 2
     assert graph_snapshot.edge_count == 1
-    assert graph_snapshot.checksum == "abc123"
     assert events == [
         "metrics",
         "context",
@@ -738,7 +735,38 @@ def _patch_metrics(
         calls += 1
         return metrics[index]
 
+    def read_metric_payload(client: Any) -> LiveGraphMetrics:
+        node_count, edge_count, key_label_counts, checksum = read_metrics(client)
+        nodes = [
+            {
+                "labels": ["Entity"],
+                "node_id": f"node-{index}",
+                "canonical_entity_id": f"entity-{index}",
+                "properties": {"node_id": f"node-{index}"},
+            }
+            for index in range(1, node_count + 1)
+        ]
+        relationships = [
+            {
+                "source_node_id": "node-1",
+                "target_node_id": "node-2",
+                "relationship_type": "SUPPLY_CHAIN",
+                "edge_id": f"edge-{index}",
+                "properties": {"edge_id": f"edge-{index}"},
+            }
+            for index in range(1, edge_count + 1)
+        ]
+        return LiveGraphMetrics(
+            node_count=node_count,
+            edge_count=edge_count,
+            key_label_counts=key_label_counts,
+            checksum=checksum,
+            nodes=nodes,
+            relationships=relationships,
+        )
+
     monkeypatch.setattr(snapshot_generator, "_read_graph_metrics", read_metrics)
+    monkeypatch.setattr(snapshot_generator, "_read_graph_metric_payload", read_metric_payload)
 
 
 def _status_manager(
@@ -791,11 +819,14 @@ def _propagation_result(graph_generation_id: int = 1) -> PropagationResult:
         activated_paths=[
             {
                 "source_node_id": "node-1",
+                "source_labels": ["Entity"],
                 "target_node_id": "node-2",
+                "target_labels": ["Entity"],
+                "edge_id": "edge-1",
                 "score": 0.7,
             }
         ],
-        impacted_entities=[{"node_id": "node-2", "score": 0.4}],
+        impacted_entities=[{"node_id": "node-2", "labels": ["Entity"], "score": 0.4}],
         channel_breakdown={"fundamental": {"path_count": 1}},
     )
 
@@ -804,8 +835,18 @@ def _impact_snapshot() -> GraphImpactSnapshot:
     return GraphImpactSnapshot(
         cycle_id="cycle-1",
         impact_snapshot_id="impact-1",
-        regime_context_ref="world-state-1",
-        activated_paths=[],
-        impacted_entities=[],
-        channel_breakdown={"fundamental": {}},
+        version="0.1.0",
+        created_at=NOW,
+        target_entities=[
+            {
+                "entity_id": "node-2",
+                "entity_type": "entity",
+                "canonical_id_rule_version": "0.1.0",
+            }
+        ],
+        affected_entities=[],
+        affected_sectors=[],
+        direction="neutral",
+        impact_score=0.0,
+        evidence_refs=["edge-1"],
     )

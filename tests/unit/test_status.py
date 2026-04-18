@@ -11,7 +11,9 @@ import pytest
 
 import graph_engine
 import graph_engine.status as status_module
-from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
+from graph_engine.models import GraphMetricsSnapshot as GraphSnapshot
+from graph_engine.models import GraphSnapshot as ContractGraphSnapshot
+from graph_engine.models import Neo4jGraphStatus
 from graph_engine.status import (
     GraphStatusManager,
     check_live_graph_consistency,
@@ -553,6 +555,60 @@ def test_check_live_graph_consistency_returns_true_for_matching_snapshot() -> No
 
     assert result is True
     assert store.writes == []
+
+
+def test_check_live_graph_consistency_accepts_contract_snapshot() -> None:
+    client = FakeLiveGraphClient(_metrics_rows())
+    metric_snapshot = _snapshot_from_live_client(client, graph_generation_id=3)
+    contract_snapshot = ContractGraphSnapshot(
+        graph_snapshot_id="graph-snapshot-1",
+        cycle_id="cycle-1",
+        version="0.1.0",
+        created_at=SNAPSHOT_CREATED_AT,
+        node_count=2,
+        edge_count=1,
+        nodes=[
+            {
+                "node_id": "node-a",
+                "labels": ["Entity"],
+                "properties": {"node_id": "node-a", "ticker": "AAA"},
+                "entity": {
+                    "entity_id": "entity-a",
+                    "entity_type": "entity",
+                    "canonical_id_rule_version": "0.1.0",
+                },
+            },
+            {
+                "node_id": "node-b",
+                "labels": ["Entity"],
+                "properties": {"node_id": "node-b", "ticker": "BBB"},
+                "entity": {
+                    "entity_id": "entity-b",
+                    "entity_type": "entity",
+                    "canonical_id_rule_version": "0.1.0",
+                },
+            },
+        ],
+        edges=[
+            {
+                "edge_id": "edge-1",
+                "source_node": "node-a",
+                "target_node": "node-b",
+                "relation_type": "SUPPLY_CHAIN",
+                "properties": {"edge_id": "edge-1", "weight": 0.7},
+            }
+        ],
+    )
+    store = InMemoryStatusStore(_status_from_snapshot(metric_snapshot))
+
+    result = check_live_graph_consistency(
+        "snapshot-1",
+        client=client,  # type: ignore[arg-type]
+        snapshot_reader=StaticSnapshotReader(contract_snapshot),
+        status_manager=GraphStatusManager(store, clock=lambda: NOW),
+    )
+
+    assert result is True
 
 
 def test_check_live_graph_consistency_requires_status_manager_by_default() -> None:

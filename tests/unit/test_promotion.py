@@ -9,7 +9,7 @@ import pytest
 
 import graph_engine.promotion.service as service_module
 from graph_engine.client import Neo4jClient
-from graph_engine.models import CandidateGraphDelta, Neo4jGraphStatus, PromotionPlan
+from graph_engine.models import FrozenGraphDelta, Neo4jGraphStatus, PromotionPlan
 from graph_engine.promotion import build_promotion_plan, promote_graph_deltas
 from graph_engine.promotion.planner import validate_entity_anchors
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
@@ -20,7 +20,7 @@ NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 
 
 class FakeCandidateReader:
-    def __init__(self, deltas: list[CandidateGraphDelta]) -> None:
+    def __init__(self, deltas: list[FrozenGraphDelta]) -> None:
         self.deltas = deltas
         self.calls: list[tuple[str, str]] = []
 
@@ -28,7 +28,7 @@ class FakeCandidateReader:
         self,
         cycle_id: str,
         selection_ref: str,
-    ) -> list[CandidateGraphDelta]:
+    ) -> list[FrozenGraphDelta]:
         self.calls.append((cycle_id, selection_ref))
         return self.deltas
 
@@ -179,7 +179,7 @@ def test_build_promotion_plan_parses_frozen_deltas_in_stable_order() -> None:
     ],
 )
 def test_build_promotion_plan_rejects_invalid_delta_contracts(
-    delta_factory: Callable[[], CandidateGraphDelta],
+    delta_factory: Callable[[], FrozenGraphDelta],
     match: str,
 ) -> None:
     with pytest.raises(ValueError, match=match):
@@ -449,8 +449,8 @@ def _delta(
     *,
     cycle_id: str = "cycle-1",
     validation_status: str = "frozen",
-) -> CandidateGraphDelta:
-    return CandidateGraphDelta(
+) -> FrozenGraphDelta:
+    return FrozenGraphDelta(
         delta_id=delta_id,
         cycle_id=cycle_id,
         delta_type=delta_type,

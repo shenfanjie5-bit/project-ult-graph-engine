@@ -9,9 +9,11 @@ from pydantic import BaseModel, ValidationError
 from graph_engine.models import (
     CandidateGraphDelta,
     ColdReloadPlan,
+    FrozenGraphDelta,
     GraphAssertionRecord,
     GraphEdgeRecord,
     GraphImpactSnapshot,
+    GraphMetricsSnapshot,
     GraphNodeRecord,
     GraphSnapshot,
     Neo4jGraphStatus,
@@ -66,6 +68,19 @@ def _model_payloads() -> list[tuple[type[BaseModel], dict[str, Any]]]:
             CandidateGraphDelta,
             {
                 "delta_id": "delta-1",
+                "delta_type": "upsert_edge",
+                "source_node": "node-1",
+                "target_node": "node-2",
+                "relation_type": "SUPPLY_CHAIN",
+                "properties": {"weight": 1.0},
+                "evidence": ["fact-1"],
+                "subsystem_id": "subsystem-news",
+            },
+        ),
+        (
+            FrozenGraphDelta,
+            {
+                "delta_id": "delta-1",
                 "cycle_id": "cycle-1",
                 "delta_type": "node_add",
                 "source_entity_ids": ["entity-1"],
@@ -75,6 +90,29 @@ def _model_payloads() -> list[tuple[type[BaseModel], dict[str, Any]]]:
         ),
         (
             GraphSnapshot,
+            {
+                "cycle_id": "cycle-1",
+                "graph_snapshot_id": "snapshot-1",
+                "version": "0.1.0",
+                "node_count": 2,
+                "edge_count": 1,
+                "nodes": [
+                    {"node_id": "node-1", "labels": ["Entity"]},
+                    {"node_id": "node-2", "labels": ["Entity"]},
+                ],
+                "edges": [
+                    {
+                        "edge_id": "edge-1",
+                        "source_node": "node-1",
+                        "target_node": "node-2",
+                        "relation_type": "SUPPLY_CHAIN",
+                    }
+                ],
+                "created_at": NOW,
+            },
+        ),
+        (
+            GraphMetricsSnapshot,
             {
                 "cycle_id": "cycle-1",
                 "snapshot_id": "snapshot-1",
@@ -139,10 +177,26 @@ def _model_payloads() -> list[tuple[type[BaseModel], dict[str, Any]]]:
             {
                 "cycle_id": "cycle-1",
                 "impact_snapshot_id": "impact-1",
-                "regime_context_ref": "world-state-1",
-                "activated_paths": [{"path": ["node-1", "node-2"]}],
-                "impacted_entities": [{"entity_id": "entity-2", "score": 0.5}],
-                "channel_breakdown": {"fundamental": {"score": 0.5}},
+                "version": "0.1.0",
+                "created_at": NOW,
+                "target_entities": [
+                    {
+                        "entity_id": "entity-1",
+                        "entity_type": "equity",
+                        "canonical_id_rule_version": "0.1.0",
+                    }
+                ],
+                "affected_entities": [
+                    {
+                        "entity_id": "entity-2",
+                        "entity_type": "equity",
+                        "canonical_id_rule_version": "0.1.0",
+                    }
+                ],
+                "affected_sectors": ["technology"],
+                "direction": "bullish",
+                "impact_score": 0.5,
+                "evidence_refs": ["fact-1"],
             },
         ),
         (
@@ -238,7 +292,7 @@ def test_edge_weight_defaults_to_one() -> None:
 
 def test_candidate_delta_rejects_invalid_validation_status() -> None:
     with pytest.raises(ValidationError):
-        CandidateGraphDelta(
+        FrozenGraphDelta(
             delta_id="delta-1",
             cycle_id="cycle-1",
             delta_type="node_add",
@@ -250,7 +304,7 @@ def test_candidate_delta_rejects_invalid_validation_status() -> None:
 
 def test_candidate_delta_rejects_invalid_delta_type() -> None:
     with pytest.raises(ValidationError):
-        CandidateGraphDelta(
+        FrozenGraphDelta(
             delta_id="delta-1",
             cycle_id="cycle-1",
             delta_type="node_delete",
@@ -306,12 +360,12 @@ def test_graph_snapshot_rejects_negative_counts() -> None:
     with pytest.raises(ValidationError):
         GraphSnapshot(
             cycle_id="cycle-1",
-            snapshot_id="snapshot-1",
-            graph_generation_id=1,
+            graph_snapshot_id="snapshot-1",
+            version="0.1.0",
             node_count=-1,
             edge_count=0,
-            key_label_counts={},
-            checksum="abc123",
+            nodes=[],
+            edges=[],
             created_at=NOW,
         )
 

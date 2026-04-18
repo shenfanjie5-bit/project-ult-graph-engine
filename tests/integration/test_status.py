@@ -8,6 +8,7 @@ import pytest
 
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
+from graph_engine.live_metrics import read_live_graph_metrics
 from graph_engine.models import GraphSnapshot, Neo4jGraphStatus
 from graph_engine.schema.manager import SchemaManager
 from graph_engine.snapshots import build_graph_snapshot
@@ -84,8 +85,17 @@ CREATE (source)-[:SUPPLY_CHAIN {
                     InMemoryStatusStore(_status_for_generation(11)),
                 ),
             )
+            node_count, edge_count, key_label_counts, checksum = read_live_graph_metrics(client)
             status_manager = GraphStatusManager(
-                InMemoryStatusStore(_status_from_snapshot(snapshot)),
+                InMemoryStatusStore(
+                    _status_from_metrics(
+                        graph_generation_id=11,
+                        node_count=node_count,
+                        edge_count=edge_count,
+                        key_label_counts=key_label_counts,
+                        checksum=checksum,
+                    )
+                ),
                 clock=lambda: NOW,
             )
             snapshot_reader = StaticSnapshotReader(snapshot)
@@ -121,14 +131,21 @@ CREATE (source)-[:SUPPLY_CHAIN {
             )
 
 
-def _status_from_snapshot(snapshot: GraphSnapshot) -> Neo4jGraphStatus:
+def _status_from_metrics(
+    *,
+    graph_generation_id: int,
+    node_count: int,
+    edge_count: int,
+    key_label_counts: dict[str, int],
+    checksum: str,
+) -> Neo4jGraphStatus:
     return Neo4jGraphStatus(
         graph_status="ready",
-        graph_generation_id=snapshot.graph_generation_id,
-        node_count=snapshot.node_count,
-        edge_count=snapshot.edge_count,
-        key_label_counts=snapshot.key_label_counts,
-        checksum=snapshot.checksum,
+        graph_generation_id=graph_generation_id,
+        node_count=node_count,
+        edge_count=edge_count,
+        key_label_counts=key_label_counts,
+        checksum=checksum,
         last_verified_at=NOW,
         last_reload_at=None,
     )

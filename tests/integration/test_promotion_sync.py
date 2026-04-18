@@ -10,7 +10,7 @@ import pytest
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
 from graph_engine.models import (
-    CandidateGraphDelta,
+    FrozenGraphDelta,
     GraphEdgeRecord,
     GraphNodeRecord,
     Neo4jGraphStatus,
@@ -32,14 +32,14 @@ NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 
 
 class StaticCandidateReader:
-    def __init__(self, deltas: list[CandidateGraphDelta]) -> None:
+    def __init__(self, deltas: list[FrozenGraphDelta]) -> None:
         self.deltas = deltas
 
     def read_candidate_graph_deltas(
         self,
         cycle_id: str,
         selection_ref: str,
-    ) -> list[CandidateGraphDelta]:
+    ) -> list[FrozenGraphDelta]:
         return self.deltas
 
 
@@ -356,8 +356,8 @@ def _node_delta(
     delta_id: str,
     node_id: str,
     canonical_entity_id: str,
-) -> CandidateGraphDelta:
-    return CandidateGraphDelta(
+) -> FrozenGraphDelta:
+    return FrozenGraphDelta(
         delta_id=delta_id,
         cycle_id="cycle-1",
         delta_type="node_add",
@@ -382,8 +382,8 @@ def _edge_delta(
     source_node_id: str,
     target_node_id: str,
     source_entity_ids: list[str],
-) -> CandidateGraphDelta:
-    return CandidateGraphDelta(
+) -> FrozenGraphDelta:
+    return FrozenGraphDelta(
         delta_id=delta_id,
         cycle_id="cycle-1",
         delta_type="edge_add",
@@ -410,8 +410,8 @@ def _assertion_delta(
     source_node_id: str,
     target_node_id: str,
     source_entity_ids: list[str],
-) -> CandidateGraphDelta:
-    return CandidateGraphDelta(
+) -> FrozenGraphDelta:
+    return FrozenGraphDelta(
         delta_id=delta_id,
         cycle_id="cycle-1",
         delta_type="assertion_add",

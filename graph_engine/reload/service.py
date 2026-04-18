@@ -9,7 +9,7 @@ from time import monotonic
 from typing import TypeVar
 
 from graph_engine.client import Neo4jClient
-from graph_engine.models import ColdReloadPlan, GraphSnapshot, Neo4jGraphStatus, PromotionPlan
+from graph_engine.models import ColdReloadPlan, GraphMetricsSnapshot, Neo4jGraphStatus, PromotionPlan
 from graph_engine.reload.interfaces import CanonicalReader
 from graph_engine.reload.projection import rebuild_gds_projection
 from graph_engine.schema.manager import DROP_ALL_CONFIRMATION_TOKEN, SchemaManager
@@ -144,10 +144,10 @@ def build_reload_promotion_plan(
 
 
 class _ExpectedSnapshotReader:
-    def __init__(self, snapshot: GraphSnapshot) -> None:
+    def __init__(self, snapshot: GraphMetricsSnapshot) -> None:
         self._snapshot = snapshot
 
-    def read_graph_snapshot(self, snapshot_ref: str) -> GraphSnapshot:
+    def read_graph_snapshot(self, snapshot_ref: str) -> GraphMetricsSnapshot:
         return self._snapshot
 
 

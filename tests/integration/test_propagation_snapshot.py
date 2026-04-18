@@ -9,6 +9,7 @@ import pytest
 
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
+from graph_engine.live_metrics import read_live_graph_metrics
 from graph_engine.models import (
     GraphEdgeRecord,
     GraphImpactSnapshot,
@@ -19,7 +20,7 @@ from graph_engine.models import (
 )
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import SchemaManager
-from graph_engine.snapshots import build_graph_snapshot, compute_graph_snapshots
+from graph_engine.snapshots import compute_graph_snapshots
 from graph_engine.status import GraphStatusManager
 from graph_engine.sync import sync_live_graph
 from tests.fakes import InMemoryStatusStore
@@ -74,21 +75,14 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
 
         try:
             sync_live_graph(_promotion_plan(source_node_id, target_node_id, edge_id), client)
-            live_snapshot = build_graph_snapshot(
-                "cycle-1",
-                1,
-                client,
-                status_manager=GraphStatusManager(
-                    InMemoryStatusStore(_status_for_generation(1)),
-                ),
-            )
+            node_count, edge_count, key_label_counts, checksum = read_live_graph_metrics(client)
             graph_status = Neo4jGraphStatus(
                 graph_status="ready",
-                graph_generation_id=live_snapshot.graph_generation_id,
-                node_count=live_snapshot.node_count,
-                edge_count=live_snapshot.edge_count,
-                key_label_counts=live_snapshot.key_label_counts,
-                checksum=live_snapshot.checksum,
+                graph_generation_id=1,
+                node_count=node_count,
+                edge_count=edge_count,
+                key_label_counts=key_label_counts,
+                checksum=checksum,
                 last_verified_at=NOW,
                 last_reload_at=None,
             )
@@ -117,9 +111,8 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
 
     assert graph_snapshot.node_count >= 2
     assert graph_snapshot.edge_count >= 1
-    assert impact_snapshot.regime_context_ref == "world-state-1"
-    assert impact_snapshot.impacted_entities
-    assert any(path["edge_id"] == edge_id for path in impact_snapshot.activated_paths)
+    assert impact_snapshot.affected_entities
+    assert edge_id in impact_snapshot.evidence_refs
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
 
@@ -139,19 +132,6 @@ def _promotion_plan(
         edge_records=[_edge_record(source_node_id, target_node_id, edge_id)],
         assertion_records=[],
         created_at=NOW,
-    )
-
-
-def _status_for_generation(graph_generation_id: int) -> Neo4jGraphStatus:
-    return Neo4jGraphStatus(
-        graph_status="ready",
-        graph_generation_id=graph_generation_id,
-        node_count=0,
-        edge_count=0,
-        key_label_counts={},
-        checksum="pending",
-        last_verified_at=NOW,
-        last_reload_at=None,
     )
 
 

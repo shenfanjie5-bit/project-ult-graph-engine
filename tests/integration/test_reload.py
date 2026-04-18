@@ -8,18 +8,18 @@ import pytest
 
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
+from graph_engine.live_metrics import read_live_graph_metrics
 from graph_engine.models import (
     ColdReloadPlan,
     GraphEdgeRecord,
+    GraphMetricsSnapshot,
     GraphNodeRecord,
-    GraphSnapshot,
     Neo4jGraphStatus,
     PromotionPlan,
 )
 from graph_engine.reload import cold_reload
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
 from graph_engine.schema.manager import DROP_ALL_CONFIRMATION_TOKEN, SchemaManager
-from graph_engine.snapshots import build_graph_snapshot
 from graph_engine.status import GraphStatusManager, check_live_graph_consistency
 from graph_engine.sync import sync_live_graph
 from tests.fakes import InMemoryStatusStore
@@ -41,10 +41,10 @@ class StaticCanonicalReader:
 
 
 class StaticSnapshotReader:
-    def __init__(self, snapshot: GraphSnapshot) -> None:
+    def __init__(self, snapshot: GraphMetricsSnapshot) -> None:
         self.snapshot = snapshot
 
-    def read_graph_snapshot(self, snapshot_ref: str) -> GraphSnapshot:
+    def read_graph_snapshot(self, snapshot_ref: str) -> GraphMetricsSnapshot:
         return self.snapshot
 
 
@@ -74,14 +74,7 @@ def test_cold_reload_rebuilds_live_graph_and_gds_projection() -> None:
 
         try:
             sync_live_graph(promotion_plan, client)
-            expected_snapshot = build_graph_snapshot(
-                "cycle-reload",
-                7,
-                client,
-                status_manager=GraphStatusManager(
-                    InMemoryStatusStore(_status(graph_generation_id=7)),
-                ),
-            )
+            expected_snapshot = _snapshot_from_live_graph(client, graph_generation_id=7)
             plan = ColdReloadPlan(
                 snapshot_ref="snapshot-ref-reload",
                 cycle_id="cycle-reload",
@@ -164,6 +157,24 @@ def _promotion_plan(
         ],
         edge_records=[_edge_record(source_node_id, target_node_id, edge_id)],
         assertion_records=[],
+        created_at=NOW,
+    )
+
+
+def _snapshot_from_live_graph(
+    client: Neo4jClient,
+    *,
+    graph_generation_id: int,
+) -> GraphMetricsSnapshot:
+    node_count, edge_count, key_label_counts, checksum = read_live_graph_metrics(client)
+    return GraphMetricsSnapshot(
+        cycle_id="cycle-reload",
+        snapshot_id=f"graph-snapshot-cycle-reload-{graph_generation_id}-{checksum[:12]}",
+        graph_generation_id=graph_generation_id,
+        node_count=node_count,
+        edge_count=edge_count,
+        key_label_counts=key_label_counts,
+        checksum=checksum,
         created_at=NOW,
     )
 

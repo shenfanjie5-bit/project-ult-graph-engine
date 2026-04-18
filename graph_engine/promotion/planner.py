@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from graph_engine.models import (
-    CandidateGraphDelta,
+    FrozenGraphDelta,
     GraphAssertionRecord,
     GraphEdgeRecord,
     GraphNodeRecord,
@@ -27,7 +27,7 @@ _VALID_RELATIONSHIP_TYPES = {relationship.value for relationship in Relationship
 
 
 def validate_entity_anchors(
-    deltas: Sequence[CandidateGraphDelta],
+    deltas: Sequence[FrozenGraphDelta],
     entity_reader: EntityAnchorReader,
 ) -> None:
     """Fail if any source entity ids referenced by deltas are missing."""
@@ -48,7 +48,7 @@ def validate_entity_anchors(
 def build_promotion_plan(
     cycle_id: str,
     selection_ref: str,
-    deltas: Sequence[CandidateGraphDelta],
+    deltas: Sequence[FrozenGraphDelta],
 ) -> PromotionPlan:
     """Parse frozen candidate deltas into a stable promotion plan."""
 
@@ -79,7 +79,7 @@ def build_promotion_plan(
     )
 
 
-def _validate_delta_header(delta: CandidateGraphDelta, cycle_id: str) -> None:
+def _validate_delta_header(delta: FrozenGraphDelta, cycle_id: str) -> None:
     if delta.cycle_id != cycle_id:
         raise ValueError(
             f"delta {delta.delta_id} belongs to cycle {delta.cycle_id!r}, "
@@ -89,7 +89,7 @@ def _validate_delta_header(delta: CandidateGraphDelta, cycle_id: str) -> None:
         raise ValueError(f"delta {delta.delta_id} is not frozen")
 
 
-def _parse_node_record(delta: CandidateGraphDelta) -> GraphNodeRecord:
+def _parse_node_record(delta: FrozenGraphDelta) -> GraphNodeRecord:
     payload = _required_payload_section(delta, "node")
     node_record = GraphNodeRecord.model_validate(payload)
     if node_record.label not in _VALID_NODE_LABELS:
@@ -99,7 +99,7 @@ def _parse_node_record(delta: CandidateGraphDelta) -> GraphNodeRecord:
     return node_record
 
 
-def _parse_edge_record(delta: CandidateGraphDelta) -> GraphEdgeRecord:
+def _parse_edge_record(delta: FrozenGraphDelta) -> GraphEdgeRecord:
     payload = _required_payload_section(delta, "edge")
     edge_record = GraphEdgeRecord.model_validate(payload)
     if edge_record.relationship_type not in _VALID_RELATIONSHIP_TYPES:
@@ -111,14 +111,14 @@ def _parse_edge_record(delta: CandidateGraphDelta) -> GraphEdgeRecord:
     return edge_record
 
 
-def _parse_assertion_record(delta: CandidateGraphDelta) -> GraphAssertionRecord:
+def _parse_assertion_record(delta: FrozenGraphDelta) -> GraphAssertionRecord:
     return GraphAssertionRecord.model_validate(
         _required_payload_section(delta, "assertion"),
     )
 
 
 def _required_payload_section(
-    delta: CandidateGraphDelta,
+    delta: FrozenGraphDelta,
     key: str,
 ) -> Mapping[str, Any]:
     payload_section = delta.payload.get(key)

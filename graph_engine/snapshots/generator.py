@@ -6,9 +6,15 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from contracts.core import Direction, __version__ as CONTRACT_VERSION
+from contracts.schemas import EntityReference
+from contracts.schemas.graph import GraphEdge, GraphNode
+
 from graph_engine.client import Neo4jClient
 from graph_engine.live_metrics import (
+    LiveGraphMetrics,
     checksum_payload as _checksum_payload,
+    read_live_graph_metric_payload,
     read_live_graph_metrics,
 )
 from graph_engine.models import (
@@ -41,14 +47,11 @@ def build_graph_snapshot(
 
     with hold_ready_read(status_manager, "graph snapshot generation") as ready_status:
         _validate_generation_input(graph_generation_id, ready_status)
-        node_count, edge_count, key_label_counts, checksum = _read_graph_metrics(client)
+        metrics = _read_graph_metric_payload(client)
         return _graph_snapshot_from_metrics(
             cycle_id,
             graph_generation_id,
-            node_count=node_count,
-            edge_count=edge_count,
-            key_label_counts=key_label_counts,
-            checksum=checksum,
+            metrics=metrics,
         )
 
 
@@ -69,13 +72,29 @@ def build_graph_impact_snapshot(
         "channel_breakdown": channel_breakdown,
     }
     impact_hash = _checksum_payload(payload)
+    affected_entities = _entity_references_from_impacted_entities(
+        propagation_result.impacted_entities,
+    )
+    target_entities = affected_entities or _entity_references_from_paths(
+        propagation_result.activated_paths,
+    )
+    evidence_refs = _evidence_refs_from_paths(propagation_result.activated_paths)
+    if not target_entities:
+        raise ValueError("GraphImpactSnapshot requires at least one target entity")
+    if not evidence_refs:
+        raise ValueError("GraphImpactSnapshot requires at least one evidence reference")
+
     return GraphImpactSnapshot(
         cycle_id=cycle_id,
         impact_snapshot_id=f"graph-impact-{cycle_id}-{impact_hash[:12]}",
-        regime_context_ref=world_state_ref,
-        activated_paths=propagation_result.activated_paths,
-        impacted_entities=propagation_result.impacted_entities,
-        channel_breakdown=channel_breakdown,
+        version=CONTRACT_VERSION,
+        created_at=datetime.now(timezone.utc),
+        target_entities=target_entities,
+        affected_entities=affected_entities,
+        affected_sectors=_affected_sectors(propagation_result.impacted_entities),
+        direction=_impact_direction(propagation_result.impacted_entities),
+        impact_score=_impact_score(propagation_result.impacted_entities),
+        evidence_refs=evidence_refs,
     )
 
 
@@ -126,13 +145,6 @@ def compute_graph_snapshots(
             ready_status.graph_generation_id,
             client,
             status_manager=status_manager,
-        )
-        _validate_status_metrics(
-            ready_status,
-            node_count=graph_snapshot.node_count,
-            edge_count=graph_snapshot.edge_count,
-            key_label_counts=graph_snapshot.key_label_counts,
-            checksum=graph_snapshot.checksum,
         )
         impact_snapshot = build_graph_impact_snapshot(
             cycle_id,
@@ -277,22 +289,154 @@ def _graph_snapshot_from_metrics(
     cycle_id: str,
     graph_generation_id: int,
     *,
-    node_count: int,
-    edge_count: int,
-    key_label_counts: dict[str, int],
-    checksum: str,
+    metrics: LiveGraphMetrics,
 ) -> GraphSnapshot:
+    checksum = metrics.checksum
     return GraphSnapshot(
         cycle_id=cycle_id,
-        snapshot_id=f"graph-snapshot-{cycle_id}-{graph_generation_id}-{checksum[:12]}",
-        graph_generation_id=graph_generation_id,
-        node_count=node_count,
-        edge_count=edge_count,
-        key_label_counts=key_label_counts,
-        checksum=checksum,
+        graph_snapshot_id=f"graph-snapshot-{cycle_id}-{graph_generation_id}-{checksum[:12]}",
+        version=CONTRACT_VERSION,
+        node_count=metrics.node_count,
+        edge_count=metrics.edge_count,
+        nodes=[_contract_node(node) for node in metrics.nodes],
+        edges=[_contract_edge(relationship) for relationship in metrics.relationships],
         created_at=datetime.now(timezone.utc),
     )
 
 
 def _read_graph_metrics(client: Neo4jClient) -> tuple[int, int, dict[str, int], str]:
     return read_live_graph_metrics(client, strict=True)
+
+
+def _read_graph_metric_payload(client: Neo4jClient) -> LiveGraphMetrics:
+    return read_live_graph_metric_payload(client, strict=True)
+
+
+def _contract_node(node: dict[str, Any]) -> GraphNode:
+    labels = _string_values(node.get("labels")) or ["Entity"]
+    properties = _dict_value(node.get("properties"))
+    entity = _entity_reference(
+        entity_id=node.get("canonical_entity_id") or properties.get("canonical_entity_id"),
+        labels=labels,
+    )
+    return GraphNode(
+        node_id=str(node.get("node_id") or properties.get("node_id") or ""),
+        labels=labels,
+        properties=properties,
+        entity=entity,
+    )
+
+
+def _contract_edge(relationship: dict[str, Any]) -> GraphEdge:
+    properties = _dict_value(relationship.get("properties"))
+    return GraphEdge(
+        edge_id=str(relationship.get("edge_id") or properties.get("edge_id") or ""),
+        source_node=str(relationship.get("source_node_id") or ""),
+        target_node=str(relationship.get("target_node_id") or ""),
+        relation_type=str(relationship.get("relationship_type") or ""),
+        properties=properties,
+        evidence_refs=_evidence_refs_from_value(properties.get("evidence_refs")),
+    )
+
+
+def _entity_references_from_impacted_entities(
+    impacted_entities: list[dict[str, Any]],
+) -> list[EntityReference]:
+    references: list[EntityReference] = []
+    seen: set[str] = set()
+    for entity in impacted_entities:
+        reference = _entity_reference(
+            entity_id=entity.get("canonical_entity_id") or entity.get("node_id"),
+            labels=entity.get("labels"),
+        )
+        if reference is None or reference.entity_id in seen:
+            continue
+        references.append(reference)
+        seen.add(reference.entity_id)
+    return references
+
+
+def _entity_references_from_paths(activated_paths: list[dict[str, Any]]) -> list[EntityReference]:
+    references: list[EntityReference] = []
+    seen: set[str] = set()
+    for path in activated_paths:
+        for entity_id, labels in (
+            (path.get("source_entity_id") or path.get("source_node_id"), path.get("source_labels")),
+            (path.get("target_entity_id") or path.get("target_node_id"), path.get("target_labels")),
+        ):
+            reference = _entity_reference(entity_id=entity_id, labels=labels)
+            if reference is None or reference.entity_id in seen:
+                continue
+            references.append(reference)
+            seen.add(reference.entity_id)
+    return references
+
+
+def _entity_reference(entity_id: Any, labels: Any) -> EntityReference | None:
+    if entity_id is None or str(entity_id) == "":
+        return None
+    entity_type = (_string_values(labels) or ["unknown"])[0].lower()
+    return EntityReference(
+        entity_id=str(entity_id),
+        entity_type=entity_type,
+        canonical_id_rule_version=CONTRACT_VERSION,
+    )
+
+
+def _affected_sectors(impacted_entities: list[dict[str, Any]]) -> list[str]:
+    sectors = {
+        str(entity.get("node_id"))
+        for entity in impacted_entities
+        if "Sector" in _string_values(entity.get("labels")) and entity.get("node_id") is not None
+    }
+    return sorted(sectors)
+
+
+def _impact_direction(impacted_entities: list[dict[str, Any]]) -> Direction:
+    total_score = sum(_float_value(entity.get("score")) for entity in impacted_entities)
+    if total_score > 0:
+        return Direction.BULLISH
+    if total_score < 0:
+        return Direction.BEARISH
+    return Direction.NEUTRAL
+
+
+def _impact_score(impacted_entities: list[dict[str, Any]]) -> float:
+    total_score = sum(_float_value(entity.get("score")) for entity in impacted_entities)
+    return max(-1.0, min(1.0, total_score))
+
+
+def _evidence_refs_from_paths(activated_paths: list[dict[str, Any]]) -> list[str]:
+    refs: set[str] = set()
+    for path in activated_paths:
+        refs.update(_evidence_refs_from_value(path.get("evidence_refs")))
+        refs.update(_evidence_refs_from_value(path.get("evidence_ref")))
+        if path.get("edge_id") is not None:
+            refs.add(str(path["edge_id"]))
+    return sorted(refs)
+
+
+def _evidence_refs_from_value(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return sorted(str(item) for item in value if str(item))
+    return [str(value)] if str(value) else []
+
+
+def _dict_value(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _string_values(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        return sorted(str(item) for item in value if str(item))
+    if value is None:
+        return []
+    return [str(value)] if str(value) else []
+
+
+def _float_value(value: Any) -> float:
+    if value is None:
+        return 0.0
+    return float(value)
