@@ -55,9 +55,23 @@ class FakeLegacyCandidateReader:
 
 
 class FakeEntityReader:
-    def __init__(self, existing_ids: set[str]) -> None:
+    def __init__(
+        self,
+        existing_ids: set[str],
+        node_entity_ids: dict[str, str] | None = None,
+    ) -> None:
         self.existing_ids = existing_ids
+        self.node_entity_ids = node_entity_ids or {}
+        self.node_calls: list[set[str]] = []
         self.calls: list[set[str]] = []
+
+    def canonical_entity_ids_for_node_ids(self, node_ids: set[str]) -> dict[str, str]:
+        self.node_calls.append(node_ids)
+        return {
+            node_id: self.node_entity_ids[node_id]
+            for node_id in node_ids
+            if node_id in self.node_entity_ids
+        }
 
     def existing_entity_ids(self, entity_ids: set[str]) -> set[str]:
         self.calls.append(entity_ids)
@@ -277,7 +291,7 @@ def test_contract_delta_evidence_flows_through_promotion_to_impact_snapshot() ->
         subsystem_id="subsystem-news",
     )
     writer = FakeCanonicalWriter()
-    entity_reader = FakeEntityReader({"node-1", "node-2"})
+    entity_reader = _contract_entity_reader()
 
     plan = promote_graph_deltas(
         "cycle-1",
@@ -290,7 +304,8 @@ def test_contract_delta_evidence_flows_through_promotion_to_impact_snapshot() ->
 
     edge_record = plan.edge_records[0]
     assert writer.plans == [plan]
-    assert entity_reader.calls == [{"node-1", "node-2"}]
+    assert entity_reader.node_calls == [{"node-1", "node-2"}]
+    assert entity_reader.calls == [{"entity-1", "entity-2"}]
     assert edge_record.edge_id == contract_delta.delta_id
     assert edge_record.source_node_id == contract_delta.source_node
     assert edge_record.target_node_id == contract_delta.target_node
@@ -325,9 +340,65 @@ def test_contract_delta_evidence_flows_through_promotion_to_impact_snapshot() ->
     assert impact_snapshot.evidence_refs == ["fact-contract-1"]
 
 
+def test_promote_graph_deltas_validates_resolved_entities_not_endpoint_nodes() -> None:
+    contract_delta = _contract_delta(
+        "delta-1",
+        source_node="node-source",
+        target_node="node-target",
+    )
+    writer = FakeCanonicalWriter()
+    entity_reader = _contract_entity_reader(
+        existing_ids={"entity-source", "entity-target"},
+        node_entity_ids={
+            "node-source": "entity-source",
+            "node-target": "entity-target",
+        },
+    )
+
+    plan = promote_graph_deltas(
+        "cycle-1",
+        "selection-1",
+        candidate_reader=FakeCandidateReader([contract_delta]),
+        entity_reader=entity_reader,
+        canonical_writer=writer,
+        sync_to_live_graph=False,
+    )
+
+    assert entity_reader.node_calls == [{"node-source", "node-target"}]
+    assert entity_reader.calls == [{"entity-source", "entity-target"}]
+    assert writer.plans == [plan]
+    assert plan.edge_records[0].source_node_id == "node-source"
+    assert plan.edge_records[0].target_node_id == "node-target"
+
+
+def test_promote_graph_deltas_rejects_contract_delta_with_unresolved_endpoint_node() -> None:
+    writer = FakeCanonicalWriter()
+    entity_reader = _contract_entity_reader(
+        existing_ids={"entity-1"},
+        node_entity_ids={"node-1": "entity-1"},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="missing canonical entity ids for graph nodes: node-2",
+    ):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([_contract_delta("delta-1")]),
+            entity_reader=entity_reader,
+            canonical_writer=writer,
+            sync_to_live_graph=False,
+        )
+
+    assert entity_reader.node_calls == [{"node-1", "node-2"}]
+    assert entity_reader.calls == []
+    assert writer.plans == []
+
+
 def test_promote_graph_deltas_rejects_unsupported_contract_delta_type() -> None:
     writer = FakeCanonicalWriter()
-    entity_reader = FakeEntityReader({"node-1", "node-2"})
+    entity_reader = _contract_entity_reader()
 
     with pytest.raises(ValueError, match="unsupported contract delta_type 'delete_edge'"):
         promote_graph_deltas(
@@ -342,6 +413,7 @@ def test_promote_graph_deltas_rejects_unsupported_contract_delta_type() -> None:
         )
 
     assert entity_reader.calls == []
+    assert entity_reader.node_calls == []
     assert writer.plans == []
 
 
@@ -443,7 +515,7 @@ def test_promote_graph_deltas_writes_canonical_before_live_graph(
         "cycle-1",
         "selection-1",
         candidate_reader=FakeCandidateReader([_contract_delta("delta-1")]),
-        entity_reader=FakeEntityReader({"node-1", "node-2"}),
+        entity_reader=_contract_entity_reader(),
         canonical_writer=writer,
         client=mock_client,
         status_manager=_status_manager_from_store(store),
@@ -473,7 +545,7 @@ def test_promote_graph_deltas_does_not_sync_when_canonical_write_fails(
             "cycle-1",
             "selection-1",
             candidate_reader=FakeCandidateReader([_contract_delta("delta-1")]),
-            entity_reader=FakeEntityReader({"node-1", "node-2"}),
+            entity_reader=_contract_entity_reader(),
             canonical_writer=FakeCanonicalWriter(fail=True),
             client=MagicMock(spec=Neo4jClient),
             status_manager=_status_manager(),
@@ -491,7 +563,7 @@ def test_promote_graph_deltas_requires_status_manager_for_live_sync() -> None:
             "cycle-1",
             "selection-1",
             candidate_reader=reader,
-            entity_reader=FakeEntityReader({"node-1", "node-2"}),
+            entity_reader=_contract_entity_reader(),
             canonical_writer=writer,
             client=MagicMock(spec=Neo4jClient),
         )
@@ -512,7 +584,7 @@ def test_promote_graph_deltas_blocks_live_sync_when_graph_is_not_ready(
             "cycle-1",
             "selection-1",
             candidate_reader=FakeCandidateReader([_contract_delta("delta-1")]),
-            entity_reader=FakeEntityReader({"node-1", "node-2"}),
+            entity_reader=_contract_entity_reader(),
             canonical_writer=writer,
             client=MagicMock(spec=Neo4jClient),
             status_manager=_status_manager(graph_status="rebuilding"),
@@ -535,7 +607,7 @@ def test_promote_graph_deltas_rejects_stale_status_before_live_sync(
             "cycle-1",
             "selection-1",
             candidate_reader=FakeCandidateReader([_contract_delta("delta-1")]),
-            entity_reader=FakeEntityReader({"node-1", "node-2"}),
+            entity_reader=_contract_entity_reader(),
             canonical_writer=writer,
             client=MagicMock(spec=Neo4jClient),
             status_manager=status_manager,
@@ -557,7 +629,7 @@ def test_promote_graph_deltas_does_not_sync_if_rebuild_starts_after_barrier(
             "cycle-1",
             "selection-1",
             candidate_reader=FakeCandidateReader([_contract_delta("delta-1")]),
-            entity_reader=FakeEntityReader({"node-1", "node-2"}),
+            entity_reader=_contract_entity_reader(),
             canonical_writer=FakeCanonicalWriter(),
             client=MagicMock(spec=Neo4jClient),
             status_manager=_status_manager_from_store(store),
@@ -586,7 +658,7 @@ def test_promote_graph_deltas_detects_status_change_during_live_sync(
             "cycle-1",
             "selection-1",
             candidate_reader=FakeCandidateReader([_contract_delta("delta-1")]),
-            entity_reader=FakeEntityReader({"node-1", "node-2"}),
+            entity_reader=_contract_entity_reader(),
             canonical_writer=writer,
             client=MagicMock(spec=Neo4jClient),
             status_manager=_status_manager_from_store(store),
@@ -611,7 +683,7 @@ def test_promote_graph_deltas_marks_status_failed_when_live_sync_fails(
             "cycle-1",
             "selection-1",
             candidate_reader=FakeCandidateReader([_contract_delta("delta-1")]),
-            entity_reader=FakeEntityReader({"node-1", "node-2"}),
+            entity_reader=_contract_entity_reader(),
             canonical_writer=FakeCanonicalWriter(),
             client=MagicMock(spec=Neo4jClient),
             status_manager=_status_manager_from_store(store),
@@ -628,7 +700,7 @@ def test_promote_graph_deltas_can_skip_live_graph_sync() -> None:
         "cycle-1",
         "selection-1",
         candidate_reader=FakeCandidateReader([_contract_delta("delta-1")]),
-        entity_reader=FakeEntityReader({"node-1", "node-2"}),
+        entity_reader=_contract_entity_reader(),
         canonical_writer=writer,
         sync_to_live_graph=False,
     )
@@ -641,6 +713,20 @@ def _status_manager(
     graph_status: str = "ready",
 ) -> GraphStatusManager:
     return GraphStatusManager(InMemoryStatusStore(_status(graph_status=graph_status)))
+
+
+def _contract_entity_reader(
+    existing_ids: set[str] | None = None,
+    node_entity_ids: dict[str, str] | None = None,
+) -> FakeEntityReader:
+    resolved_node_entity_ids = node_entity_ids or {
+        "node-1": "entity-1",
+        "node-2": "entity-2",
+    }
+    return FakeEntityReader(
+        existing_ids or set(resolved_node_entity_ids.values()),
+        resolved_node_entity_ids,
+    )
 
 
 def _status(
@@ -684,12 +770,14 @@ def _contract_delta(
     delta_id: str = "delta-1",
     *,
     delta_type: str = "upsert_edge",
+    source_node: str = "node-1",
+    target_node: str = "node-2",
 ) -> CandidateGraphDelta:
     return CandidateGraphDelta(
         delta_id=delta_id,
         delta_type=delta_type,
-        source_node="node-1",
-        target_node="node-2",
+        source_node=source_node,
+        target_node=target_node,
         relation_type=RelationshipType.SUPPLY_CHAIN.value,
         properties={"weight": 0.7},
         evidence=[f"fact-{delta_id}"],
