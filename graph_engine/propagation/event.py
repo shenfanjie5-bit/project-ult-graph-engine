@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from graph_engine.client import Neo4jClient
+from graph_engine.evidence import evidence_refs_from_mapping
 from graph_engine.models import PropagationContext, PropagationResult
 from graph_engine.propagation._gds import (
     drop_projection_if_exists,
@@ -271,7 +272,7 @@ def _activated_path(
         "target_labels": _string_list(row.get("target_labels")),
         "edge_id": row.get("edge_id"),
         "relationship_type": row.get("relationship_type"),
-        "evidence_refs": _evidence_refs_from_row(row),
+        "evidence_refs": evidence_refs_from_mapping(row),
         "source_canonical_id_rule_version": row.get("source_canonical_id_rule_version"),
         "target_canonical_id_rule_version": row.get("target_canonical_id_rule_version"),
         "score": explanation["score"],
@@ -352,18 +353,3 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return sorted(str(item) for item in value)
-
-
-def _evidence_refs_from_row(row: dict[str, Any]) -> list[str]:
-    refs: set[str] = set()
-    refs.update(_evidence_refs_from_value(row.get("evidence_refs")))
-    refs.update(_evidence_refs_from_value(row.get("evidence_ref")))
-    return sorted(refs)
-
-
-def _evidence_refs_from_value(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        return sorted(str(item) for item in value if str(item))
-    return [str(value)] if str(value) else []

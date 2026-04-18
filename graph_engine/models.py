@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal, Self, get_args
 
@@ -14,6 +13,8 @@ from contracts.schemas import (
 )
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from graph_engine.evidence import evidence_refs_from_properties
+
 __all__ = [
     "CandidateGraphDelta",
     "ColdReloadPlan",
@@ -22,6 +23,7 @@ __all__ = [
     "GraphEdgeRecord",
     "GraphImpactSnapshot",
     "GraphMetricsSnapshot",
+    "GraphPropagationPathQueryResult",
     "GraphNodeRecord",
     "GraphQueryResult",
     "GraphSnapshot",
@@ -83,7 +85,7 @@ class GraphEdgeRecord(BaseModel):
         if not _is_propagatable_edge(self.relationship_type, self.properties):
             return self
 
-        evidence_refs = _evidence_refs_from_properties(self.properties)
+        evidence_refs = evidence_refs_from_properties(self.properties)
         if not evidence_refs:
             raise ValueError(
                 "propagatable GraphEdgeRecord requires evidence_ref or evidence_refs",
@@ -126,35 +128,6 @@ def _is_propagation_channel(value: Any) -> bool:
     if isinstance(value, (list, tuple, set)):
         return any(_is_propagation_channel(item) for item in value)
     return isinstance(value, str) and value in _ALLOWED_PROPAGATION_CHANNELS
-
-
-def _evidence_refs_from_properties(properties: dict[str, Any]) -> list[str]:
-    refs = set(_evidence_refs_from_value(properties.get("evidence_refs")))
-    refs.update(_evidence_refs_from_value(properties.get("evidence_ref")))
-    return sorted(refs)
-
-
-def _evidence_refs_from_value(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        ref = value.strip()
-        if not ref:
-            raise ValueError("evidence refs must be non-empty strings")
-        return [ref]
-    if isinstance(value, Mapping):
-        raise ValueError("evidence refs must be non-empty strings")
-    if isinstance(value, (list, tuple, set)):
-        refs: set[str] = set()
-        for item in value:
-            if not isinstance(item, str):
-                raise ValueError("evidence refs must be non-empty strings")
-            ref = item.strip()
-            if not ref:
-                raise ValueError("evidence refs must be non-empty strings")
-            refs.add(ref)
-        return sorted(refs)
-    raise ValueError("evidence refs must be non-empty strings")
 
 
 class FrozenGraphDelta(BaseModel):
@@ -317,6 +290,21 @@ class GraphQueryResult(BaseModel):
     graph_generation_id: int = Field(ge=0)
     subgraph_nodes: list[dict[str, Any]]
     subgraph_edges: list[dict[str, Any]]
+    status: Literal["ready"]
+    seed_entities: list[str] = Field(default_factory=list)
+    depth: int = Field(default=0, ge=0)
+    result_limit: int = Field(default=0, ge=0)
+    truncated: bool = False
+    truncation: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphPropagationPathQueryResult(BaseModel):
+    """Status-gated read-only propagation path query result."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    graph_generation_id: int = Field(ge=0)
+    paths: list[dict[str, Any]]
     status: Literal["ready"]
     seed_entities: list[str] = Field(default_factory=list)
     depth: int = Field(default=0, ge=0)

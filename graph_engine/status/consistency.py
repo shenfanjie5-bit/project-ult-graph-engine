@@ -6,6 +6,7 @@ import logging
 from typing import Protocol, TypeAlias
 
 from graph_engine.client import Neo4jClient
+from graph_engine.evidence import evidence_refs_from_value
 from graph_engine.live_metrics import checksum_payload, read_live_graph_metrics, sorted_payload_list
 from graph_engine.models import GraphMetricsSnapshot, GraphSnapshot, Neo4jGraphStatus
 from graph_engine.status.manager import GraphStatusManager, hold_ready_read
@@ -74,6 +75,17 @@ def _check_live_graph_consistency_after_status(
         )
         return False
 
+    if status is not None and snapshot_generation_id is None:
+        _LOGGER.warning(
+            "live graph consistency snapshot missing generation metadata",
+            extra={
+                "snapshot_ref": snapshot_ref,
+                "failure_stage": "result_validation",
+                "status_generation_id": status.graph_generation_id,
+            },
+        )
+        return False
+
     try:
         node_count, edge_count, key_label_counts, checksum = _read_live_graph_metrics(client)
     except Exception:
@@ -85,7 +97,6 @@ def _check_live_graph_consistency_after_status(
 
     if (
         status is not None
-        and snapshot_generation_id is not None
         and snapshot_generation_id != status.graph_generation_id
     ):
         _LOGGER.warning(
@@ -169,16 +180,21 @@ def _snapshot_metric_values(
             }
         )
 
-    relationships = [
-        {
-            "source_node_id": edge.source_node,
-            "target_node_id": edge.target_node,
-            "relationship_type": edge.relation_type,
-            "edge_id": edge.edge_id,
-            "properties": dict(edge.properties),
-        }
-        for edge in snapshot.edges
-    ]
+    relationships = []
+    for edge in snapshot.edges:
+        properties = dict(edge.properties)
+        evidence_refs = evidence_refs_from_value(edge.evidence_refs)
+        if evidence_refs:
+            properties["evidence_refs"] = evidence_refs
+        relationships.append(
+            {
+                "source_node_id": edge.source_node,
+                "target_node_id": edge.target_node,
+                "relationship_type": edge.relation_type,
+                "edge_id": edge.edge_id,
+                "properties": properties,
+            }
+        )
     payload = {
         "node_count": snapshot.node_count,
         "edge_count": snapshot.edge_count,

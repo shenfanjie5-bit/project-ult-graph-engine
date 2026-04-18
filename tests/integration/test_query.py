@@ -150,11 +150,14 @@ def test_query_propagation_paths_uses_effective_channel_filter() -> None:
                 {"node_ids": list(node_ids.values())},
             )
 
-    assert {(path["edge_id"], path["channel"]) for path in all_paths} == {
+    assert all_paths.status == "ready"
+    assert all_paths.seed_entities == [f"{prefix}-entity-source"]
+    assert all_paths.depth == 2
+    assert {(path["edge_id"], path["channel"]) for path in all_paths.paths} == {
         (f"{prefix}-edge-1", "fundamental"),
         (f"{prefix}-edge-2", "event"),
     }
-    assert event_paths == [
+    assert event_paths.paths == [
         {
             "channel": "event",
             "edge_id": f"{prefix}-edge-2",
@@ -166,7 +169,7 @@ def test_query_propagation_paths_uses_effective_channel_filter() -> None:
             "properties": {"kind": "event"},
         }
     ]
-    assert depth_zero == []
+    assert depth_zero.paths == []
 
 
 def _create_query_graph(client: Neo4jClient, prefix: str) -> None:

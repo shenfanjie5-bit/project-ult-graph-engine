@@ -275,6 +275,22 @@ def test_contract_delta_edge_timestamps_are_stable_for_replayed_delta() -> None:
     assert first.edge_records[0].created_at == first.edge_records[0].updated_at
 
 
+def test_contract_delta_upsert_relation_maps_to_edge_promotion() -> None:
+    contract_delta = _contract_delta(delta_type="upsert_relation")
+
+    plan = promote_graph_deltas(
+        "cycle-1",
+        "selection-1",
+        candidate_reader=FakeCandidateReader([contract_delta]),
+        entity_reader=_contract_entity_reader(),
+        canonical_writer=FakeCanonicalWriter(),
+        sync_to_live_graph=False,
+    )
+
+    assert [edge.edge_id for edge in plan.edge_records] == [contract_delta.delta_id]
+    assert plan.edge_records[0].relationship_type == contract_delta.relation_type
+
+
 def test_contract_delta_evidence_flows_through_promotion_to_impact_snapshot() -> None:
     contract_delta = CandidateGraphDelta(
         delta_id="contract-edge-1",

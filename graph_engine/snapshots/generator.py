@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -11,6 +11,10 @@ from contracts.schemas import EntityReference
 from contracts.schemas.graph import GraphEdge, GraphNode
 
 from graph_engine.client import Neo4jClient
+from graph_engine.evidence import (
+    evidence_refs_from_properties,
+    evidence_refs_from_value,
+)
 from graph_engine.live_metrics import (
     LiveGraphMetrics,
     checksum_payload as _checksum_payload,
@@ -362,7 +366,7 @@ def _contract_edge(relationship: dict[str, Any]) -> GraphEdge:
         target_node=str(relationship.get("target_node_id") or ""),
         relation_type=str(relationship.get("relationship_type") or ""),
         properties=properties,
-        evidence_refs=_evidence_refs_from_properties(properties),
+        evidence_refs=evidence_refs_from_properties(properties),
     )
 
 
@@ -461,10 +465,10 @@ def _evidence_refs_from_paths(
     refs: set[str] = set()
     paths_without_evidence: list[str] = []
     for path in activated_paths:
-        path_refs = set(_evidence_refs_from_value(path.get("evidence_refs")))
-        path_refs.update(_evidence_refs_from_value(path.get("evidence_ref")))
+        path_refs = set(evidence_refs_from_value(path.get("evidence_refs")))
+        path_refs.update(evidence_refs_from_value(path.get("evidence_ref")))
         path_refs.update(
-            _evidence_refs_from_value(path.get("evidence"), allow_mapping=True),
+            evidence_refs_from_value(path.get("evidence"), allow_mapping=True),
         )
         if path_refs:
             refs.update(path_refs)
@@ -481,43 +485,6 @@ def _path_identifier(path: dict[str, Any]) -> str:
         f"{path.get('source_node_id', '<unknown-source>')}"
         f"->{path.get('target_node_id', '<unknown-target>')}"
     )
-
-
-def _evidence_refs_from_value(value: Any, *, allow_mapping: bool = False) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        ref = value.strip()
-        if not ref:
-            raise ValueError("evidence refs must be non-empty strings")
-        return [ref]
-    if isinstance(value, Mapping):
-        if allow_mapping:
-            return _evidence_refs_from_mapping(value)
-        raise ValueError("evidence refs must be non-empty strings")
-    if isinstance(value, (list, tuple, set)):
-        refs: set[str] = set()
-        for item in value:
-            if not isinstance(item, str):
-                raise ValueError("evidence refs must be non-empty strings")
-            ref = item.strip()
-            if not ref:
-                raise ValueError("evidence refs must be non-empty strings")
-            refs.add(ref)
-        return sorted(refs)
-    raise ValueError("evidence refs must be non-empty strings")
-
-
-def _evidence_refs_from_mapping(mapping: Mapping[str, Any]) -> list[str]:
-    refs = set(_evidence_refs_from_value(mapping.get("evidence_refs")))
-    refs.update(_evidence_refs_from_value(mapping.get("evidence_ref")))
-    return sorted(refs)
-
-
-def _evidence_refs_from_properties(properties: dict[str, Any]) -> list[str]:
-    refs = set(_evidence_refs_from_value(properties.get("evidence_refs")))
-    refs.update(_evidence_refs_from_value(properties.get("evidence_ref")))
-    return sorted(refs)
 
 
 def _dict_value(value: Any) -> dict[str, Any]:

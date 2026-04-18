@@ -43,16 +43,13 @@ def test_sync_live_graph_uses_idempotent_merge_queries() -> None:
     assert "n.properties = row.properties" not in queries[0]
     assert "r.properties = row.properties" not in queries[0]
     assert "assertion.evidence = row.evidence" not in queries[0]
-    assert "n.properties_json = row.properties_json" in queries[0]
-    assert "r.properties_json = row.properties_json" in queries[0]
+    assert "SET n = row.neo4j_properties" in queries[0]
+    assert "SET r = row.neo4j_properties" in queries[0]
     assert "assertion.evidence_json = row.evidence_json" in queries[0]
-    assert "SET n[stale_property_key] = null" in queries[0]
-    assert "SET r[stale_property_key] = null" in queries[0]
-    assert "NOT property_key IN row.safe_property_keys" in queries[0]
-
-    parameters = client.execute_write.call_args.args[1]
-    assert "node_id" in parameters["reserved_property_names"]
-    assert "properties_json" in parameters["reserved_property_names"]
+    assert "SET n[stale_property_key] = null" not in queries[0]
+    assert "SET r[stale_property_key] = null" not in queries[0]
+    assert "NOT property_key IN row.safe_property_keys" not in queries[0]
+    assert "reserved_property_names" not in client.execute_write.call_args.args[1]
 
 
 def test_sync_live_graph_batches_rows_by_node_label() -> None:
@@ -222,6 +219,16 @@ def test_sync_live_graph_expands_only_safe_properties() -> None:
         "tags": ["supply-chain", "issuer"],
         "ticker": "ULT",
     }
+    assert rows[0]["neo4j_properties"] == {
+        "node_id": "node-1",
+        "canonical_entity_id": "entity-1",
+        "label": NodeLabel.ENTITY.value,
+        "properties_json": _json_payload(properties),
+        "created_at": NOW,
+        "updated_at": NOW,
+        "tags": ["supply-chain", "issuer"],
+        "ticker": "ULT",
+    }
     assert rows[0]["safe_property_keys"] == ["tags", "ticker"]
     assert "properties" not in rows[0]
 
@@ -290,6 +297,19 @@ def test_sync_live_graph_serializes_edge_properties_and_assertion_evidence() -> 
     assertion_row = parameters["assertion_source_rows_1"][0]
     assert edge_row["properties_json"] == _json_payload(edge_properties)
     assert edge_row["safe_properties"] == {
+        "confidence_band": ["medium", "high"],
+        "evidence_refs": ["fact-edge-1"],
+        "source": "filing",
+    }
+    assert edge_row["neo4j_properties"] == {
+        "edge_id": "edge-1",
+        "source_node_id": "node-1",
+        "target_node_id": "node-2",
+        "relationship_type": RelationshipType.SUPPLY_CHAIN.value,
+        "weight": 0.7,
+        "properties_json": _json_payload(edge_properties),
+        "created_at": NOW,
+        "updated_at": NOW,
         "confidence_band": ["medium", "high"],
         "evidence_refs": ["fact-edge-1"],
         "source": "filing",
@@ -409,13 +429,23 @@ def _assertion_record(
 
 
 def _expected_node_row(node_id: str, canonical_entity_id: str) -> dict[str, object]:
+    properties_json = _json_payload({"ticker": "ULT"})
     return {
         "node_id": node_id,
         "canonical_entity_id": canonical_entity_id,
         "label": NodeLabel.ENTITY.value,
-        "properties_json": _json_payload({"ticker": "ULT"}),
+        "properties_json": properties_json,
         "safe_properties": {"ticker": "ULT"},
         "safe_property_keys": ["ticker"],
+        "neo4j_properties": {
+            "node_id": node_id,
+            "canonical_entity_id": canonical_entity_id,
+            "label": NodeLabel.ENTITY.value,
+            "properties_json": properties_json,
+            "created_at": NOW,
+            "updated_at": NOW,
+            "ticker": "ULT",
+        },
         "created_at": NOW,
         "updated_at": NOW,
     }

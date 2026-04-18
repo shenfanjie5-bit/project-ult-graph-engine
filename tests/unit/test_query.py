@@ -8,7 +8,11 @@ from typing import Any, Iterator, Literal
 import pytest
 from pydantic import ValidationError
 
-from graph_engine.models import GraphQueryResult, Neo4jGraphStatus
+from graph_engine.models import (
+    GraphPropagationPathQueryResult,
+    GraphQueryResult,
+    Neo4jGraphStatus,
+)
 from graph_engine.query import (
     MAX_QUERY_DEPTH,
     query_propagation_paths,
@@ -79,6 +83,8 @@ class FakeQueryClient:
     ) -> list[dict[str, Any]]:
         frontier = set(parameters.get("frontier_node_keys", []))
         visited_relationships = set(parameters.get("visited_relationship_keys", []))
+        channel_filter = parameters.get("channel_filter")
+        channel_set = set(channel_filter) if isinstance(channel_filter, list) else None
         nodes_by_id = {_node_key(node): node for node in self.nodes}
         rows: list[dict[str, Any]] = []
         for edge in self.edges:
@@ -92,12 +98,15 @@ class FakeQueryClient:
             source = nodes_by_id[source_key]
             target = nodes_by_id[target_key]
             neighbor = target if source_key in frontier else source
+            channel = _edge_channel(edge) if " AS channel" in query else None
+            if channel_set is not None and channel not in channel_set:
+                continue
             row = {
                 "relationship_key": edge_key,
                 "source_key": source_key,
                 "target_key": target_key,
                 "neighbor_key": _node_key(neighbor),
-                "channel": _edge_channel(edge) if " AS channel" in query else None,
+                "channel": channel,
                 "source": source,
                 "target": target,
                 "neighbor": neighbor,
@@ -150,6 +159,16 @@ def test_graph_query_result_forbids_extra_fields() -> None:
             graph_generation_id=1,
             subgraph_nodes=[],
             subgraph_edges=[],
+            status="ready",
+            extra_field=True,
+        )
+
+
+def test_graph_propagation_path_query_result_forbids_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        GraphPropagationPathQueryResult(
+            graph_generation_id=1,
+            paths=[],
             status="ready",
             extra_field=True,
         )
@@ -365,7 +384,7 @@ def test_query_propagation_paths_validates_channels_before_reading(
 def test_query_propagation_paths_filters_channels_and_normalizes_paths() -> None:
     client = FakeQueryClient()
 
-    paths = query_propagation_paths(
+    result = query_propagation_paths(
         ["entity-a"],
         2,
         client=client,  # type: ignore[arg-type]
@@ -374,7 +393,13 @@ def test_query_propagation_paths_filters_channels_and_normalizes_paths() -> None
         result_limit=5,
     )
 
-    assert paths == [
+    assert result.graph_generation_id == 1
+    assert result.status == "ready"
+    assert result.seed_entities == ["entity-a"]
+    assert result.depth == 2
+    assert result.result_limit == 5
+    assert result.truncated is False
+    assert result.paths == [
         {
             "channel": "event",
             "edge_id": "edge-2",
@@ -391,19 +416,29 @@ def test_query_propagation_paths_filters_channels_and_normalizes_paths() -> None
     assert all("[*" not in read_query for read_query, _ in client.read_calls)
     assert any("propagation_channel" in read_query for read_query, _ in client.read_calls)
     assert parameters == {"per_depth_limit": 6, "seed_entities": ["entity-a"]}
+    assert any(
+        read_parameters.get("channel_filter") == ["event"]
+        for _, read_parameters in client.read_calls
+    )
+    assert any(
+        "WHERE $channel_filter IS NULL OR channel IN $channel_filter" in read_query
+        for read_query, _ in client.read_calls
+    )
 
 
 def test_query_propagation_paths_depth_zero_returns_empty_path_summary() -> None:
     client = FakeQueryClient()
 
-    paths = query_propagation_paths(
+    result = query_propagation_paths(
         ["entity-a"],
         0,
         client=client,  # type: ignore[arg-type]
         status_manager=_status_manager(),
     )
 
-    assert paths == []
+    assert result.paths == []
+    assert result.truncated is False
+    assert result.truncation["path_count"] == 0
     assert client.read_calls == []
 
 
@@ -437,7 +472,7 @@ def test_query_propagation_paths_caps_dense_cyclic_frontiers() -> None:
     nodes, edges = _dense_cyclic_graph(node_count=12)
     client = FakeQueryClient(nodes=nodes, edges=edges)
 
-    paths = query_propagation_paths(
+    result = query_propagation_paths(
         ["dense-entity-0"],
         4,
         client=client,  # type: ignore[arg-type]
@@ -445,9 +480,9 @@ def test_query_propagation_paths_caps_dense_cyclic_frontiers() -> None:
         result_limit=3,
     )
 
-    assert len(paths) <= 3
-    assert paths.truncated is True  # type: ignore[attr-defined]
-    assert paths.truncation["frontier_limit_reached"] is True  # type: ignore[attr-defined]
+    assert len(result.paths) <= 3
+    assert result.truncated is True
+    assert result.truncation["frontier_limit_reached"] is True
     assert max(client.expansion_row_counts) <= 4
     assert all("[*" not in query and "collect(path)" not in query for query, _ in client.read_calls)
 

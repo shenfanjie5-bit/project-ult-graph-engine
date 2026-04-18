@@ -19,6 +19,7 @@ from graph_engine.models import (
     PropagationResult,
 )
 from graph_engine.promotion import build_promotion_plan
+from graph_engine.propagation import run_fundamental_propagation
 from graph_engine.snapshots import (
     build_graph_impact_snapshot,
     build_graph_snapshot,
@@ -63,6 +64,61 @@ class FakeSnapshotClient:
                     "relationships": list(self.relationships),
                 }
             ]
+        return []
+
+
+class FakePropagationReaderClient:
+    def __init__(self) -> None:
+        self.read_calls: list[str] = []
+        self.write_calls: list[str] = []
+
+    def execute_read(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        self.read_calls.append(query)
+        if "gds.graph.exists" in query:
+            return [{"exists": False}]
+        if "gds.pageRank.stream" in query:
+            return [
+                {
+                    "node_id": "node-2",
+                    "canonical_entity_id": "entity-2",
+                    "labels": ["Entity"],
+                    "stable_node_id": "node-2",
+                    "score": 0.4,
+                }
+            ]
+        if "MATCH (source)-[relationship]->(target)" in query:
+            return [
+                {
+                    "source_node_id": "node-1",
+                    "source_entity_id": "entity-1",
+                    "source_labels": ["Entity"],
+                    "target_node_id": "node-2",
+                    "target_entity_id": "entity-2",
+                    "target_labels": ["Entity"],
+                    "edge_id": "edge-1",
+                    "relationship_type": "SUPPLY_CHAIN",
+                    "evidence_refs": ["fact-synced-1"],
+                    "evidence_ref": None,
+                    "relation_weight": 0.7,
+                    "evidence_confidence": 1.0,
+                    "recency_decay": 1.0,
+                    "path_score": 0.7,
+                }
+            ]
+        return []
+
+    def execute_write(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        self.write_calls.append(query)
+        if "gds.graph.project" in query:
+            return [{"relationshipCount": 1}]
         return []
 
 
@@ -748,6 +804,28 @@ def test_compute_graph_snapshots_publishes_promoted_contract_delta_evidence(
     assert graph_snapshot.edges[0].evidence_refs == ["fact-contract-1"]
     assert impact_snapshot.evidence_refs == ["fact-contract-1"]
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
+
+
+def test_real_channel_reader_preserves_synced_relationship_evidence_refs() -> None:
+    client = FakePropagationReaderClient()
+    status_manager, _ = _status_manager(_ready_status())
+
+    propagation_result = run_fundamental_propagation(
+        _context(),
+        client,  # type: ignore[arg-type]
+        status_manager=status_manager,
+        graph_name="unit-snapshot-fundamental",
+        result_limit=10,
+    )
+    impact_snapshot = build_graph_impact_snapshot(
+        "cycle-1",
+        "world-state-1",
+        propagation_result,
+    )
+
+    assert propagation_result.activated_paths[0]["evidence_refs"] == ["fact-synced-1"]
+    assert impact_snapshot.evidence_refs == ["fact-synced-1"]
+    assert any("relationship.evidence_refs AS evidence_refs" in query for query in client.read_calls)
 
 
 def test_compute_graph_snapshots_rechecks_status_before_write(

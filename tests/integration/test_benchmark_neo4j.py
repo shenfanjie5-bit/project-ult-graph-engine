@@ -4,7 +4,12 @@ import os
 
 import pytest
 
-from benchmarks.generate_synthetic import clear_graph, generate_synthetic_edges, generate_synthetic_nodes, load_synthetic_graph
+from benchmarks.generate_synthetic import (
+    clear_graph,
+    generate_synthetic_edges,
+    generate_synthetic_nodes,
+    load_synthetic_graph,
+)
 from benchmarks.run_benchmark import benchmark_gds_projection_create, benchmark_pagerank
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
@@ -13,11 +18,8 @@ from graph_engine.schema.manager import SchemaManager
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("DATABASE_URL") is None and os.getenv("NEO4J_PASSWORD") is None,
-    reason=(
-        "DATABASE_URL/NEO4J_PASSWORD is not set; "
-        "Neo4j benchmark integration tests require a database."
-    ),
+    os.getenv("NEO4J_PASSWORD") is None,
+    reason="NEO4J_PASSWORD is not set; Neo4j benchmark integration tests require a database.",
 )
 
 
@@ -38,7 +40,9 @@ def test_small_neo4j_gds_benchmark_flow_runs() -> None:
             pytest.skip("Neo4j is not reachable with the configured environment.")
 
         clear_graph(client)
-        SchemaManager(client).apply_schema()
+        schema_manager = SchemaManager(client)
+        schema_manager.apply_schema()
+        assert schema_manager.verify_schema() is True
         load_synthetic_graph(client, nodes, edges)
 
         try:
