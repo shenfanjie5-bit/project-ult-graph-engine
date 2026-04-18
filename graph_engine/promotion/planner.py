@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from contracts.schemas import CandidateGraphDelta
 
@@ -29,6 +29,10 @@ _VALID_NODE_LABELS = {label.value for label in NodeLabel}
 _VALID_RELATIONSHIP_TYPES = {relationship.value for relationship in RelationshipType}
 _STABLE_CONTRACT_EDGE_TIMESTAMP_BASE = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _STABLE_CONTRACT_EDGE_TIMESTAMP_SPAN_SECONDS = 10 * 365 * 24 * 60 * 60
+_InternalContractDeltaType = Literal["edge_add"]
+_CONTRACT_DELTA_TYPE_TO_INTERNAL: Mapping[str, _InternalContractDeltaType] = {
+    "upsert_edge": "edge_add",
+}
 
 
 def freeze_contract_delta(
@@ -37,10 +41,11 @@ def freeze_contract_delta(
 ) -> FrozenGraphDelta:
     """Adapt a contract graph delta into the internal promotion planner record."""
 
+    delta_type = _internal_delta_type_for_contract_delta(contract_delta)
     return FrozenGraphDelta(
         delta_id=contract_delta.delta_id,
         cycle_id=cycle_id,
-        delta_type="edge_add",
+        delta_type=delta_type,
         source_entity_ids=[
             contract_delta.source_node,
             contract_delta.target_node,
@@ -48,6 +53,18 @@ def freeze_contract_delta(
         payload=contract_delta.model_dump(),
         validation_status="frozen",
     )
+
+
+def _internal_delta_type_for_contract_delta(
+    contract_delta: CandidateGraphDelta,
+) -> _InternalContractDeltaType:
+    delta_type = _CONTRACT_DELTA_TYPE_TO_INTERNAL.get(contract_delta.delta_type)
+    if delta_type is None:
+        raise ValueError(
+            "unsupported contract delta_type "
+            f"{contract_delta.delta_type!r} for delta {contract_delta.delta_id}",
+        )
+    return delta_type
 
 
 def validate_entity_anchors(

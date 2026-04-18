@@ -59,10 +59,13 @@ def promote_graph_deltas(
 
 def _internal_promotion_delta(
     cycle_id: str,
-    delta: CandidateGraphDelta | FrozenGraphDelta,
+    delta: CandidateGraphDelta,
 ) -> FrozenGraphDelta:
-    if isinstance(delta, FrozenGraphDelta):
-        return delta
+    if not isinstance(delta, CandidateGraphDelta):
+        raise TypeError(
+            "CandidateDeltaReader must return contracts.schemas.CandidateGraphDelta "
+            f"values, got {type(delta).__name__}",
+        )
     return freeze_contract_delta(cycle_id, delta)
 
 

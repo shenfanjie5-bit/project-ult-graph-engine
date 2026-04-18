@@ -40,6 +40,20 @@ class FakeCandidateReader:
         return self.deltas
 
 
+class FakeLegacyCandidateReader:
+    def __init__(self, deltas: list[FrozenGraphDelta]) -> None:
+        self.deltas = deltas
+        self.calls: list[tuple[str, str]] = []
+
+    def read_candidate_graph_deltas(
+        self,
+        cycle_id: str,
+        selection_ref: str,
+    ) -> list[FrozenGraphDelta]:
+        self.calls.append((cycle_id, selection_ref))
+        return self.deltas
+
+
 class FakeEntityReader:
     def __init__(self, existing_ids: set[str]) -> None:
         self.existing_ids = existing_ids
@@ -309,6 +323,46 @@ def test_contract_delta_evidence_flows_through_promotion_to_impact_snapshot() ->
     )
 
     assert impact_snapshot.evidence_refs == ["fact-contract-1"]
+
+
+def test_promote_graph_deltas_rejects_unsupported_contract_delta_type() -> None:
+    writer = FakeCanonicalWriter()
+    entity_reader = FakeEntityReader({"node-1", "node-2"})
+
+    with pytest.raises(ValueError, match="unsupported contract delta_type 'delete_edge'"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader(
+                [_contract_delta("delta-1", delta_type="delete_edge")],
+            ),
+            entity_reader=entity_reader,
+            canonical_writer=writer,
+            sync_to_live_graph=False,
+        )
+
+    assert entity_reader.calls == []
+    assert writer.plans == []
+
+
+def test_promote_graph_deltas_rejects_legacy_frozen_delta_reader() -> None:
+    writer = FakeCanonicalWriter()
+    entity_reader = FakeEntityReader({"entity-1"})
+
+    with pytest.raises(TypeError, match="CandidateDeltaReader must return"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeLegacyCandidateReader(
+                [_delta("delta-1", "edge_add", {"edge": _edge_payload()})],
+            ),
+            entity_reader=entity_reader,
+            canonical_writer=writer,
+            sync_to_live_graph=False,
+        )
+
+    assert entity_reader.calls == []
+    assert writer.plans == []
 
 
 @pytest.mark.parametrize(
@@ -626,10 +680,14 @@ def _delta(
     )
 
 
-def _contract_delta(delta_id: str = "delta-1") -> CandidateGraphDelta:
+def _contract_delta(
+    delta_id: str = "delta-1",
+    *,
+    delta_type: str = "upsert_edge",
+) -> CandidateGraphDelta:
     return CandidateGraphDelta(
         delta_id=delta_id,
-        delta_type="upsert_edge",
+        delta_type=delta_type,
         source_node="node-1",
         target_node="node-2",
         relation_type=RelationshipType.SUPPLY_CHAIN.value,
