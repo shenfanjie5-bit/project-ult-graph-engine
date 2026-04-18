@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal, Self, get_args
 
@@ -34,6 +35,20 @@ __all__ = [
 
 PropagationChannel = Literal["fundamental", "event", "reflexive"]
 _ALLOWED_PROPAGATION_CHANNELS: frozenset[str] = frozenset(get_args(PropagationChannel))
+_PROPAGATABLE_RELATIONSHIP_TYPES: frozenset[str] = frozenset(
+    {
+        "SUPPLY_CHAIN",
+        "OWNERSHIP",
+        "INDUSTRY_CHAIN",
+        "SECTOR_MEMBERSHIP",
+        "EVENT_IMPACT",
+    }
+)
+_PROPAGATION_CHANNEL_PROPERTY_NAMES: tuple[str, ...] = (
+    "propagation_channel",
+    "channel",
+    "impact_channel",
+)
 
 
 class GraphNodeRecord(BaseModel):
@@ -63,6 +78,23 @@ class GraphEdgeRecord(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    @model_validator(mode="after")
+    def _propagatable_edges_require_evidence_refs(self) -> Self:
+        if not _is_propagatable_edge(self.relationship_type, self.properties):
+            return self
+
+        evidence_refs = _evidence_refs_from_properties(self.properties)
+        if not evidence_refs:
+            raise ValueError(
+                "propagatable GraphEdgeRecord requires evidence_ref or evidence_refs",
+            )
+
+        self.properties = {
+            **self.properties,
+            "evidence_refs": evidence_refs,
+        }
+        return self
+
 
 class GraphAssertionRecord(BaseModel):
     """Canonical assertion and evidence record."""
@@ -76,6 +108,53 @@ class GraphAssertionRecord(BaseModel):
     evidence: dict[str, Any]
     confidence: float = Field(ge=0.0, le=1.0)
     created_at: datetime
+
+
+def _is_propagatable_edge(
+    relationship_type: str,
+    properties: dict[str, Any],
+) -> bool:
+    if relationship_type in _PROPAGATABLE_RELATIONSHIP_TYPES:
+        return True
+    return any(
+        _is_propagation_channel(properties.get(property_name))
+        for property_name in _PROPAGATION_CHANNEL_PROPERTY_NAMES
+    )
+
+
+def _is_propagation_channel(value: Any) -> bool:
+    if isinstance(value, (list, tuple, set)):
+        return any(_is_propagation_channel(item) for item in value)
+    return isinstance(value, str) and value in _ALLOWED_PROPAGATION_CHANNELS
+
+
+def _evidence_refs_from_properties(properties: dict[str, Any]) -> list[str]:
+    refs = set(_evidence_refs_from_value(properties.get("evidence_refs")))
+    refs.update(_evidence_refs_from_value(properties.get("evidence_ref")))
+    return sorted(refs)
+
+
+def _evidence_refs_from_value(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        ref = value.strip()
+        if not ref:
+            raise ValueError("evidence refs must be non-empty strings")
+        return [ref]
+    if isinstance(value, Mapping):
+        raise ValueError("evidence refs must be non-empty strings")
+    if isinstance(value, (list, tuple, set)):
+        refs: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("evidence refs must be non-empty strings")
+            ref = item.strip()
+            if not ref:
+                raise ValueError("evidence refs must be non-empty strings")
+            refs.add(ref)
+        return sorted(refs)
+    raise ValueError("evidence refs must be non-empty strings")
 
 
 class FrozenGraphDelta(BaseModel):

@@ -9,10 +9,17 @@ import pytest
 
 import graph_engine.promotion.service as service_module
 from graph_engine.client import Neo4jClient
-from graph_engine.models import FrozenGraphDelta, Neo4jGraphStatus, PromotionPlan
+from graph_engine.models import (
+    CandidateGraphDelta,
+    FrozenGraphDelta,
+    Neo4jGraphStatus,
+    PropagationResult,
+    PromotionPlan,
+)
 from graph_engine.promotion import build_promotion_plan, promote_graph_deltas
 from graph_engine.promotion.planner import validate_entity_anchors
 from graph_engine.schema.definitions import NodeLabel, RelationshipType
+from graph_engine.snapshots import build_graph_impact_snapshot
 from graph_engine.status import GraphStatusManager
 from tests.fakes import InMemoryStatusStore
 
@@ -125,6 +132,188 @@ def test_build_promotion_plan_parses_frozen_deltas_in_stable_order() -> None:
     assert [record.edge_id for record in plan.edge_records] == ["edge-1", "edge-2"]
     assert [record.assertion_id for record in plan.assertion_records] == ["assertion-1"]
     assert plan.created_at.tzinfo is not None
+
+
+def test_build_promotion_plan_maps_delta_evidence_into_edge_and_assertion_records() -> None:
+    deltas = [
+        _delta(
+            "delta-1",
+            "edge_add",
+            {
+                "edge": _edge_payload(properties={"source": "filing"}),
+                "evidence": ["fact-edge"],
+            },
+        ),
+        _delta(
+            "delta-2",
+            "assertion_add",
+            {
+                "assertion": _assertion_payload(evidence={"source": "contract"}),
+                "evidence": ["fact-assertion"],
+            },
+        ),
+    ]
+
+    plan = build_promotion_plan("cycle-1", "selection-1", deltas)
+
+    assert plan.edge_records[0].properties["evidence_refs"] == ["fact-edge"]
+    assert plan.assertion_records[0].evidence == {
+        "source": "contract",
+        "evidence_refs": ["fact-assertion"],
+    }
+
+
+def test_build_promotion_plan_extracts_refs_from_evidence_mapping() -> None:
+    plan = build_promotion_plan(
+        "cycle-1",
+        "selection-1",
+        [
+            _delta(
+                "delta-1",
+                "edge_add",
+                {
+                    "edge": _edge_payload(properties={"source": "filing"}),
+                    "evidence": {
+                        "source": "filing",
+                        "evidence_ref": "fact-edge",
+                    },
+                },
+            ),
+        ],
+    )
+
+    assert plan.edge_records[0].properties["evidence_refs"] == ["fact-edge"]
+
+
+def test_build_promotion_plan_rejects_evidence_objects_without_refs() -> None:
+    with pytest.raises(ValueError, match="evidence_ref"):
+        build_promotion_plan(
+            "cycle-1",
+            "selection-1",
+            [
+                _delta(
+                    "delta-1",
+                    "edge_add",
+                    {
+                        "edge": _edge_payload(properties={"source": "filing"}),
+                        "evidence": {"source": "filing"},
+                    },
+                ),
+            ],
+        )
+
+
+def test_build_promotion_plan_rejects_non_string_evidence_ref_values() -> None:
+    with pytest.raises(ValueError, match="evidence refs must be non-empty strings"):
+        build_promotion_plan(
+            "cycle-1",
+            "selection-1",
+            [
+                _delta(
+                    "delta-1",
+                    "edge_add",
+                    {
+                        "edge": _edge_payload(properties={"source": "filing"}),
+                        "evidence_refs": [None],
+                    },
+                ),
+            ],
+        )
+
+
+def test_contract_delta_edge_timestamps_are_stable_for_replayed_delta() -> None:
+    contract_delta = CandidateGraphDelta(
+        delta_id="contract-edge-1",
+        delta_type="upsert_edge",
+        source_node="node-1",
+        target_node="node-2",
+        relation_type=RelationshipType.SUPPLY_CHAIN.value,
+        properties={"evidence_confidence": 0.9, "recency_decay": 1.0},
+        evidence=["fact-contract-1"],
+        subsystem_id="subsystem-news",
+    )
+    delta = _delta(
+        "delta-1",
+        "edge_add",
+        contract_delta.model_dump(),
+        source_entity_ids=["entity-1", "entity-2"],
+    )
+
+    first = build_promotion_plan("cycle-1", "selection-1", [delta])
+    second = build_promotion_plan("cycle-1", "selection-1", [delta])
+
+    assert first.edge_records[0].created_at == second.edge_records[0].created_at
+    assert first.edge_records[0].updated_at == second.edge_records[0].updated_at
+    assert first.edge_records[0].created_at == first.edge_records[0].updated_at
+
+
+def test_contract_delta_evidence_flows_through_promotion_to_impact_snapshot() -> None:
+    contract_delta = CandidateGraphDelta(
+        delta_id="contract-edge-1",
+        delta_type="upsert_edge",
+        source_node="node-1",
+        target_node="node-2",
+        relation_type=RelationshipType.SUPPLY_CHAIN.value,
+        properties={
+            "evidence_confidence": 0.9,
+            "recency_decay": 1.0,
+            "weight": 0.7,
+        },
+        evidence=["fact-contract-1"],
+        subsystem_id="subsystem-news",
+    )
+    writer = FakeCanonicalWriter()
+
+    plan = promote_graph_deltas(
+        "cycle-1",
+        "selection-1",
+        candidate_reader=FakeCandidateReader([
+            _delta(
+                "delta-1",
+                "edge_add",
+                contract_delta.model_dump(),
+                source_entity_ids=["entity-1", "entity-2"],
+            ),
+        ]),
+        entity_reader=FakeEntityReader({"entity-1", "entity-2"}),
+        canonical_writer=writer,
+        sync_to_live_graph=False,
+    )
+
+    edge_record = plan.edge_records[0]
+    assert writer.plans == [plan]
+    assert edge_record.edge_id == contract_delta.delta_id
+    assert edge_record.source_node_id == contract_delta.source_node
+    assert edge_record.target_node_id == contract_delta.target_node
+    assert edge_record.relationship_type == contract_delta.relation_type
+    assert edge_record.properties["evidence_refs"] == ["fact-contract-1"]
+
+    impact_snapshot = build_graph_impact_snapshot(
+        "cycle-1",
+        "world-state-1",
+        PropagationResult(
+            cycle_id="cycle-1",
+            graph_generation_id=3,
+            activated_paths=[
+                {
+                    "source_node_id": edge_record.source_node_id,
+                    "source_labels": ["Entity"],
+                    "target_node_id": edge_record.target_node_id,
+                    "target_labels": ["Entity"],
+                    "edge_id": edge_record.edge_id,
+                    "relationship_type": edge_record.relationship_type,
+                    "evidence_refs": edge_record.properties["evidence_refs"],
+                    "score": 0.7,
+                }
+            ],
+            impacted_entities=[
+                {"node_id": edge_record.target_node_id, "labels": ["Entity"], "score": 0.7}
+            ],
+            channel_breakdown={"fundamental": {"path_count": 1}},
+        ),
+    )
+
+    assert impact_snapshot.evidence_refs == ["fact-contract-1"]
 
 
 @pytest.mark.parametrize(
@@ -481,26 +670,31 @@ def _edge_payload(
     edge_id: str = "edge-1",
     *,
     relationship_type: str = RelationshipType.SUPPLY_CHAIN.value,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "edge_id": edge_id,
         "source_node_id": "node-1",
         "target_node_id": "node-2",
         "relationship_type": relationship_type,
-        "properties": {"source": "filing"},
+        "properties": (
+            {"source": "filing", "evidence_refs": [f"fact-{edge_id}"]}
+            if properties is None
+            else properties
+        ),
         "weight": 0.7,
         "created_at": NOW,
         "updated_at": NOW,
     }
 
 
-def _assertion_payload() -> dict[str, Any]:
+def _assertion_payload(*, evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "assertion_id": "assertion-1",
         "source_node_id": "node-1",
         "target_node_id": "node-2",
         "assertion_type": "risk",
-        "evidence": {"source": "contract"},
+        "evidence": {"source": "contract"} if evidence is None else evidence,
         "confidence": 0.8,
         "created_at": NOW,
     }

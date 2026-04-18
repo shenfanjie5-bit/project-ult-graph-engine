@@ -151,6 +151,7 @@ def test_sync_removes_stale_top_level_properties_when_payload_becomes_json_only(
     source_node_id = f"{prefix}-source"
     target_node_id = f"{prefix}-target"
     edge_id = f"{prefix}-edge"
+    evidence_refs = [f"{edge_id}-fact"]
     node_ids = [source_node_id, target_node_id]
 
     scalar_plan = _direct_sync_plan(
@@ -158,14 +159,17 @@ def test_sync_removes_stale_top_level_properties_when_payload_becomes_json_only(
         target_node_id,
         edge_id,
         node_properties={"score": 42},
-        edge_properties={"score": 0.7},
+        edge_properties={"score": 0.7, "evidence_refs": evidence_refs},
     )
     nested_plan = _direct_sync_plan(
         source_node_id,
         target_node_id,
         edge_id,
         node_properties={"score": {"breakdown": {"a": 10, "b": 32}}},
-        edge_properties={"score": {"breakdown": {"direct": 0.7}}},
+        edge_properties={
+            "score": {"breakdown": {"direct": 0.7}},
+            "evidence_refs": evidence_refs,
+        },
     )
 
     with Neo4jClient(load_config_from_env()) as client:
@@ -191,7 +195,9 @@ def test_sync_removes_stale_top_level_properties_when_payload_becomes_json_only(
         "node_score": 42,
         "node_properties_json": _json_payload({"score": 42}),
         "edge_score": 0.7,
-        "edge_properties_json": _json_payload({"score": 0.7}),
+        "edge_properties_json": _json_payload(
+            {"score": 0.7, "evidence_refs": evidence_refs},
+        ),
     }
     assert updated_payloads == {
         "node_score": None,
@@ -200,7 +206,10 @@ def test_sync_removes_stale_top_level_properties_when_payload_becomes_json_only(
         ),
         "edge_score": None,
         "edge_properties_json": _json_payload(
-            {"score": {"breakdown": {"direct": 0.7}}},
+            {
+                "score": {"breakdown": {"direct": 0.7}},
+                "evidence_refs": evidence_refs,
+            },
         ),
     }
 
@@ -441,6 +450,7 @@ def _node_properties(node_id: str) -> dict[str, object]:
 
 def _edge_properties(edge_id: str) -> dict[str, object]:
     return {
+        "evidence_refs": [f"{edge_id}-fact"],
         "integration_prefix": edge_id,
         "mixed_aliases": ["SUPPLY_CHAIN", 1],
         "metadata": {"source_system": "fixture"},

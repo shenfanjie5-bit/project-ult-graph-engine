@@ -271,6 +271,7 @@ def test_sync_live_graph_serializes_edge_properties_and_assertion_evidence() -> 
         "source": "filing",
         "details": {"form": "10-K"},
         "confidence_band": ["medium", "high"],
+        "evidence_refs": ["fact-edge-1"],
         "properties_json": "not-overwritten",
     }
     assertion_evidence = {
@@ -290,9 +291,14 @@ def test_sync_live_graph_serializes_edge_properties_and_assertion_evidence() -> 
     assert edge_row["properties_json"] == _json_payload(edge_properties)
     assert edge_row["safe_properties"] == {
         "confidence_band": ["medium", "high"],
+        "evidence_refs": ["fact-edge-1"],
         "source": "filing",
     }
-    assert edge_row["safe_property_keys"] == ["confidence_band", "source"]
+    assert edge_row["safe_property_keys"] == [
+        "confidence_band",
+        "evidence_refs",
+        "source",
+    ]
     assert "properties" not in edge_row
     assert assertion_row["evidence_json"] == _json_payload(assertion_evidence)
     assert "evidence" not in assertion_row
@@ -370,12 +376,17 @@ def _edge_record(
     relationship_type: str = RelationshipType.SUPPLY_CHAIN.value,
     properties: dict[str, object] | None = None,
 ) -> GraphEdgeRecord:
+    resolved_properties = (
+        {"source": "filing", "evidence_refs": [f"fact-{edge_id}"]}
+        if properties is None
+        else properties
+    )
     return GraphEdgeRecord(
         edge_id=edge_id,
         source_node_id=source_node_id,
         target_node_id=target_node_id,
         relationship_type=relationship_type,
-        properties=properties or {"source": "filing"},
+        properties=resolved_properties,
         weight=0.7,
         created_at=NOW,
         updated_at=NOW,

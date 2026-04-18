@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -463,6 +463,9 @@ def _evidence_refs_from_paths(
     for path in activated_paths:
         path_refs = set(_evidence_refs_from_value(path.get("evidence_refs")))
         path_refs.update(_evidence_refs_from_value(path.get("evidence_ref")))
+        path_refs.update(
+            _evidence_refs_from_value(path.get("evidence"), allow_mapping=True),
+        )
         if path_refs:
             refs.update(path_refs)
         else:
@@ -480,12 +483,35 @@ def _path_identifier(path: dict[str, Any]) -> str:
     )
 
 
-def _evidence_refs_from_value(value: Any) -> list[str]:
+def _evidence_refs_from_value(value: Any, *, allow_mapping: bool = False) -> list[str]:
     if value is None:
         return []
+    if isinstance(value, str):
+        ref = value.strip()
+        if not ref:
+            raise ValueError("evidence refs must be non-empty strings")
+        return [ref]
+    if isinstance(value, Mapping):
+        if allow_mapping:
+            return _evidence_refs_from_mapping(value)
+        raise ValueError("evidence refs must be non-empty strings")
     if isinstance(value, (list, tuple, set)):
-        return sorted(str(item) for item in value if str(item))
-    return [str(value)] if str(value) else []
+        refs: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("evidence refs must be non-empty strings")
+            ref = item.strip()
+            if not ref:
+                raise ValueError("evidence refs must be non-empty strings")
+            refs.add(ref)
+        return sorted(refs)
+    raise ValueError("evidence refs must be non-empty strings")
+
+
+def _evidence_refs_from_mapping(mapping: Mapping[str, Any]) -> list[str]:
+    refs = set(_evidence_refs_from_value(mapping.get("evidence_refs")))
+    refs.update(_evidence_refs_from_value(mapping.get("evidence_ref")))
+    return sorted(refs)
 
 
 def _evidence_refs_from_properties(properties: dict[str, Any]) -> list[str]:

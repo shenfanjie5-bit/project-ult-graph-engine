@@ -200,7 +200,10 @@ def _edge_record(
         source_node_id=source_node_id,
         target_node_id=target_node_id,
         relationship_type=RelationshipType.SUPPLY_CHAIN.value,
-        properties={"integration_prefix": edge_id},
+        properties={
+            "integration_prefix": edge_id,
+            "evidence_refs": [f"{edge_id}-fact"],
+        },
         weight=0.7,
         created_at=NOW,
         updated_at=NOW,
