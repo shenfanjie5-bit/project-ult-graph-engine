@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal, Self, get_args
 
@@ -136,9 +137,24 @@ def _evidence_refs_from_properties(properties: dict[str, Any]) -> list[str]:
 def _evidence_refs_from_value(value: Any) -> list[str]:
     if value is None:
         return []
+    if isinstance(value, str):
+        ref = value.strip()
+        if not ref:
+            raise ValueError("evidence refs must be non-empty strings")
+        return [ref]
+    if isinstance(value, Mapping):
+        raise ValueError("evidence refs must be non-empty strings")
     if isinstance(value, (list, tuple, set)):
-        return sorted(str(item) for item in value if str(item))
-    return [str(value)] if str(value) else []
+        refs: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("evidence refs must be non-empty strings")
+            ref = item.strip()
+            if not ref:
+                raise ValueError("evidence refs must be non-empty strings")
+            refs.add(ref)
+        return sorted(refs)
+    raise ValueError("evidence refs must be non-empty strings")
 
 
 class FrozenGraphDelta(BaseModel):

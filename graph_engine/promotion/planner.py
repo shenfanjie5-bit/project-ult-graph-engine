@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from graph_engine.models import (
@@ -25,6 +26,8 @@ _FORBIDDEN_PAYLOAD_FIELDS = {
 }
 _VALID_NODE_LABELS = {label.value for label in NodeLabel}
 _VALID_RELATIONSHIP_TYPES = {relationship.value for relationship in RelationshipType}
+_STABLE_CONTRACT_EDGE_TIMESTAMP_BASE = datetime(2000, 1, 1, tzinfo=timezone.utc)
+_STABLE_CONTRACT_EDGE_TIMESTAMP_SPAN_SECONDS = 10 * 365 * 24 * 60 * 60
 
 
 def validate_entity_anchors(
@@ -137,15 +140,20 @@ def _edge_payload(
         return _edge_payload_with_evidence_refs(payload_section, evidence_refs)
     if contract_delta is None:
         raise ValueError(f"delta {delta.delta_id} payload must include 'edge'")
-    return _edge_payload_from_contract_delta(contract_delta, evidence_refs=evidence_refs)
+    return _edge_payload_from_contract_delta(
+        delta,
+        contract_delta,
+        evidence_refs=evidence_refs,
+    )
 
 
 def _edge_payload_from_contract_delta(
+    delta: FrozenGraphDelta,
     contract_delta: CandidateGraphDelta,
     *,
     evidence_refs: list[str],
 ) -> dict[str, Any]:
-    created_at = datetime.now(timezone.utc)
+    created_at = _stable_contract_edge_timestamp(delta, contract_delta)
     properties = dict(contract_delta.properties)
     existing_refs = set(_evidence_refs_from_mapping(properties))
     properties["evidence_refs"] = sorted(existing_refs | set(evidence_refs))
@@ -234,7 +242,9 @@ def _delta_evidence_refs(
     refs: set[str] = set()
     refs.update(_evidence_refs_from_value(delta.payload.get("evidence_refs")))
     refs.update(_evidence_refs_from_value(delta.payload.get("evidence_ref")))
-    refs.update(_evidence_refs_from_value(delta.payload.get("evidence")))
+    refs.update(
+        _evidence_refs_from_value(delta.payload.get("evidence"), allow_mapping=True),
+    )
     if contract_delta is not None:
         refs.update(_evidence_refs_from_value(contract_delta.evidence))
     return sorted(refs)
@@ -246,12 +256,51 @@ def _evidence_refs_from_mapping(mapping: Mapping[str, Any]) -> list[str]:
     return sorted(refs)
 
 
-def _evidence_refs_from_value(value: Any) -> list[str]:
+def _evidence_refs_from_value(value: Any, *, allow_mapping: bool = False) -> list[str]:
     if value is None:
         return []
+    if isinstance(value, str):
+        ref = value.strip()
+        if not ref:
+            raise ValueError("evidence refs must be non-empty strings")
+        return [ref]
+    if isinstance(value, Mapping):
+        if allow_mapping:
+            return _evidence_refs_from_mapping(value)
+        raise ValueError("evidence refs must be non-empty strings")
     if isinstance(value, (list, tuple, set)):
-        return sorted(str(item) for item in value if str(item))
-    return [str(value)] if str(value) else []
+        refs: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("evidence refs must be non-empty strings")
+            ref = item.strip()
+            if not ref:
+                raise ValueError("evidence refs must be non-empty strings")
+            refs.add(ref)
+        return sorted(refs)
+    raise ValueError("evidence refs must be non-empty strings")
+
+
+def _stable_contract_edge_timestamp(
+    delta: FrozenGraphDelta,
+    contract_delta: CandidateGraphDelta,
+) -> datetime:
+    material = "|".join(
+        (
+            delta.cycle_id,
+            delta.delta_id,
+            contract_delta.delta_id,
+            contract_delta.source_node,
+            contract_delta.target_node,
+            contract_delta.relation_type,
+        )
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).digest()
+    offset_seconds = (
+        int.from_bytes(digest[:8], byteorder="big")
+        % _STABLE_CONTRACT_EDGE_TIMESTAMP_SPAN_SECONDS
+    )
+    return _STABLE_CONTRACT_EDGE_TIMESTAMP_BASE + timedelta(seconds=offset_seconds)
 
 
 def _edge_weight(properties: Mapping[str, Any]) -> float:

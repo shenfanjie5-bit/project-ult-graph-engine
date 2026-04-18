@@ -304,6 +304,33 @@ def test_propagatable_edge_requires_evidence_refs() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "properties",
+    [
+        {"evidence_ref": ""},
+        {"evidence_ref": 123},
+        {"evidence_ref": {"source": "filing"}},
+        {"evidence_refs": ["fact-1", ""]},
+        {"evidence_refs": [None]},
+        {"evidence_refs": [{"source": "filing"}]},
+        {"evidence_refs": {"source": "filing"}},
+    ],
+)
+def test_propagatable_edge_rejects_forged_evidence_refs(
+    properties: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError, match="evidence refs must be non-empty strings"):
+        GraphEdgeRecord(
+            edge_id="edge-1",
+            source_node_id="node-1",
+            target_node_id="node-2",
+            relationship_type="SUPPLY_CHAIN",
+            properties=properties,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+
+
 def test_non_propagatable_edge_can_omit_evidence_refs() -> None:
     edge = GraphEdgeRecord(
         edge_id="edge-1",

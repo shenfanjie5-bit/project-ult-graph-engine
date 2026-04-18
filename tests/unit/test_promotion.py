@@ -163,6 +163,90 @@ def test_build_promotion_plan_maps_delta_evidence_into_edge_and_assertion_record
     }
 
 
+def test_build_promotion_plan_extracts_refs_from_evidence_mapping() -> None:
+    plan = build_promotion_plan(
+        "cycle-1",
+        "selection-1",
+        [
+            _delta(
+                "delta-1",
+                "edge_add",
+                {
+                    "edge": _edge_payload(properties={"source": "filing"}),
+                    "evidence": {
+                        "source": "filing",
+                        "evidence_ref": "fact-edge",
+                    },
+                },
+            ),
+        ],
+    )
+
+    assert plan.edge_records[0].properties["evidence_refs"] == ["fact-edge"]
+
+
+def test_build_promotion_plan_rejects_evidence_objects_without_refs() -> None:
+    with pytest.raises(ValueError, match="evidence_ref"):
+        build_promotion_plan(
+            "cycle-1",
+            "selection-1",
+            [
+                _delta(
+                    "delta-1",
+                    "edge_add",
+                    {
+                        "edge": _edge_payload(properties={"source": "filing"}),
+                        "evidence": {"source": "filing"},
+                    },
+                ),
+            ],
+        )
+
+
+def test_build_promotion_plan_rejects_non_string_evidence_ref_values() -> None:
+    with pytest.raises(ValueError, match="evidence refs must be non-empty strings"):
+        build_promotion_plan(
+            "cycle-1",
+            "selection-1",
+            [
+                _delta(
+                    "delta-1",
+                    "edge_add",
+                    {
+                        "edge": _edge_payload(properties={"source": "filing"}),
+                        "evidence_refs": [None],
+                    },
+                ),
+            ],
+        )
+
+
+def test_contract_delta_edge_timestamps_are_stable_for_replayed_delta() -> None:
+    contract_delta = CandidateGraphDelta(
+        delta_id="contract-edge-1",
+        delta_type="upsert_edge",
+        source_node="node-1",
+        target_node="node-2",
+        relation_type=RelationshipType.SUPPLY_CHAIN.value,
+        properties={"evidence_confidence": 0.9, "recency_decay": 1.0},
+        evidence=["fact-contract-1"],
+        subsystem_id="subsystem-news",
+    )
+    delta = _delta(
+        "delta-1",
+        "edge_add",
+        contract_delta.model_dump(),
+        source_entity_ids=["entity-1", "entity-2"],
+    )
+
+    first = build_promotion_plan("cycle-1", "selection-1", [delta])
+    second = build_promotion_plan("cycle-1", "selection-1", [delta])
+
+    assert first.edge_records[0].created_at == second.edge_records[0].created_at
+    assert first.edge_records[0].updated_at == second.edge_records[0].updated_at
+    assert first.edge_records[0].created_at == first.edge_records[0].updated_at
+
+
 def test_contract_delta_evidence_flows_through_promotion_to_impact_snapshot() -> None:
     contract_delta = CandidateGraphDelta(
         delta_id="contract-edge-1",

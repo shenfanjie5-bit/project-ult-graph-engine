@@ -10,12 +10,15 @@ import pytest
 import graph_engine.snapshots.generator as snapshot_generator
 from graph_engine.live_metrics import LiveGraphMetrics
 from graph_engine.models import (
+    CandidateGraphDelta,
+    FrozenGraphDelta,
     GraphImpactSnapshot,
     GraphSnapshot,
     Neo4jGraphStatus,
     PropagationContext,
     PropagationResult,
 )
+from graph_engine.promotion import build_promotion_plan
 from graph_engine.snapshots import (
     build_graph_impact_snapshot,
     build_graph_snapshot,
@@ -256,6 +259,35 @@ def test_build_graph_impact_snapshot_rejects_edge_id_as_evidence_fallback() -> N
             "world-state-1",
             propagation_result,
         )
+
+
+def test_build_graph_impact_snapshot_rejects_forged_evidence_refs() -> None:
+    propagation_result = _propagation_result()
+    propagation_result.activated_paths[0]["evidence_refs"] = [{"source": "filing"}]
+
+    with pytest.raises(ValueError, match="evidence refs must be non-empty strings"):
+        build_graph_impact_snapshot(
+            "cycle-1",
+            "world-state-1",
+            propagation_result,
+        )
+
+
+def test_build_graph_impact_snapshot_extracts_refs_from_evidence_mapping() -> None:
+    propagation_result = _propagation_result()
+    propagation_result.activated_paths[0].pop("evidence_refs")
+    propagation_result.activated_paths[0]["evidence"] = {
+        "source": "filing",
+        "evidence_refs": ["fact-1"],
+    }
+
+    impact_snapshot = build_graph_impact_snapshot(
+        "cycle-1",
+        "world-state-1",
+        propagation_result,
+    )
+
+    assert impact_snapshot.evidence_refs == ["fact-1"]
 
 
 def test_build_graph_impact_snapshot_empty_impact_error_has_context() -> None:
@@ -592,6 +624,130 @@ def test_compute_graph_snapshots_accepts_single_channel_regression_path(
     )
 
     assert requested_channels == ["fundamental"]
+
+
+def test_compute_graph_snapshots_publishes_promoted_contract_delta_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract_delta = CandidateGraphDelta(
+        delta_id="contract-edge-1",
+        delta_type="upsert_edge",
+        source_node="node-1",
+        target_node="node-2",
+        relation_type="SUPPLY_CHAIN",
+        properties={
+            "evidence_confidence": 0.9,
+            "recency_decay": 1.0,
+            "weight": 0.7,
+        },
+        evidence=["fact-contract-1"],
+        subsystem_id="subsystem-news",
+    )
+    plan = build_promotion_plan(
+        "cycle-1",
+        "selection-1",
+        [
+            FrozenGraphDelta(
+                delta_id="delta-1",
+                cycle_id="cycle-1",
+                delta_type="edge_add",
+                source_entity_ids=["entity-1", "entity-2"],
+                payload=contract_delta.model_dump(),
+                validation_status="frozen",
+            ),
+        ],
+    )
+    edge_record = plan.edge_records[0]
+    client = FakeSnapshotClient(
+        nodes=[
+            {
+                "labels": ["Entity"],
+                "node_id": edge_record.source_node_id,
+                "canonical_entity_id": "entity-1",
+                "properties": {"node_id": edge_record.source_node_id},
+            },
+            {
+                "labels": ["Entity"],
+                "node_id": edge_record.target_node_id,
+                "canonical_entity_id": "entity-2",
+                "properties": {"node_id": edge_record.target_node_id},
+            },
+        ],
+        relationships=[
+            {
+                "source_node_id": edge_record.source_node_id,
+                "target_node_id": edge_record.target_node_id,
+                "relationship_type": edge_record.relationship_type,
+                "edge_id": edge_record.edge_id,
+                "properties": {
+                    "edge_id": edge_record.edge_id,
+                    **edge_record.properties,
+                },
+            },
+        ],
+    )
+    node_count, edge_count, key_label_counts, checksum = snapshot_generator._read_graph_metrics(
+        client,
+    )
+    client.read_calls.clear()
+    status_manager, _ = _status_manager(
+        _ready_status(
+            node_count=node_count,
+            edge_count=edge_count,
+            key_label_counts=key_label_counts,
+            checksum=checksum,
+        ),
+    )
+
+    def run_propagation(
+        context: PropagationContext,
+        passed_client: Any,
+        **kwargs: Any,
+    ) -> PropagationResult:
+        assert context.graph_generation_id == 1
+        assert passed_client is client
+        return PropagationResult(
+            cycle_id="cycle-1",
+            graph_generation_id=context.graph_generation_id,
+            activated_paths=[
+                {
+                    "source_node_id": edge_record.source_node_id,
+                    "source_labels": ["Entity"],
+                    "target_node_id": edge_record.target_node_id,
+                    "target_labels": ["Entity"],
+                    "edge_id": edge_record.edge_id,
+                    "relationship_type": edge_record.relationship_type,
+                    "evidence_refs": edge_record.properties["evidence_refs"],
+                    "score": 0.7,
+                }
+            ],
+            impacted_entities=[
+                {
+                    "node_id": edge_record.target_node_id,
+                    "labels": ["Entity"],
+                    "score": 0.7,
+                }
+            ],
+            channel_breakdown={"fundamental": {"path_count": 1}},
+        )
+
+    monkeypatch.setattr(snapshot_generator, "run_full_propagation", run_propagation)
+    writer = RecordingSnapshotWriter()
+
+    graph_snapshot, impact_snapshot = compute_graph_snapshots(
+        "cycle-1",
+        "world-state-1",
+        client=client,
+        graph_generation_id=1,
+        regime_reader=StaticRegimeReader(),
+        snapshot_writer=writer,
+        status_manager=status_manager,
+        enabled_channels=["fundamental"],
+    )
+
+    assert graph_snapshot.edges[0].evidence_refs == ["fact-contract-1"]
+    assert impact_snapshot.evidence_refs == ["fact-contract-1"]
+    assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
 
 def test_compute_graph_snapshots_rechecks_status_before_write(
