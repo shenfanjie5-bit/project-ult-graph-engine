@@ -117,7 +117,6 @@ def _sync_query_and_parameters(
         node_record.node_id for node_record in promotion_batch.node_records
     }
     parameters["required_endpoint_node_ids"] = sorted(required_endpoint_node_ids)
-    parameters["reserved_property_names"] = sorted(_RESERVED_PROPERTY_NAMES)
     return _sync_transaction_query(clauses), parameters
 
 
@@ -158,21 +157,7 @@ def _node_sync_clause(
 CALL {{
     UNWIND ${parameter_name} AS row
     MERGE (n:{label_identifier} {{node_id: row.node_id}})
-    WITH row, n, [
-        property_key IN keys(n)
-        WHERE NOT property_key IN row.safe_property_keys
-          AND NOT property_key IN $reserved_property_names
-    ] AS stale_property_keys
-    FOREACH (
-        stale_property_key IN stale_property_keys |
-        SET n[stale_property_key] = null
-    )
-    SET n.canonical_entity_id = row.canonical_entity_id,
-        n.label = row.label,
-        n.properties_json = row.properties_json,
-        n.created_at = row.created_at,
-        n.updated_at = row.updated_at
-    SET n += row.safe_properties
+    SET n = row.neo4j_properties
     RETURN count(n) AS {result_name}
 }}
 """
@@ -198,21 +183,7 @@ CALL {{
     MATCH (source {{node_id: row.source_node_id}})
     MATCH (target {{node_id: row.target_node_id}})
     MERGE (source)-[r:{relationship_identifier} {{edge_id: row.edge_id}}]->(target)
-    WITH row, r, [
-        property_key IN keys(r)
-        WHERE NOT property_key IN row.safe_property_keys
-          AND NOT property_key IN $reserved_property_names
-    ] AS stale_property_keys
-    FOREACH (
-        stale_property_key IN stale_property_keys |
-        SET r[stale_property_key] = null
-    )
-    SET r.relationship_type = row.relationship_type,
-        r.weight = row.weight,
-        r.properties_json = row.properties_json,
-        r.created_at = row.created_at,
-        r.updated_at = row.updated_at
-    SET r += row.safe_properties
+    SET r = row.neo4j_properties
     RETURN count(r) AS {result_name}
 }}
 """
@@ -299,13 +270,23 @@ def _referenced_endpoint_node_ids(promotion_batch: PromotionPlan) -> set[str]:
 
 def _node_row(node_record: GraphNodeRecord) -> dict[str, Any]:
     safe_properties = _safe_properties(node_record.properties)
-    return {
+    neo4j_properties = {
         "node_id": node_record.node_id,
         "canonical_entity_id": node_record.canonical_entity_id,
         "label": node_record.label,
         "properties_json": _structured_payload_json(node_record.properties),
+        "created_at": node_record.created_at,
+        "updated_at": node_record.updated_at,
+        **safe_properties,
+    }
+    return {
+        "node_id": node_record.node_id,
+        "canonical_entity_id": node_record.canonical_entity_id,
+        "label": node_record.label,
+        "properties_json": neo4j_properties["properties_json"],
         "safe_properties": safe_properties,
         "safe_property_keys": sorted(safe_properties),
+        "neo4j_properties": neo4j_properties,
         "created_at": node_record.created_at,
         "updated_at": node_record.updated_at,
     }
@@ -313,15 +294,27 @@ def _node_row(node_record: GraphNodeRecord) -> dict[str, Any]:
 
 def _edge_row(edge_record: GraphEdgeRecord) -> dict[str, Any]:
     safe_properties = _safe_properties(edge_record.properties)
-    return {
+    neo4j_properties = {
         "edge_id": edge_record.edge_id,
         "source_node_id": edge_record.source_node_id,
         "target_node_id": edge_record.target_node_id,
         "relationship_type": edge_record.relationship_type,
         "weight": edge_record.weight,
         "properties_json": _structured_payload_json(edge_record.properties),
+        "created_at": edge_record.created_at,
+        "updated_at": edge_record.updated_at,
+        **safe_properties,
+    }
+    return {
+        "edge_id": edge_record.edge_id,
+        "source_node_id": edge_record.source_node_id,
+        "target_node_id": edge_record.target_node_id,
+        "relationship_type": edge_record.relationship_type,
+        "weight": edge_record.weight,
+        "properties_json": neo4j_properties["properties_json"],
         "safe_properties": safe_properties,
         "safe_property_keys": sorted(safe_properties),
+        "neo4j_properties": neo4j_properties,
         "created_at": edge_record.created_at,
         "updated_at": edge_record.updated_at,
     }

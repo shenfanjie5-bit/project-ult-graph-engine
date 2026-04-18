@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from typing import Any, get_args
 
 from graph_engine.client import Neo4jClient
-from graph_engine.models import GraphQueryResult, PropagationChannel
+from graph_engine.models import (
+    GraphPropagationPathQueryResult,
+    GraphQueryResult,
+    PropagationChannel,
+)
 from graph_engine.propagation.channels import effective_channel_expression
 from graph_engine.status import GraphStatusManager
 
@@ -111,7 +115,7 @@ def query_propagation_paths(
     channels: list[str] | None = None,
     result_limit: int = 100,
     max_depth: int = MAX_QUERY_DEPTH,
-) -> list[dict[str, Any]]:
+) -> GraphPropagationPathQueryResult:
     """Return read-only propagation path summaries from a ready live graph."""
 
     seed_list = _validated_seed_entities(seed_entities)
@@ -121,13 +125,23 @@ def query_propagation_paths(
     if status_manager is None:
         raise ValueError("query_propagation_paths requires status_manager")
 
-    with status_manager.ready_read():
-        return _read_propagation_paths(
+    with status_manager.ready_read() as graph_status:
+        paths = _read_propagation_paths(
             seed_list,
             validated_depth,
             client=client,
             channels=channel_filter,
             result_limit=validated_limit,
+        )
+        return GraphPropagationPathQueryResult(
+            graph_generation_id=graph_status.graph_generation_id,
+            paths=list(paths),
+            status="ready",
+            seed_entities=seed_list,
+            depth=validated_depth,
+            result_limit=validated_limit,
+            truncated=paths.truncated,
+            truncation=paths.truncation,
         )
 
 
@@ -282,6 +296,25 @@ def _path_query(depth: int) -> str:
 def _frontier_expansion_query(*, include_channel: bool) -> str:
     channel_expression = effective_channel_expression("relationship")
     channel_projection = f"{channel_expression} AS channel" if include_channel else "null AS channel"
+    channel_filter = (
+        "WHERE $channel_filter IS NULL OR channel IN $channel_filter"
+        if include_channel
+        else ""
+    )
+    order_by = (
+        "ORDER BY coalesce(relationship.weight, 1.0) DESC,\n"
+        "         relationship_key,\n"
+        "         source_key,\n"
+        "         type(relationship),\n"
+        "         target_key,\n"
+        "         neighbor_key"
+        if include_channel
+        else "ORDER BY relationship_key,\n"
+        "         source_key,\n"
+        "         type(relationship),\n"
+        "         target_key,\n"
+        "         neighbor_key"
+    )
     return f"""
 MATCH (frontier)-[relationship]-(neighbor)
 WHERE coalesce(frontier.node_id, elementId(frontier)) IN $frontier_node_keys
@@ -320,11 +353,8 @@ WITH relationship,
      neighbor,
      coalesce(neighbor.node_id, elementId(neighbor)) AS neighbor_key,
      {channel_projection}
-ORDER BY relationship_key,
-         source_key,
-         type(relationship),
-         target_key,
-         neighbor_key
+{channel_filter}
+{order_by}
 LIMIT $per_depth_limit
 RETURN relationship_key,
        source_key,
@@ -415,20 +445,35 @@ def _read_propagation_paths(
         if not frontier_node_keys:
             break
         reached_depth = current_depth
-        rows = _read_frontier_rows(
+        frontier_rows = _read_frontier_rows(
             client,
             frontier_node_keys=frontier_node_keys,
             visited_relationship_keys=visited_relationship_keys,
             result_limit=result_limit,
             include_channel=True,
         )
-        if len(rows) > result_limit:
+        path_rows = (
+            frontier_rows
+            if channel_set is None
+            else _read_frontier_rows(
+                client,
+                frontier_node_keys=frontier_node_keys,
+                visited_relationship_keys=visited_relationship_keys,
+                result_limit=result_limit,
+                include_channel=True,
+                channels=channels,
+            )
+        )
+        if len(frontier_rows) > result_limit:
             frontier_limit_reached = True
+            truncated_depths.add(current_depth)
+        if len(path_rows) > result_limit:
+            path_limit_reached = True
             truncated_depths.add(current_depth)
 
         previous_node_keys = set(nodes_by_key)
         next_frontier_keys: list[str] = []
-        for row in rows[:result_limit]:
+        for row in frontier_rows[:result_limit]:
             relationship, relationship_key = _relationship_from_traversal_row(row)
             if relationship_key is None or relationship_key in visited_relationship_keys:
                 continue
@@ -452,6 +497,10 @@ def _read_propagation_paths(
             ):
                 next_frontier_keys.append(neighbor_key)
 
+        for row in path_rows[:result_limit]:
+            relationship, relationship_key = _relationship_from_traversal_row(row)
+            if relationship_key is None:
+                continue
             channel = _text_or_none(row.get("channel"))
             if channel is None or (channel_set is not None and channel not in channel_set):
                 continue
@@ -519,10 +568,12 @@ def _read_frontier_rows(
     visited_relationship_keys: set[str],
     result_limit: int,
     include_channel: bool,
+    channels: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     return client.execute_read(
         _frontier_expansion_query(include_channel=include_channel),
         {
+            "channel_filter": channels,
             "frontier_node_keys": frontier_node_keys,
             "per_depth_limit": _per_depth_limit(result_limit),
             "visited_relationship_keys": sorted(visited_relationship_keys),

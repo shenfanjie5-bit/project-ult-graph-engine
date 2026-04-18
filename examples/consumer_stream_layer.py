@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from graph_engine import (
@@ -10,6 +11,8 @@ from graph_engine import (
     ReadonlySimulationRequest,
     simulate_readonly_impact,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def handle_stream_event(
@@ -40,5 +43,13 @@ def handle_stream_event(
         client=client,
         status_manager=status_manager,
     )
-    print(result)
+    _LOGGER.debug(
+        "stream-layer interim impact computed",
+        extra={
+            "cycle_id": result.get("cycle_id"),
+            "graph_generation_id": result.get("graph_generation_id"),
+            "path_count": len(result.get("activated_paths", [])),
+            "impacted_entity_count": len(result.get("impacted_entities", [])),
+        },
+    )
     return result

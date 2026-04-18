@@ -121,6 +121,14 @@ def build_benchmark_run_record(
         "record_type": "target_scale_budget_validation",
         "recorded_at": datetime.now(UTC).isoformat(),
         "command": command,
+        "environment": {
+            "graph_store": "Neo4j 5.x with GDS",
+            "record_scope": "milestone-0 Lite target budget gate",
+        },
+        "notes": [
+            "Small integration tests cover Neo4j/GDS connectivity only.",
+            "This committed run record is the target-scale budget gate artifact.",
+        ],
         "validation_command": (
             "python -m benchmarks.run_benchmark "
             "--validate-artifact benchmarks/artifacts/lite_target_100k_800k.json"

@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from contracts.schemas import CandidateGraphDelta
 
+from graph_engine.evidence import evidence_refs_from_mapping, evidence_refs_from_value
 from graph_engine.models import (
     FrozenGraphDelta,
     GraphAssertionRecord,
@@ -32,6 +33,7 @@ _STABLE_CONTRACT_EDGE_TIMESTAMP_SPAN_SECONDS = 10 * 365 * 24 * 60 * 60
 _InternalContractDeltaType = Literal["edge_add"]
 _CONTRACT_DELTA_TYPE_TO_INTERNAL: Mapping[str, _InternalContractDeltaType] = {
     "upsert_edge": "edge_add",
+    "upsert_relation": "edge_add",
 }
 
 
@@ -221,7 +223,7 @@ def _parse_assertion_record(delta: FrozenGraphDelta) -> GraphAssertionRecord:
     if evidence_refs:
         evidence = payload.get("evidence")
         evidence_mapping = dict(evidence) if isinstance(evidence, Mapping) else {}
-        existing_refs = set(_evidence_refs_from_mapping(evidence_mapping))
+        existing_refs = set(evidence_refs_from_mapping(evidence_mapping))
         evidence_mapping["evidence_refs"] = sorted(existing_refs | set(evidence_refs))
         payload["evidence"] = evidence_mapping
     return GraphAssertionRecord.model_validate(payload)
@@ -253,7 +255,7 @@ def _edge_payload_from_contract_delta(
 ) -> dict[str, Any]:
     created_at = _stable_contract_edge_timestamp(delta, contract_delta)
     properties = dict(contract_delta.properties)
-    existing_refs = set(_evidence_refs_from_mapping(properties))
+    existing_refs = set(evidence_refs_from_mapping(properties))
     properties["evidence_refs"] = sorted(existing_refs | set(evidence_refs))
     return {
         "edge_id": contract_delta.delta_id,
@@ -277,7 +279,7 @@ def _edge_payload_with_evidence_refs(
     properties = payload.get("properties")
     if not isinstance(properties, Mapping):
         return payload
-    existing_refs = set(_evidence_refs_from_mapping(properties))
+    existing_refs = set(evidence_refs_from_mapping(properties))
     payload["properties"] = {
         **dict(properties),
         "evidence_refs": sorted(existing_refs | set(evidence_refs)),
@@ -338,45 +340,14 @@ def _delta_evidence_refs(
     contract_delta: CandidateGraphDelta | None,
 ) -> list[str]:
     refs: set[str] = set()
-    refs.update(_evidence_refs_from_value(delta.payload.get("evidence_refs")))
-    refs.update(_evidence_refs_from_value(delta.payload.get("evidence_ref")))
+    refs.update(evidence_refs_from_value(delta.payload.get("evidence_refs")))
+    refs.update(evidence_refs_from_value(delta.payload.get("evidence_ref")))
     refs.update(
-        _evidence_refs_from_value(delta.payload.get("evidence"), allow_mapping=True),
+        evidence_refs_from_value(delta.payload.get("evidence"), allow_mapping=True),
     )
     if contract_delta is not None:
-        refs.update(_evidence_refs_from_value(contract_delta.evidence))
+        refs.update(evidence_refs_from_value(contract_delta.evidence))
     return sorted(refs)
-
-
-def _evidence_refs_from_mapping(mapping: Mapping[str, Any]) -> list[str]:
-    refs = set(_evidence_refs_from_value(mapping.get("evidence_refs")))
-    refs.update(_evidence_refs_from_value(mapping.get("evidence_ref")))
-    return sorted(refs)
-
-
-def _evidence_refs_from_value(value: Any, *, allow_mapping: bool = False) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        ref = value.strip()
-        if not ref:
-            raise ValueError("evidence refs must be non-empty strings")
-        return [ref]
-    if isinstance(value, Mapping):
-        if allow_mapping:
-            return _evidence_refs_from_mapping(value)
-        raise ValueError("evidence refs must be non-empty strings")
-    if isinstance(value, (list, tuple, set)):
-        refs: set[str] = set()
-        for item in value:
-            if not isinstance(item, str):
-                raise ValueError("evidence refs must be non-empty strings")
-            ref = item.strip()
-            if not ref:
-                raise ValueError("evidence refs must be non-empty strings")
-            refs.add(ref)
-        return sorted(refs)
-    raise ValueError("evidence refs must be non-empty strings")
 
 
 def _stable_contract_edge_timestamp(

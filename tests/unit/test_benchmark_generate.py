@@ -252,6 +252,14 @@ def test_write_benchmark_artifacts_records_json_and_text_report(tmp_path: Path) 
         "edge_factor": 8,
     }
     assert record["overall_passed"] is True
+    assert record["environment"] == {
+        "graph_store": "Neo4j 5.x with GDS",
+        "record_scope": "milestone-0 Lite target budget gate",
+    }
+    assert record["notes"] == [
+        "Small integration tests cover Neo4j/GDS connectivity only.",
+        "This committed run record is the target-scale budget gate artifact.",
+    ]
     assert validate_benchmark_artifact(json_path) is True
     assert "Overall: PASS" in text_path.read_text(encoding="utf-8")
 
