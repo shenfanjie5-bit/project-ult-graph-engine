@@ -34,6 +34,8 @@ _DEFAULT_SNAPSHOT_CHANNELS: tuple[PropagationChannel, ...] = (
     "event",
     "reflexive",
 )
+# Used only when the canonical record did not carry the entity-registry rule version.
+_UNKNOWN_CANONICAL_ID_RULE_VERSION = "unknown"
 
 
 def build_graph_snapshot(
@@ -78,11 +80,32 @@ def build_graph_impact_snapshot(
     target_entities = affected_entities or _entity_references_from_paths(
         propagation_result.activated_paths,
     )
-    evidence_refs = _evidence_refs_from_paths(propagation_result.activated_paths)
+    evidence_refs, paths_without_evidence = _evidence_refs_from_paths(
+        propagation_result.activated_paths,
+    )
     if not target_entities:
-        raise ValueError("GraphImpactSnapshot requires at least one target entity")
+        raise ValueError(
+            "GraphImpactSnapshot requires at least one target entity "
+            f"for cycle_id={cycle_id!r}, world_state_ref={world_state_ref!r}, "
+            "graph_generation_id="
+            f"{propagation_result.graph_generation_id!r}",
+        )
+    if paths_without_evidence:
+        raise ValueError(
+            "GraphImpactSnapshot requires real evidence references for every "
+            "activated path "
+            f"for cycle_id={cycle_id!r}, world_state_ref={world_state_ref!r}, "
+            "graph_generation_id="
+            f"{propagation_result.graph_generation_id!r}; "
+            f"paths_without_evidence={paths_without_evidence}",
+        )
     if not evidence_refs:
-        raise ValueError("GraphImpactSnapshot requires at least one evidence reference")
+        raise ValueError(
+            "GraphImpactSnapshot requires at least one real evidence reference "
+            f"for cycle_id={cycle_id!r}, world_state_ref={world_state_ref!r}, "
+            "graph_generation_id="
+            f"{propagation_result.graph_generation_id!r}",
+        )
 
     return GraphImpactSnapshot(
         cycle_id=cycle_id,
@@ -318,6 +341,10 @@ def _contract_node(node: dict[str, Any]) -> GraphNode:
     entity = _entity_reference(
         entity_id=node.get("canonical_entity_id") or properties.get("canonical_entity_id"),
         labels=labels,
+        canonical_id_rule_version=(
+            node.get("canonical_id_rule_version")
+            or properties.get("canonical_id_rule_version")
+        ),
     )
     return GraphNode(
         node_id=str(node.get("node_id") or properties.get("node_id") or ""),
@@ -335,7 +362,7 @@ def _contract_edge(relationship: dict[str, Any]) -> GraphEdge:
         target_node=str(relationship.get("target_node_id") or ""),
         relation_type=str(relationship.get("relationship_type") or ""),
         properties=properties,
-        evidence_refs=_evidence_refs_from_value(properties.get("evidence_refs")),
+        evidence_refs=_evidence_refs_from_properties(properties),
     )
 
 
@@ -348,6 +375,7 @@ def _entity_references_from_impacted_entities(
         reference = _entity_reference(
             entity_id=entity.get("canonical_entity_id") or entity.get("node_id"),
             labels=entity.get("labels"),
+            canonical_id_rule_version=entity.get("canonical_id_rule_version"),
         )
         if reference is None or reference.entity_id in seen:
             continue
@@ -360,11 +388,23 @@ def _entity_references_from_paths(activated_paths: list[dict[str, Any]]) -> list
     references: list[EntityReference] = []
     seen: set[str] = set()
     for path in activated_paths:
-        for entity_id, labels in (
-            (path.get("source_entity_id") or path.get("source_node_id"), path.get("source_labels")),
-            (path.get("target_entity_id") or path.get("target_node_id"), path.get("target_labels")),
+        for entity_id, labels, canonical_id_rule_version in (
+            (
+                path.get("source_entity_id") or path.get("source_node_id"),
+                path.get("source_labels"),
+                path.get("source_canonical_id_rule_version"),
+            ),
+            (
+                path.get("target_entity_id") or path.get("target_node_id"),
+                path.get("target_labels"),
+                path.get("target_canonical_id_rule_version"),
+            ),
         ):
-            reference = _entity_reference(entity_id=entity_id, labels=labels)
+            reference = _entity_reference(
+                entity_id=entity_id,
+                labels=labels,
+                canonical_id_rule_version=canonical_id_rule_version,
+            )
             if reference is None or reference.entity_id in seen:
                 continue
             references.append(reference)
@@ -372,14 +412,23 @@ def _entity_references_from_paths(activated_paths: list[dict[str, Any]]) -> list
     return references
 
 
-def _entity_reference(entity_id: Any, labels: Any) -> EntityReference | None:
+def _entity_reference(
+    entity_id: Any,
+    labels: Any,
+    *,
+    canonical_id_rule_version: Any = None,
+) -> EntityReference | None:
     if entity_id is None or str(entity_id) == "":
         return None
     entity_type = (_string_values(labels) or ["unknown"])[0].lower()
     return EntityReference(
         entity_id=str(entity_id),
         entity_type=entity_type,
-        canonical_id_rule_version=CONTRACT_VERSION,
+        canonical_id_rule_version=(
+            str(canonical_id_rule_version)
+            if canonical_id_rule_version is not None and str(canonical_id_rule_version)
+            else _UNKNOWN_CANONICAL_ID_RULE_VERSION
+        ),
     )
 
 
@@ -406,14 +455,29 @@ def _impact_score(impacted_entities: list[dict[str, Any]]) -> float:
     return max(-1.0, min(1.0, total_score))
 
 
-def _evidence_refs_from_paths(activated_paths: list[dict[str, Any]]) -> list[str]:
+def _evidence_refs_from_paths(
+    activated_paths: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
     refs: set[str] = set()
+    paths_without_evidence: list[str] = []
     for path in activated_paths:
-        refs.update(_evidence_refs_from_value(path.get("evidence_refs")))
-        refs.update(_evidence_refs_from_value(path.get("evidence_ref")))
-        if path.get("edge_id") is not None:
-            refs.add(str(path["edge_id"]))
-    return sorted(refs)
+        path_refs = set(_evidence_refs_from_value(path.get("evidence_refs")))
+        path_refs.update(_evidence_refs_from_value(path.get("evidence_ref")))
+        if path_refs:
+            refs.update(path_refs)
+        else:
+            paths_without_evidence.append(_path_identifier(path))
+    return sorted(refs), paths_without_evidence
+
+
+def _path_identifier(path: dict[str, Any]) -> str:
+    edge_id = path.get("edge_id")
+    if edge_id is not None and str(edge_id):
+        return str(edge_id)
+    return (
+        f"{path.get('source_node_id', '<unknown-source>')}"
+        f"->{path.get('target_node_id', '<unknown-target>')}"
+    )
 
 
 def _evidence_refs_from_value(value: Any) -> list[str]:
@@ -422,6 +486,12 @@ def _evidence_refs_from_value(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return sorted(str(item) for item in value if str(item))
     return [str(value)] if str(value) else []
+
+
+def _evidence_refs_from_properties(properties: dict[str, Any]) -> list[str]:
+    refs = set(_evidence_refs_from_value(properties.get("evidence_refs")))
+    refs.update(_evidence_refs_from_value(properties.get("evidence_ref")))
+    return sorted(refs)
 
 
 def _dict_value(value: Any) -> dict[str, Any]:

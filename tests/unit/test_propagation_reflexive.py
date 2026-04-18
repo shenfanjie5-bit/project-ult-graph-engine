@@ -213,6 +213,7 @@ def test_run_reflexive_propagation_filters_tagged_paths_and_explains_scores() ->
     assert [path["edge_id"] for path in result.activated_paths] == ["edge-top", "edge-mid"]
     assert {path["edge_id"] for path in result.activated_paths}.isdisjoint({"edge-untagged"})
     assert result.activated_paths[0]["channel"] == "reflexive"
+    assert result.activated_paths[0]["evidence_refs"] == ["fact-edge-top"]
     assert result.activated_paths[0]["explanation"] == {
         "relation_weight": 2.0,
         "evidence_confidence": 1.0,
@@ -326,6 +327,7 @@ def _path_row(
     propagation_channel: str | None = None,
     channel: str | None = None,
     impact_channel: str | None = None,
+    evidence_refs: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "source_node_id": "node-a",
@@ -342,6 +344,7 @@ def _path_row(
         "propagation_channel": propagation_channel,
         "channel": channel,
         "impact_channel": impact_channel,
+        "evidence_refs": [f"fact-{edge_id}"] if evidence_refs is None else evidence_refs,
     }
 
 

@@ -240,7 +240,45 @@ def test_build_graph_impact_snapshot_returns_contract_payload() -> None:
     assert [entity.entity_id for entity in impact_snapshot.affected_entities] == ["node-2"]
     assert impact_snapshot.direction == "bullish"
     assert impact_snapshot.impact_score == pytest.approx(0.4)
-    assert impact_snapshot.evidence_refs == ["edge-1"]
+    assert impact_snapshot.evidence_refs == ["fact-1"]
+
+
+def test_build_graph_impact_snapshot_rejects_edge_id_as_evidence_fallback() -> None:
+    propagation_result = _propagation_result()
+    propagation_result.activated_paths[0].pop("evidence_refs")
+
+    with pytest.raises(
+        ValueError,
+        match=r"real evidence references.*paths_without_evidence=\['edge-1'\]",
+    ):
+        build_graph_impact_snapshot(
+            "cycle-1",
+            "world-state-1",
+            propagation_result,
+        )
+
+
+def test_build_graph_impact_snapshot_empty_impact_error_has_context() -> None:
+    propagation_result = PropagationResult(
+        cycle_id="cycle-1",
+        graph_generation_id=1,
+        activated_paths=[],
+        impacted_entities=[],
+        channel_breakdown={"fundamental": {"path_count": 0}},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "target entity.*cycle_id='cycle-1'.*world_state_ref='world-state-1'.*"
+            "graph_generation_id=1"
+        ),
+    ):
+        build_graph_impact_snapshot(
+            "cycle-1",
+            "world-state-1",
+            propagation_result,
+        )
 
 
 def test_build_graph_impact_snapshot_id_tracks_full_propagation_payload() -> None:
@@ -823,6 +861,7 @@ def _propagation_result(graph_generation_id: int = 1) -> PropagationResult:
                 "target_node_id": "node-2",
                 "target_labels": ["Entity"],
                 "edge_id": "edge-1",
+                "evidence_refs": ["fact-1"],
                 "score": 0.7,
             }
         ],
@@ -848,5 +887,5 @@ def _impact_snapshot() -> GraphImpactSnapshot:
         affected_sectors=[],
         direction="neutral",
         impact_score=0.0,
-        evidence_refs=["edge-1"],
+        evidence_refs=["fact-1"],
     )

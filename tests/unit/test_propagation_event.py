@@ -216,6 +216,7 @@ def test_run_event_propagation_uses_projection_and_explains_paths() -> None:
 
     assert [path["edge_id"] for path in result.activated_paths] == ["edge-top", "edge-mid"]
     assert result.activated_paths[0]["channel"] == "event"
+    assert result.activated_paths[0]["evidence_refs"] == ["fact-edge-top"]
     assert result.activated_paths[0]["explanation"] == {
         "relation_weight": 2.0,
         "evidence_confidence": 1.0,
@@ -334,6 +335,7 @@ def _path_row(
     propagation_channel: str | None = None,
     channel: str | None = None,
     impact_channel: str | None = None,
+    evidence_refs: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "source_node_id": "node-a",
@@ -350,6 +352,7 @@ def _path_row(
         "propagation_channel": propagation_channel,
         "channel": channel,
         "impact_channel": impact_channel,
+        "evidence_refs": [f"fact-{edge_id}"] if evidence_refs is None else evidence_refs,
     }
 
 

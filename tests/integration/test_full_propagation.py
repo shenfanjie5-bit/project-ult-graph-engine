@@ -74,6 +74,9 @@ def test_compute_graph_snapshots_generates_three_channel_impact_snapshot() -> No
     supply_edge_id = f"{prefix}-supply-edge"
     event_edge_id = f"{prefix}-event-edge"
     reflexive_edge_id = f"{prefix}-reflexive-edge"
+    supply_evidence_ref = f"{prefix}-supply-fact"
+    event_evidence_ref = f"{prefix}-event-fact"
+    reflexive_evidence_ref = f"{prefix}-reflexive-fact"
     node_ids = [
         source_node_id,
         fundamental_target_id,
@@ -100,6 +103,9 @@ def test_compute_graph_snapshots_generates_three_channel_impact_snapshot() -> No
                     supply_edge_id=supply_edge_id,
                     event_edge_id=event_edge_id,
                     reflexive_edge_id=reflexive_edge_id,
+                    supply_evidence_ref=supply_evidence_ref,
+                    event_evidence_ref=event_evidence_ref,
+                    reflexive_evidence_ref=reflexive_evidence_ref,
                 ),
                 client,
             )
@@ -137,7 +143,7 @@ def test_compute_graph_snapshots_generates_three_channel_impact_snapshot() -> No
                 {"node_ids": node_ids},
             )
 
-    assert {supply_edge_id, event_edge_id, reflexive_edge_id} <= set(
+    assert {supply_evidence_ref, event_evidence_ref, reflexive_evidence_ref} <= set(
         impact_snapshot.evidence_refs
     )
     assert impact_snapshot.affected_entities
@@ -155,6 +161,9 @@ def _promotion_plan(
     supply_edge_id: str,
     event_edge_id: str,
     reflexive_edge_id: str,
+    supply_evidence_ref: str,
+    event_evidence_ref: str,
+    reflexive_evidence_ref: str,
 ) -> PromotionPlan:
     return PromotionPlan(
         cycle_id="cycle-1",
@@ -173,6 +182,7 @@ def _promotion_plan(
                 supply_edge_id,
                 RelationshipType.SUPPLY_CHAIN.value,
                 weight=2.0,
+                evidence_ref=supply_evidence_ref,
             ),
             _edge_record(
                 source_node_id,
@@ -180,6 +190,7 @@ def _promotion_plan(
                 event_edge_id,
                 RelationshipType.EVENT_IMPACT.value,
                 weight=3.0,
+                evidence_ref=event_evidence_ref,
             ),
             _edge_record(
                 source_node_id,
@@ -187,6 +198,7 @@ def _promotion_plan(
                 reflexive_edge_id,
                 RelationshipType.OWNERSHIP.value,
                 weight=4.0,
+                evidence_ref=reflexive_evidence_ref,
                 extra_properties={"propagation_channel": "reflexive"},
             ),
         ],
@@ -213,11 +225,13 @@ def _edge_record(
     relationship_type: str,
     *,
     weight: float,
+    evidence_ref: str,
     extra_properties: dict[str, Any] | None = None,
 ) -> GraphEdgeRecord:
     properties = {
         "integration_prefix": edge_id,
         "evidence_confidence": 1.0,
+        "evidence_refs": [evidence_ref],
         "recency_decay": 1.0,
     }
     properties.update(extra_properties or {})

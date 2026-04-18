@@ -62,6 +62,7 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
     source_node_id = f"{prefix}-source"
     target_node_id = f"{prefix}-target"
     edge_id = f"{prefix}-edge"
+    evidence_ref = f"{prefix}-fact-1"
     node_ids = [source_node_id, target_node_id]
     writer = CapturingSnapshotWriter()
 
@@ -74,7 +75,10 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
         assert manager.verify_schema() is True
 
         try:
-            sync_live_graph(_promotion_plan(source_node_id, target_node_id, edge_id), client)
+            sync_live_graph(
+                _promotion_plan(source_node_id, target_node_id, edge_id, evidence_ref),
+                client,
+            )
             node_count, edge_count, key_label_counts, checksum = read_live_graph_metrics(client)
             graph_status = Neo4jGraphStatus(
                 graph_status="ready",
@@ -112,7 +116,7 @@ def test_compute_graph_snapshots_runs_fundamental_pagerank_on_promoted_graph() -
     assert graph_snapshot.node_count >= 2
     assert graph_snapshot.edge_count >= 1
     assert impact_snapshot.affected_entities
-    assert edge_id in impact_snapshot.evidence_refs
+    assert impact_snapshot.evidence_refs == [evidence_ref]
     assert writer.calls == [(graph_snapshot, impact_snapshot)]
 
 
@@ -120,6 +124,7 @@ def _promotion_plan(
     source_node_id: str,
     target_node_id: str,
     edge_id: str,
+    evidence_ref: str,
 ) -> PromotionPlan:
     return PromotionPlan(
         cycle_id="cycle-1",
@@ -129,7 +134,7 @@ def _promotion_plan(
             _node_record(source_node_id, f"{source_node_id}-entity"),
             _node_record(target_node_id, f"{target_node_id}-entity"),
         ],
-        edge_records=[_edge_record(source_node_id, target_node_id, edge_id)],
+        edge_records=[_edge_record(source_node_id, target_node_id, edge_id, evidence_ref)],
         assertion_records=[],
         created_at=NOW,
     )
@@ -150,6 +155,7 @@ def _edge_record(
     source_node_id: str,
     target_node_id: str,
     edge_id: str,
+    evidence_ref: str,
 ) -> GraphEdgeRecord:
     return GraphEdgeRecord(
         edge_id=edge_id,
@@ -159,6 +165,7 @@ def _edge_record(
         properties={
             "integration_prefix": edge_id,
             "evidence_confidence": 0.9,
+            "evidence_refs": [evidence_ref],
             "recency_decay": 1.0,
         },
         weight=10.0,
