@@ -1,10 +1,12 @@
-"""Build canonical graph promotion plans from frozen candidate deltas."""
+"""Adapt contract candidate deltas into canonical graph promotion plans."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
+
+from contracts.schemas import CandidateGraphDelta
 
 from graph_engine.models import (
     FrozenGraphDelta,
@@ -24,6 +26,57 @@ _FORBIDDEN_PAYLOAD_FIELDS = {
 }
 _VALID_NODE_LABELS = {label.value for label in NodeLabel}
 _VALID_RELATIONSHIP_TYPES = {relationship.value for relationship in RelationshipType}
+_PromotionDeltaType = Literal["node_add", "edge_add", "edge_update", "assertion_add"]
+_CONTRACT_DELTA_TYPES: dict[str, _PromotionDeltaType] = {
+    "add_relation": "edge_add",
+    "create_relation": "edge_add",
+    "edge_add": "edge_add",
+    "edge_update": "edge_update",
+    "update_relation": "edge_update",
+    "upsert_edge": "edge_update",
+    "upsert_relation": "edge_update",
+}
+_CONTRACT_RELATIONSHIP_TYPES = {
+    "assertion_link": RelationshipType.ASSERTION_LINK.value,
+    "belongs_to_sector": RelationshipType.SECTOR_MEMBERSHIP.value,
+    "event_impact": RelationshipType.EVENT_IMPACT.value,
+    "industry_chain": RelationshipType.INDUSTRY_CHAIN.value,
+    "ownership": RelationshipType.OWNERSHIP.value,
+    "sector_membership": RelationshipType.SECTOR_MEMBERSHIP.value,
+    "supply_chain": RelationshipType.SUPPLY_CHAIN.value,
+}
+
+
+def adapt_candidate_graph_delta(
+    delta: CandidateGraphDelta,
+    cycle_id: str,
+) -> FrozenGraphDelta:
+    """Translate a contracts-defined delta into the internal promotion record."""
+
+    promotion_delta_type = _contract_promotion_delta_type(delta)
+    relationship_type = _contract_relationship_type(delta)
+    created_at = datetime.now(timezone.utc)
+    properties = _contract_edge_properties(delta)
+
+    return FrozenGraphDelta(
+        delta_id=delta.delta_id,
+        cycle_id=cycle_id,
+        delta_type=promotion_delta_type,
+        source_entity_ids=_contract_source_entity_ids(delta),
+        payload={
+            "edge": {
+                "edge_id": _contract_edge_id(delta, relationship_type),
+                "source_node_id": delta.source_node,
+                "target_node_id": delta.target_node,
+                "relationship_type": relationship_type,
+                "properties": properties,
+                "weight": _contract_edge_weight(delta, properties),
+                "created_at": created_at,
+                "updated_at": created_at,
+            },
+        },
+        validation_status="frozen",
+    )
 
 
 def validate_entity_anchors(
@@ -43,6 +96,57 @@ def validate_entity_anchors(
         raise ValueError(
             "missing entity anchors: " + ", ".join(missing_entity_ids),
         )
+
+
+def _contract_promotion_delta_type(delta: CandidateGraphDelta) -> _PromotionDeltaType:
+    delta_type = _CONTRACT_DELTA_TYPES.get(delta.delta_type.strip().lower())
+    if delta_type is None:
+        raise ValueError(
+            f"contract delta {delta.delta_id} uses unsupported delta_type "
+            f"{delta.delta_type!r}",
+        )
+    return delta_type
+
+
+def _contract_relationship_type(delta: CandidateGraphDelta) -> str:
+    relation_type = delta.relation_type.strip()
+    if relation_type in _VALID_RELATIONSHIP_TYPES:
+        return relation_type
+
+    mapped_relation_type = _CONTRACT_RELATIONSHIP_TYPES.get(relation_type.lower())
+    if mapped_relation_type is not None:
+        return mapped_relation_type
+
+    return relation_type
+
+
+def _contract_edge_id(delta: CandidateGraphDelta, relationship_type: str) -> str:
+    return "|".join((delta.source_node, relationship_type, delta.target_node))
+
+
+def _contract_source_entity_ids(delta: CandidateGraphDelta) -> list[str]:
+    return [delta.source_node]
+
+
+def _contract_edge_properties(delta: CandidateGraphDelta) -> dict[str, Any]:
+    properties = dict(delta.properties)
+    properties["contract_delta_id"] = delta.delta_id
+    properties["contract_delta_type"] = delta.delta_type
+    properties["evidence_refs"] = list(delta.evidence)
+    properties["subsystem_id"] = delta.subsystem_id
+    return properties
+
+
+def _contract_edge_weight(
+    delta: CandidateGraphDelta,
+    properties: Mapping[str, Any],
+) -> float:
+    weight = properties.get("weight", 1.0)
+    if isinstance(weight, bool) or not isinstance(weight, int | float):
+        raise ValueError(
+            f"contract delta {delta.delta_id} property 'weight' must be numeric",
+        )
+    return float(weight)
 
 
 def build_promotion_plan(
