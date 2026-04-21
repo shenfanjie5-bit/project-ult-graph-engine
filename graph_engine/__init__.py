@@ -18,6 +18,7 @@ from graph_engine.models import (
     PromotionPlan,
     ReadonlySimulationRequest,
 )
+from graph_engine.promotion import promote_graph_deltas
 from graph_engine.query import query_propagation_paths, query_subgraph, simulate_readonly_impact
 from graph_engine.reload import (
     CanonicalReader,
@@ -42,8 +43,7 @@ from graph_engine.status import (
     hold_ready_read,
     require_ready_status,
 )
-
-__version__ = "0.1.0"
+from graph_engine.version import __version__
 
 __all__ = [
     "CandidateGraphDelta",
@@ -79,6 +79,7 @@ __all__ = [
     "get_index_statements",
     "hold_ready_read",
     "load_config_from_env",
+    "promote_graph_deltas",
     "query_propagation_paths",
     "query_subgraph",
     "rebuild_gds_projection",

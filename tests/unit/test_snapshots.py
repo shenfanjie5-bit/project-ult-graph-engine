@@ -294,7 +294,15 @@ def test_build_graph_impact_snapshot_returns_contract_payload() -> None:
         propagation_result,
     )
 
-    assert impact_snapshot.version == "0.1.0"
+    # Snapshot version stamps the live contracts version
+    # (graph_engine.snapshots.generator imports
+    # ``contracts.core.__version__`` as CONTRACT_VERSION). Avoid
+    # hardcoding the literal so the test doesn't drift on each
+    # contracts bump (Stage 2.10 follow-up: contracts went 0.1.0 →
+    # 0.1.3).
+    from contracts.core import __version__ as _CONTRACT_VERSION
+
+    assert impact_snapshot.version == _CONTRACT_VERSION
     assert [entity.entity_id for entity in impact_snapshot.target_entities] == ["node-2"]
     assert [entity.entity_id for entity in impact_snapshot.affected_entities] == ["node-2"]
     assert impact_snapshot.direction == "bullish"

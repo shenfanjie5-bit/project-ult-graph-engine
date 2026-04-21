@@ -40,6 +40,13 @@ def test_public_graph_contract_field_sets_are_pinned() -> None:
         "properties",
         "evidence",
         "subsystem_id",
+        # contracts v0.1.3 added the `producer_context` extension slot
+        # (Stage 2.8 follow-up #3 Op1 — backward-compatible nullable
+        # field for cross-subsystem provenance attached to canonical
+        # Ex-1/2/3 wire payloads). graph-engine just re-exports;
+        # consumers may inspect `producer_context` for upstream
+        # subsystem trace info but graph-engine doesn't depend on it.
+        "producer_context",
     }
     assert set(models.GraphSnapshot.model_fields) == {
         "graph_snapshot_id",
