@@ -454,10 +454,19 @@ class _VersionDeclaration:
 
     @staticmethod
     def _safe_contract_version() -> str:
+        # Returns the contracts package version with the canonical ``v``
+        # prefix required by assembly's ``ContractVersion`` regex
+        # (``^v\d+\.\d+\.\d+$``); see
+        # ``assembly/src/assembly/contracts/primitives.py``. The bare
+        # ``contracts.__version__`` (e.g. ``"0.1.3"``) would fail that
+        # regex, blocking any registry contract_version upgrade.
+        # Exception path keeps ``"unknown"`` as the explicit degraded-state
+        # marker — callers (Stage 4 §4.1 registry upgrade) detect it and
+        # leave the registry's ``contract_version`` at ``v0.0.0``.
         try:
             from contracts import __version__ as contracts_version
 
-            return contracts_version
+            return f"v{contracts_version}"
         except Exception:
             return "unknown"
 

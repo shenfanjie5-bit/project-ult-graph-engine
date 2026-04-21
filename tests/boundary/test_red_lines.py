@@ -10,9 +10,19 @@ Per CLAUDE.md (graph-engine):
 3. **Regime Is Read-only**: graph-engine does NOT reverse-import
    ``main_core``; subprocess deny-scan on ``graph_engine.public``
    import graph rejects ``main_core`` (and other business modules).
-4. **Readonly Simulation**: ``simulate_readonly_impact`` does not
-   write the formal live graph (no Neo4j write API calls). Test:
-   real call with mock Neo4jClient; assert 0 ``execute_write`` calls.
+4. **Readonly Simulation**: ``simulate_readonly_impact`` MUST NOT
+   mutate formal live-graph nodes/edges (``CREATE``/``MERGE``/
+   ``SET``/``DELETE`` on real entities), but IS allowed to write
+   **ephemeral GDS projections** (``gds.graph.project`` /
+   ``gds.graph.drop``) that are created and dropped within the
+   simulation scope. Test (codex review #1 P2 fix): target the
+   ``_ReadonlyProjectionClient.execute_write`` structural barrier
+   in ``query/simulation.py:337`` — it raises ``PermissionError``
+   for non-GDS writes and accepts GDS projection writes scoped to
+   the simulation's owned projection name. The previous version of
+   this test asserted "no execute_write of any kind" and skipped
+   without exercising any real path; that invariant was wrong (the
+   real implementation legitimately uses ``gds.graph.project``).
 5. **No Raw Text**: only contracted ``CandidateGraphDelta`` —
    subprocess deny-scan rejects ``lightrag``, ``langchain``,
    ``pdfplumber``, ``pypdf``, ``unstructured``, ``pdfminer`` from
