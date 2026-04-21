@@ -6,37 +6,34 @@ CLAUDE.md (graph-engine):
 - §10 #1 Truth Before Mirror: Iceberg is canonical; Neo4j is hot
   mirror only.
 - §10 #5 No Raw Text: graph-engine accepts only contracted
-  ``CandidateGraphDelta`` (the canonical Ex-3 wire shape produced by
-  upstream subsystems like announcement / news).
+  ``CandidateGraphDelta``.
 - §10 #7 Status Guard: live graph reads check ``graph_status='ready'``.
 
-This regression hard-imports ``audit_eval_fixtures`` (iron rule #1 —
-no ``pytest.skip(allow_module_level=True)``; missing fixture pack
-must fail collection so dev-only venvs surface the gap loudly). It
-really invokes graph-engine's CONSUMER-side validation chain:
-``CandidateGraphDelta.model_validate`` (canonical Pydantic) → graph-
-engine's promotion-side guards. iron rule #5 + main-core sub-rule:
-real runtime + fixture-derived business expectation.
+Iron rule #1: hard-import ``audit_eval_fixtures`` (no module-level
+skip). Iron rule #5 + main-core sub-rule: real runtime + fixture-
+derived business expectation.
+
+Codex review #1 P2 fix (stage 2.10 follow-up #1): the previous
+version of this regression only called
+``CandidateGraphDelta.model_validate(...)``, which is the contracts
+schema graph-engine RE-EXPORTS — calling it doesn't exercise any
+graph-engine code at all. A bug in graph-engine's ``promote_graph_deltas``
+or ``freeze_contract_deltas`` would have stayed green.
+
+This rewrite drives the **real graph-engine consumer service**:
+``promote_graph_deltas(..., sync_to_live_graph=False)`` against
+fixture-derived ``CandidateGraphDelta`` input, with stub reader /
+entity reader / canonical writer that capture call ordering. The
+fixture's ``case_ex3_negative`` is upstream-rejected by announcement /
+news producer guards (so its weak-evidence form never reaches
+graph-engine in production); we use the case's STRENGTHENED variant
+(canonical resolved entities + multiple evidence refs — what the
+producer guards would emit if the scenario had been well-evidenced)
+to drive the consumer side.
 
 Fixture: ``audit_eval_fixtures.event_cases.case_ex3_negative``
-(audit-eval v0.2.2 release; same case used by announcement Stage 2.8
-follow-up #3 + news Stage 2.9 regression). The case's business
-expectation is shape-neutral: given weak evidence + non-official
-source + unresolved target entity anchor, the consuming subsystem's
-Ex-3 high-threshold guard MUST emit 0 graph deltas.
-
-For graph-engine: graph-engine itself does not enforce the
-"single weak evidence" / "non-official source" guards (those live
-upstream in announcement/news producer-side guards). What graph-
-engine DOES enforce is **structural canonical wire validation** at
-its consumer boundary. The case's
-``candidate_graph_delta_attempt`` shape is fed through real
-``CandidateGraphDelta.model_validate``; we then assert graph-engine's
-re-export identity check confirms the schema reaches Layer A
-unchanged. The "0 Ex-3 emitted" business expectation is upheld
-upstream (in announcement/news regression tests); graph-engine's
-contribution here is documenting that it remains a faithful CONSUMER
-of the canonical wire shape after upstream rejection.
+(audit-eval v0.2.2 release). Same case used by announcement Stage
+2.8 follow-up #3 + news Stage 2.9 regression.
 """
 
 from __future__ import annotations
@@ -45,16 +42,15 @@ from __future__ import annotations
 # collection — NOT module-level skip.
 from audit_eval_fixtures import load_case  # noqa: F401  (load_case below proves use)
 
+import pytest
 
-class TestCaseEx3NegativeFixtureMetadataAcknowledgesGraphEngine:
-    """Cross-check fixture metadata declares graph-engine awareness.
-    audit-eval v0.2.2 metadata explicitly named subsystem-news as a
-    secondary consumer of this case; if a future bump also lists
-    graph-engine, this test surfaces the addition. Either way, the
-    fixture itself remains the canonical reference for "what an Ex-3
-    high-threshold-rejected scenario looks like" — graph-engine's
-    upstream producers (announcement/news) are the actual guard
-    enforcers.
+
+class TestCaseEx3NegativeFixtureMetadataDeclaresGraphConsumerScenario:
+    """Cross-check fixture metadata: the case is the canonical "Ex-3
+    high-threshold negative" baseline used across announcement / news
+    / graph-engine. If a future audit-eval bump changes the
+    ``fixture_kind`` or business expectation, this regression should
+    be revisited.
     """
 
     def test_case_ex3_negative_metadata_describes_high_threshold_kind(
@@ -71,89 +67,159 @@ class TestCaseEx3NegativeFixtureMetadataAcknowledgesGraphEngine:
     def test_case_ex3_negative_business_expectation_zero_ex3(self) -> None:
         case = load_case("event_cases", "case_ex3_negative")
         expected = case.expected
-        # Business contract: Ex-3 high-threshold guard must emit zero
-        # candidates. graph-engine relies on this upstream invariant
-        # — if it ever drifts, all consuming subsystems need to
-        # re-evaluate their Layer A write contracts.
         assert expected["ex3_candidates_emitted"] == 0
         assert expected["ex3_high_threshold_guard_triggered"] is True
 
 
-class TestGraphEngineConsumerSideRoundTripCanonicalDelta:
-    """Real runtime touch (iron rule #5): construct a synthetic
-    ``CandidateGraphDelta`` shape comparable to what announcement /
-    news produce after THEIR upstream guards either pass or reject.
-    For the rejected case, the wire payload never reaches Layer B and
-    therefore never reaches graph-engine. For positive cases (e.g.
-    a real well-evidenced contract relationship), graph-engine
-    consumes the canonical wire shape directly.
-
-    This test exercises the consumer-side acceptance path with a
-    valid wire payload, proving graph-engine's ``CandidateGraphDelta``
-    re-export accepts what contracts canonical schema accepts. The
-    fixture-derived business expectation is asserted via
-    ``test_case_ex3_negative_business_expectation_zero_ex3`` above;
-    here we assert the structural consumer contract.
+class TestPromoteGraphDeltasConsumerSideViaRealRuntime:
+    """Real runtime touch (iron rule #5 + main-core sub-rule):
+    ``promote_graph_deltas(..., sync_to_live_graph=False)`` is invoked
+    against fixture-derived ``CandidateGraphDelta`` input. The
+    promotion plan output is asserted against fixture-anchored
+    business expectations (cycle id, frozen delta count, source/target
+    nodes preserved). Stub reader / entity reader / canonical writer
+    capture the call ordering invariant (Layer A canonical write
+    happens — CLAUDE.md §10 #1 truth-before-mirror).
     """
 
-    def test_canonical_wire_payload_round_trips_through_graph_engine_re_export(
+    def test_promote_graph_deltas_consumes_fixture_derived_candidate(
         self,
     ) -> None:
-        # Use the case as inspiration for what a "well-evidenced"
-        # canonical Ex-3 looks like after producer-side guards (the
-        # rejected case has weak evidence, so we synthesize the
-        # *would-have-been-emitted* shape with strong evidence and
-        # verify graph-engine re-export accepts it).
+        from contracts.schemas import CandidateGraphDelta
+
+        from graph_engine import promote_graph_deltas
+
         case = load_case("event_cases", "case_ex3_negative")
         attempt = case.input["candidate_graph_delta_attempt"]
 
-        # Build a STRENGTHENED version (resolved target + multiple
-        # canonical evidence refs); this is what graph-engine would
-        # actually consume in the positive (non-rejected) case.
-        from graph_engine.models import (
-            CandidateGraphDelta as GeCandidateGraphDelta,
+        # Build a STRENGTHENED CandidateGraphDelta from the fixture's
+        # attempt shape: same source_node + relation_type, but
+        # promote target_node from "unresolved counterparty" to a
+        # canonical entity id, and use multiple evidence refs (the
+        # fixture's "single weak evidence" guard reason is upstream-
+        # producer's responsibility; once the producer guard would
+        # accept, this is what graph-engine sees).
+        strengthened_delta = CandidateGraphDelta(
+            subsystem_id="subsystem-news",
+            delta_id=f"graph-engine-regression-{attempt['delta_id']}",
+            # graph-engine internal mapper accepts only
+            # ``upsert_edge`` / ``upsert_relation``; the canonical Ex-3
+            # wire shape (announcement/news produce this).
+            delta_type="upsert_edge",
+            source_node=str(attempt["source_node"]),
+            target_node="ENT_RESOLVED_DOWNSTREAM_FROM_FIXTURE",
+            # Must be a graph-engine RelationshipType enum value (see
+            # ``schema/definitions.py``).
+            relation_type="SUPPLY_CHAIN",
+            properties=dict(attempt.get("properties", {})),
+            evidence=[
+                "evidence-strong-fixture-ref-001",
+                "evidence-strong-fixture-ref-002",
+            ],
         )
 
-        wire_payload = {
-            "subsystem_id": "subsystem-news",
-            "delta_id": str(attempt.get("delta_id", "fixture-delta-001")),
-            # graph-engine internal validator accepts only
-            # ``upsert_edge``/``upsert_relation``; producer-side
-            # contracts.Ex3 schema accepts any non-empty string. We
-            # use the canonical contracts wire here (graph-engine's
-            # internal mapping happens later, not at re-export time).
-            "delta_type": "add",
-            "source_node": str(attempt["source_node"]),
-            # Strengthen target_node to canonical-resolved (originally
-            # unresolved per the fixture's "single anchor resolution"
-            # guard reason).
-            "target_node": "ENT_RESOLVED_DOWNSTREAM_CANONICAL",
-            "relation_type": str(attempt["relation_type"]),
-            "properties": dict(attempt.get("properties", {})),
-            # Strengthen evidence to multiple canonical refs (originally
-            # single weak per the fixture's "single weak evidence"
-            # guard reason).
-            "evidence": [
-                "evidence-strong-ref-001",
-                "evidence-strong-ref-002",
-            ],
-        }
+        cycle_id = "regression-cycle-from-fixture-001"
+        selection_ref = f"regression-selection-{strengthened_delta.delta_id}"
 
-        # Real CONSUMER-side validation (iron rule #5): use graph-
-        # engine's re-exported CandidateGraphDelta to validate the
-        # canonical wire payload. Validates that graph-engine re-
-        # export accepts what contracts.Ex3 accepts (no fork drift).
-        validated = GeCandidateGraphDelta.model_validate(wire_payload)
+        # Stub reader / entity reader / canonical writer with call
+        # logging so we can assert the Layer-A-first ordering.
+        call_log: list[str] = []
 
-        # Fixture-derived business assertions (iron rule #5 main-core
-        # sub-rule): the strengthened wire shape preserves the
-        # fixture's structural invariants (delta_id origin, source
-        # node anchor, relation_type intent).
-        assert validated.delta_id == wire_payload["delta_id"]
-        assert validated.source_node == wire_payload["source_node"]
-        assert validated.relation_type == wire_payload["relation_type"]
-        # The fixture's "non-official source" guard reason is reflected
-        # in producer_context (NOT in the canonical wire shape itself);
-        # graph-engine's consumer contract sees only the canonical
-        # fields.
-        assert validated.evidence == wire_payload["evidence"]
+        class _FixtureReader:
+            def read_candidate_graph_deltas(
+                self, cid: str, sref: str
+            ) -> list[CandidateGraphDelta]:
+                call_log.append("reader.read")
+                assert cid == cycle_id
+                assert sref == selection_ref
+                return [strengthened_delta]
+
+        class _FixtureEntityReader:
+            def canonical_entity_ids_for_node_ids(
+                self, node_ids: set[str]
+            ) -> dict[str, str]:
+                call_log.append("entity_reader.canonical_ids")
+                # Resolve every node id to itself (fixture's source +
+                # the strengthened target both already canonical).
+                return {nid: nid for nid in node_ids}
+
+            def existing_entity_ids(
+                self, entity_ids: set[str]
+            ) -> set[str]:
+                call_log.append("entity_reader.existing")
+                # Fixture-derived entities are all canonical (the
+                # strengthened scenario assumes entity-registry
+                # resolved them upstream).
+                return set(entity_ids)
+
+        class _RecordingCanonicalWriter:
+            def __init__(self) -> None:
+                self.written_plans: list = []
+
+            def write_canonical_records(self, plan) -> None:
+                call_log.append("canonical_writer.write")
+                self.written_plans.append(plan)
+
+        canonical_writer = _RecordingCanonicalWriter()
+
+        plan = promote_graph_deltas(
+            cycle_id=cycle_id,
+            selection_ref=selection_ref,
+            candidate_reader=_FixtureReader(),
+            entity_reader=_FixtureEntityReader(),
+            canonical_writer=canonical_writer,
+            sync_to_live_graph=False,  # no Neo4j needed for regression
+        )
+
+        # Iron rule #5: real runtime returned a real PromotionPlan
+        # (not just a Pydantic re-validation echo).
+        assert plan is not None, (
+            "promote_graph_deltas must return a PromotionPlan"
+        )
+
+        # CLAUDE.md §10 #1 (truth-before-mirror): canonical writer was
+        # invoked exactly once (Layer A write is the source of truth).
+        assert call_log.count("canonical_writer.write") == 1, (
+            f"Layer A canonical write must run exactly once per "
+            f"promotion; call log: {call_log}"
+        )
+        assert canonical_writer.written_plans == [plan], (
+            "canonical_writer received exactly the PromotionPlan that "
+            "promote_graph_deltas returned"
+        )
+
+        # Fixture-derived business expectation (main-core sub-rule):
+        # the promotion plan's cycle / selection / delta_ids carry the
+        # fixture-anchored identity all the way through the consumer
+        # chain. PromotionPlan shape (see ``models.py``):
+        #   {cycle_id, selection_ref, delta_ids, node_records,
+        #    edge_records, assertion_records, created_at}
+        assert plan.cycle_id == cycle_id
+        assert plan.selection_ref == selection_ref
+        assert strengthened_delta.delta_id in plan.delta_ids, (
+            f"fixture-derived delta_id "
+            f"{strengthened_delta.delta_id!r} missing from "
+            f"PromotionPlan.delta_ids={plan.delta_ids}"
+        )
+
+        # CLAUDE.md §10 #6 (No Raw Text): graph-engine emitted real
+        # GraphEdgeRecord(s) (Layer A canonical edge), proving the
+        # consumer pipeline freeze + plan-build went all the way through.
+        assert plan.edge_records, (
+            "promotion plan must contain at least one GraphEdgeRecord "
+            "for an upsert_edge candidate; got empty edge_records"
+        )
+        edge_sources = {edge.source_node_id for edge in plan.edge_records}
+        edge_targets = {edge.target_node_id for edge in plan.edge_records}
+        # Both source AND target carry forward — fixture's source +
+        # the strengthened target are both in the canonical Layer A
+        # edge record (no silent rename / drop).
+        assert str(attempt["source_node"]) in edge_sources, (
+            f"fixture-derived source_node "
+            f"{str(attempt['source_node'])!r} missing from "
+            f"PromotionPlan.edge_records sources={edge_sources}"
+        )
+        assert "ENT_RESOLVED_DOWNSTREAM_FROM_FIXTURE" in edge_targets, (
+            f"strengthened target_node missing from "
+            f"PromotionPlan.edge_records targets={edge_targets}"
+        )

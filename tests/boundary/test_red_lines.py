@@ -222,92 +222,143 @@ class TestTruthBeforeMirror:
         )
 
 
-# ── Red line 4: Readonly Simulation does not write live graph ──────
+# ── Red line 4: Readonly Simulation does not mutate formal live graph ─
 
 
-class TestReadonlySimulationNoLiveGraphWrites:
-    """``simulate_readonly_impact`` MUST NOT call any Neo4jClient write
-    API. Mock Neo4jClient and assert ``execute_write`` is never invoked.
+class TestReadonlySimulationOnlyAllowsGdsProjectionWrites:
+    """``simulate_readonly_impact`` is allowed to write **ephemeral GDS
+    projections** (``gds.graph.project`` / ``gds.graph.drop``) but MUST
+    NOT mutate formal live-graph nodes / edges (``CREATE``/``MERGE``/
+    ``SET``/``DELETE`` on real graph entities). This is the structural
+    invariant CLAUDE.md §10 #4 ("readonly simulation 不能写正式 live
+    graph") really demands.
+
+    Codex review #1 P2: the previous version of this test asserted "no
+    execute_write of any kind" with a wrong-shape ``ReadonlySimulationRequest``
+    constructor, so it skipped without exercising the real path AND
+    used the wrong invariant (the real implementation legitimately
+    issues ``gds.graph.project``/``drop`` writes for ephemeral
+    projections). The right test target is
+    ``_ReadonlyProjectionClient`` — the structural barrier in
+    ``query/simulation.py`` that simulation code goes through. It
+    explicitly raises ``PermissionError`` for any write that isn't a
+    GDS projection op (line 337 in ``query/simulation.py``).
     """
 
-    def test_simulate_readonly_impact_does_not_call_execute_write(
+    def test_readonly_projection_client_raises_on_node_mutation_query(
         self,
     ) -> None:
-        from graph_engine import simulate_readonly_impact
-        from graph_engine.models import (
-            Neo4jGraphStatus,
-            ReadonlySimulationRequest,
-        )
+        from graph_engine.query.simulation import _ReadonlyProjectionClient
 
-        write_calls: list[Any] = []
-        read_calls: list[Any] = []
-
-        class _MockNeo4jClient:
-            def execute_read(self, query, **kwargs):
-                read_calls.append((query, kwargs))
-                # Return empty result so the simulation completes
-                # without raising; the boundary test is about the
-                # WRITE invariant, not the READ-correctness path.
+        # Stub real Neo4jClient — never reached because the barrier
+        # raises before delegation.
+        class _StubClient:
+            def execute_read(self, query, parameters=None):
                 return []
 
-            def execute_write(self, query, **kwargs):
-                write_calls.append((query, kwargs))
+            def execute_write(self, query, parameters=None):
                 raise AssertionError(
-                    "simulate_readonly_impact MUST NOT call "
-                    "Neo4jClient.execute_write — readonly contract "
-                    "(CLAUDE.md §10 #4)"
+                    "barrier should reject before reaching underlying "
+                    "Neo4jClient.execute_write"
                 )
 
-        class _MockStatusManager:
-            def require_ready(self) -> Neo4jGraphStatus:
-                return Neo4jGraphStatus(
-                    graph_status="ready",
-                    graph_generation_id=1,
-                    node_count=0,
-                    edge_count=0,
-                    key_label_counts={},
-                    checksum="sha256:placeholder",
-                    last_verified_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    last_reload_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    writer_lock_token=None,
-                )
-
-        # Build a minimal request. Schema may vary; we wrap in try
-        # and skip if signature has shifted (boundary test should be
-        # resilient to test-helper parameter drift, not assertion drift).
-        try:
-            request = ReadonlySimulationRequest(
-                target_entities=["ENT_SIM_001"],
-                hops=1,
-            )
-        except Exception:
-            # If the request schema requires more fields, skip — the
-            # invariant we're testing (no execute_write) is checked
-            # via _MockNeo4jClient regardless of the call's success
-            # path. Boundary intent: WRITE BARRIER not happy-path.
-            pytest.skip(
-                "ReadonlySimulationRequest schema requires more fields; "
-                "boundary intent (no execute_write) tested via mock "
-                "raises if write attempted."
-            )
-
-        try:
-            simulate_readonly_impact(
-                request,
-                client=_MockNeo4jClient(),
-                status_manager=_MockStatusManager(),
-            )
-        except AssertionError:
-            raise  # write-barrier violation surfaced via mock
-        except Exception:
-            # Any other exception is fine — happy path may need real
-            # Neo4j data. The invariant is that write was never called.
-            pass
-
-        assert write_calls == [], (
-            "simulate_readonly_impact MUST NOT call Neo4jClient.execute_write; "
-            f"got {len(write_calls)} write calls"
+        client = _ReadonlyProjectionClient(
+            _StubClient(),
+            node_ids=["n1", "n2"],
+            edges=[],
+            projection_names=["sim-projection-001"],
         )
+
+        for forbidden_query in (
+            "CREATE (s:Stock {id: 'ENT_001'}) RETURN s",
+            "MERGE (s:Stock {id: 'ENT_001'}) SET s.name = 'x' RETURN s",
+            "MATCH (s:Stock) SET s.flag = true RETURN s",
+            "MATCH (s:Stock {id: 'ENT_001'}) DELETE s",
+            "MATCH (a)-[r:SUPPLY_CHAIN]->(b) DELETE r",
+        ):
+            with pytest.raises(
+                PermissionError, match="GDS projection writes"
+            ):
+                client.execute_write(forbidden_query)
+
+    def test_readonly_projection_client_allows_gds_projection_write(
+        self,
+    ) -> None:
+        """Positive path: ``gds.graph.project`` MUST be allowed (it's
+        an ephemeral projection, not formal mutation). This pin
+        prevents over-tightening the barrier into "no execute_write
+        at all" which would break the real simulation path.
+        """
+
+        from graph_engine.query.simulation import _ReadonlyProjectionClient
+
+        class _StubClient:
+            def execute_read(self, query, parameters=None):
+                # gds.graph.exists check — return "doesn't exist yet"
+                # so projection-create proceeds.
+                return [{"exists": False}]
+
+            def execute_write(self, query, parameters=None):
+                # Real Neo4j would create the projection; stub returns
+                # success.
+                return [
+                    {
+                        "graphName": parameters.get("graph_name"),
+                        "nodeCount": 2,
+                        "relationshipCount": 0,
+                    }
+                ]
+
+        client = _ReadonlyProjectionClient(
+            _StubClient(),
+            node_ids=["n1", "n2"],
+            edges=[],
+            projection_names=["sim-projection-002"],
+        )
+
+        # Should NOT raise PermissionError — GDS projection is allowed.
+        # (May return 0 relationships since edges=[]; that's fine for
+        # the boundary intent.)
+        rows = client.execute_write(
+            "CALL gds.graph.project($graph_name, ['Stock'], '*')",
+            {"graph_name": "sim-projection-002"},
+        )
+        assert rows  # write returned a row, barrier did not block
+
+    def test_readonly_projection_client_rejects_unowned_projection_drop(
+        self,
+    ) -> None:
+        """Even GDS ops are constrained: a simulation can only drop
+        projections IT created — can't drop a formal live projection
+        owned by promotion / cold-reload.
+        """
+
+        from graph_engine.query.simulation import _ReadonlyProjectionClient
+
+        class _StubClient:
+            def execute_read(self, query, parameters=None):
+                return []
+
+            def execute_write(self, query, parameters=None):
+                raise AssertionError(
+                    "barrier should reject before reaching underlying "
+                    "Neo4jClient.execute_write"
+                )
+
+        client = _ReadonlyProjectionClient(
+            _StubClient(),
+            node_ids=["n1"],
+            edges=[],
+            projection_names=["sim-projection-003"],
+        )
+
+        # Drop targets a projection name NOT in this client's owned
+        # set → barrier rejects.
+        with pytest.raises(PermissionError, match="owned by this invocation"):
+            client.execute_write(
+                "CALL gds.graph.drop($graph_name)",
+                {"graph_name": "formal-projection-owned-by-cold-reload"},
+            )
 
 
 # ── Red line 3 + 5: public.py import graph deny scan (CLAUDE.md) ───

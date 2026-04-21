@@ -201,16 +201,27 @@ class _SmokeHook:
     """Run a one-shot end-to-end smoke that exercises the canonical
     delta -> promotion plan path WITHOUT opening Neo4j / Postgres.
 
-    1. Build a minimal valid ``CandidateGraphDelta`` (contracts canonical
-       wire shape — graph-engine doesn't fork the schema).
-    2. Drive it through the promotion-side validators that run BEFORE
-       any Layer A / Neo4j IO. The smoke covers the schema-only invariants
-       graph-engine enforces on incoming deltas.
-    3. Asserts the delta is structurally accepted (passes Pydantic +
-       graph-engine's local re-validation).
+    1. Build a minimal valid ``CandidateGraphDelta`` (canonical Ex-3
+       wire shape that announcement / news produce).
+    2. Drive it through the REAL ``promote_graph_deltas`` consumer
+       service with stub reader / entity reader / canonical writer
+       — covers ``freeze_contract_deltas`` + ``validate_entity_anchors``
+       + ``build_promotion_plan`` end-to-end (NOT just schema
+       re-validation).
+    3. Asserts the resulting ``PromotionPlan`` carries the canonical
+       delta forward (cycle / selection / delta_id / edge record
+       source/target preserved).
 
-    Profile-aware only insofar as it rejects unknown profile_ids. Heavy
-    deps (Neo4j driver / Postgres / GDS) are NEVER imported here.
+    Codex stage 2.10 review #1 P2 fix: the previous version stopped
+    at ``CandidateGraphDelta.model_validate(...)`` which is the
+    contracts re-export — calling it didn't exercise any graph-engine
+    code and would stay green if ``promote_graph_deltas`` was broken.
+    This rewrite drives the real consumer service with
+    ``sync_to_live_graph=False`` so no Neo4j / Postgres connection
+    is needed (preserves the offline-first smoke contract).
+
+    Profile-aware only insofar as it rejects unknown profile_ids.
+    Heavy deps (Neo4j driver / Postgres / GDS) are NEVER imported here.
     """
 
     _SUPPORTED_PROFILES: Final[frozenset[str]] = frozenset(
@@ -231,43 +242,17 @@ class _SmokeHook:
         try:
             from typing import get_args
 
+            from graph_engine import promote_graph_deltas
             from graph_engine.models import (
                 CandidateGraphDelta,
                 Neo4jGraphStatus,
+                PromotionPlan,
             )
         except Exception as exc:
             return {
                 "passed": False,
                 "failure_reason": (
-                    f"graph_engine.models import failed: {exc!r}"
-                ),
-                "profile_id": profile_id,
-            }
-
-        # Build a synthetic but minimally valid CandidateGraphDelta.
-        # Schema fields come from contracts.schemas — graph-engine just
-        # re-exports. We construct via Pydantic so any contracts-side
-        # schema drift surfaces here.
-        try:
-            payload = {
-                "delta_id": "smoke-graph-delta-001",
-                "subsystem_id": "graph-engine-smoke",
-                "delta_type": "add_edge",
-                "source_node": "ENT_GRAPH_SMOKE_SRC",
-                "target_node": "ENT_GRAPH_SMOKE_DST",
-                "relation_type": "supplier_of",
-                "properties": {"smoke": "minimal"},
-                "evidence": [
-                    "smoke-evidence-ref-001",
-                    "smoke-evidence-ref-002",
-                ],
-            }
-            delta = CandidateGraphDelta.model_validate(payload)
-        except Exception as exc:
-            return {
-                "passed": False,
-                "failure_reason": (
-                    f"CandidateGraphDelta construction failed: {exc!r}"
+                    f"graph_engine import failed: {exc!r}"
                 ),
                 "profile_id": profile_id,
             }
@@ -291,6 +276,118 @@ class _SmokeHook:
                 "profile_id": profile_id,
             }
 
+        # Build a synthetic but minimally valid CandidateGraphDelta.
+        # ``delta_type="upsert_edge"`` and ``relation_type="SUPPLY_CHAIN"``
+        # are required to pass graph-engine's promotion-side validators
+        # (see promotion/planner.py::_CONTRACT_DELTA_TYPE_TO_INTERNAL +
+        # schema/definitions.py::RelationshipType).
+        try:
+            delta = CandidateGraphDelta(
+                subsystem_id="subsystem-news",
+                delta_id="smoke-graph-delta-001",
+                delta_type="upsert_edge",
+                source_node="ENT_GRAPH_SMOKE_SRC",
+                target_node="ENT_GRAPH_SMOKE_DST",
+                relation_type="SUPPLY_CHAIN",
+                properties={"smoke": "minimal"},
+                evidence=[
+                    "smoke-evidence-ref-001",
+                    "smoke-evidence-ref-002",
+                ],
+            )
+        except Exception as exc:
+            return {
+                "passed": False,
+                "failure_reason": (
+                    f"CandidateGraphDelta construction failed: {exc!r}"
+                ),
+                "profile_id": profile_id,
+            }
+
+        # Drive REAL ``promote_graph_deltas`` (CONSUMER service) with
+        # in-memory stub reader / entity reader / canonical writer so
+        # no IO is required. ``sync_to_live_graph=False`` skips the
+        # Neo4j sync path (which would need a real driver).
+        cycle_id = "smoke-graph-cycle-001"
+        selection_ref = "smoke-graph-selection-001"
+        canonical_writes: list[Any] = []
+
+        class _StubReader:
+            def read_candidate_graph_deltas(
+                self, _cid: str, _sref: str
+            ) -> list[CandidateGraphDelta]:
+                return [delta]
+
+        class _StubEntityReader:
+            def canonical_entity_ids_for_node_ids(
+                self, node_ids: set[str]
+            ) -> dict[str, str]:
+                # Resolve every node id to itself (sentinel: smoke
+                # entities are already canonical).
+                return {nid: nid for nid in node_ids}
+
+            def existing_entity_ids(
+                self, entity_ids: set[str]
+            ) -> set[str]:
+                return set(entity_ids)
+
+        class _StubCanonicalWriter:
+            def write_canonical_records(self, plan: PromotionPlan) -> None:
+                canonical_writes.append(plan)
+
+        try:
+            plan = promote_graph_deltas(
+                cycle_id=cycle_id,
+                selection_ref=selection_ref,
+                candidate_reader=_StubReader(),
+                entity_reader=_StubEntityReader(),
+                canonical_writer=_StubCanonicalWriter(),
+                sync_to_live_graph=False,
+            )
+        except Exception as exc:
+            return {
+                "passed": False,
+                "failure_reason": (
+                    f"promote_graph_deltas raised: {exc!r}"
+                ),
+                "profile_id": profile_id,
+            }
+
+        # Verify CLAUDE.md §10 #1 (truth-before-mirror): canonical
+        # writer was invoked with the returned plan exactly once.
+        if canonical_writes != [plan]:
+            return {
+                "passed": False,
+                "failure_reason": (
+                    f"canonical_writer.write_canonical_records called "
+                    f"{len(canonical_writes)} times with "
+                    f"{[id(p) for p in canonical_writes]} (expected "
+                    f"exactly [plan id={id(plan)}])"
+                ),
+                "profile_id": profile_id,
+            }
+
+        # Verify the plan carries the canonical delta forward.
+        if delta.delta_id not in plan.delta_ids:
+            return {
+                "passed": False,
+                "failure_reason": (
+                    f"PromotionPlan.delta_ids missing canonical "
+                    f"delta_id {delta.delta_id!r}; got {plan.delta_ids}"
+                ),
+                "profile_id": profile_id,
+            }
+        if not plan.edge_records:
+            return {
+                "passed": False,
+                "failure_reason": (
+                    "PromotionPlan.edge_records empty; "
+                    "upsert_edge candidate must produce at least one "
+                    "GraphEdgeRecord"
+                ),
+                "profile_id": profile_id,
+            }
+
         return {
             "passed": True,
             "profile_id": profile_id,
@@ -299,6 +396,9 @@ class _SmokeHook:
                 "delta_type": delta.delta_type,
                 "relation_type": delta.relation_type,
                 "evidence_count": len(delta.evidence),
+                "promotion_plan_cycle_id": plan.cycle_id,
+                "promotion_plan_delta_count": len(plan.delta_ids),
+                "promotion_plan_edge_record_count": len(plan.edge_records),
                 "consumed_ex_types": list(_CONSUMED_EX_TYPES),
                 "canonical_truth_layer": "iceberg",
             },
