@@ -61,42 +61,126 @@ _DOWN: Final[str] = "blocked"
 _CONSUMED_EX_TYPES: Final[tuple[str, ...]] = ("Ex-3",)
 
 
+#: The ONLY missing-module name (exact, full dotted) that the probe
+#: accepts as a legitimate offline-first dev miss and downgrades to
+#: ``degraded``. Must be the top-level ``contracts`` package itself —
+#: an installed ``contracts`` package whose ``schemas`` submodule
+#: (or any other ``contracts.*`` submodule, or a transitive dep)
+#: is absent is a STRUCTURAL break in the installed package (not a
+#: benign offline-first state) and must surface as ``contracts_broken``
+#: → ``blocked``. Codex review #13 P2 strict call.
+_OFFLINE_FIRST_BENIGN_MISSING_MODULE: Final[str] = "contracts"
+
+
+def _extract_full_missing_module_name(reason: str) -> str | None:
+    """Extract the FULL dotted missing-module name from a
+    ``ModuleNotFoundError`` repr embedded in a probe reason string.
+
+    Unlike announcement/news where missing-submodule-of-optional-dep is
+    a legitimate offline-first miss (e.g. ``docling.datamodel.base_models``
+    is whitelisted in that module's optional-deps set), graph-engine's
+    only contracts touchpoint is ``contracts.schemas``. A missing
+    ``contracts.schemas`` while ``contracts`` itself is installed
+    signals a broken contracts package, not a benign dev miss. So this
+    helper deliberately does NOT strip to the top-level segment — the
+    caller compares the full dotted name against an exact whitelist.
+    Returns ``None`` if the reason doesn't carry a recognizable payload.
+    """
+
+    import re
+
+    match = re.search(r"No module named '([^']+)'", reason)
+    if match is None:
+        return None
+    return match.group(1)
+
+
 def _probe_contracts_re_exports() -> dict[str, Any]:
     """Confirm contracts schemas re-exported by graph_engine.models are
     the IDENTITY (same Python object) of what contracts itself exports.
     A drift here means graph-engine forked the schema (forbidden — only
     contracts owns Ex-3 canonical shape per CLAUDE.md domain rules).
+
+    Codex review #12 P2 fix: split the external ``contracts.schemas``
+    import from the in-repo ``graph_engine.models`` import into two
+    distinct try blocks — a ``ModuleNotFoundError`` from the in-repo
+    chain no longer masquerades as a benign ``contracts_missing``
+    state.
+
+    Codex review #13 P2 follow-up: tighten the ``contracts_missing``
+    boundary to accept ONLY the literal top-level ``contracts`` package
+    being absent. The previous version ran the missing module name
+    through a top-level-stripping helper, which conflated "contracts
+    package not installed" (legitimate offline-first) with "contracts
+    package installed but its ``schemas`` submodule or a transitive
+    dep is missing" (structural regression) — the latter was silently
+    downgraded to degraded. Now the full dotted name must exactly
+    equal ``contracts`` to qualify; everything else → blocked.
     """
 
+    # Step 1: external contracts package (legitimately optional in
+    # offline-first dev venvs — but ONLY when the top-level
+    # ``contracts`` package itself is absent; a missing submodule of
+    # an installed ``contracts`` is a structural break).
     try:
         from contracts.schemas import (
             CandidateGraphDelta as ContractsCandidateGraphDelta,
         )
         from contracts.schemas import GraphImpactSnapshot as ContractsImpact
         from contracts.schemas import GraphSnapshot as ContractsSnapshot
+    except ModuleNotFoundError as exc:
+        # Exact-match check on the FULL dotted missing-module name.
+        # Only ``No module named 'contracts'`` (no dots) qualifies as
+        # a benign offline-first dev miss. Anything else — including
+        # ``contracts.schemas``, ``contracts.foo``, or transitive
+        # deps like ``pydantic`` — signals a broken environment /
+        # structural regression and must surface as ``contracts_broken``
+        # so the caller blocks.
+        missing = _extract_full_missing_module_name(repr(exc))
+        if missing == _OFFLINE_FIRST_BENIGN_MISSING_MODULE:
+            return {
+                "available": False,
+                "kind": "contracts_missing",
+                "missing_module": missing,
+                "reason": (
+                    f"top-level 'contracts' package not installed "
+                    f"(offline-first dev miss): {exc!r}"
+                ),
+            }
+        return {
+            "available": False,
+            "kind": "contracts_broken",
+            "missing_module": missing,
+            "reason": (
+                f"contracts schema import failed: {exc!r} "
+                f"(missing_module={missing!r} is NOT the literal "
+                f"top-level 'contracts' package — this is a structural "
+                f"regression in the installed contracts package or "
+                f"one of its transitive deps, not a benign dev miss)"
+            ),
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        return {
+            "available": False,
+            "kind": "contracts_broken",
+            "reason": f"contracts schema import failed: {exc!r}",
+        }
 
+    # Step 2: in-repo graph_engine.models. Any failure here — including
+    # ``ModuleNotFoundError`` for an internal namespace we renamed or
+    # deleted by accident — is a real source-side regression and must
+    # NOT be tagged ``contracts_missing``.
+    try:
         from graph_engine.models import (
             CandidateGraphDelta,
             GraphImpactSnapshot,
             GraphSnapshot,
         )
-    except ModuleNotFoundError as exc:
-        # Codex review #11 P2 fix: distinguish "contracts package not
-        # installed in this venv" (offline-first dev — degraded) from
-        # "contracts package broke or graph-engine forked the schema"
-        # (real domain regression — blocked). The caller key off
-        # ``kind`` rather than substring-matching the reason string,
-        # which previously created an unreachable degraded branch.
+    except Exception as exc:
         return {
             "available": False,
-            "kind": "import_unavailable",
-            "reason": f"contracts schema re-export check failed: {exc!r}",
-        }
-    except Exception as exc:  # pragma: no cover - defensive
-        return {
-            "available": False,
-            "kind": "import_failed",
-            "reason": f"contracts schema re-export check failed: {exc!r}",
+            "kind": "graph_engine_models_broken",
+            "reason": f"graph_engine.models import failed: {exc!r}",
         }
 
     drift: list[str] = []
@@ -190,23 +274,26 @@ class _HealthProbe:
         }
 
         # Invariant 1: contracts re-exports are identity (no fork —
-        # CLAUDE.md domain rule). Codex review #11 P2 fix: probe now
-        # tags failures with ``kind`` (``import_unavailable`` vs
-        # ``drift`` vs ``import_failed``) so we don't substring-match
-        # reason strings — the previous matcher (``"could not import"``
-        # / ``"import failed"``) never matched the actual reason text
-        # (``"contracts schema re-export check failed: ..."``), making
-        # the offline-first ``degraded`` branch unreachable. Now we
-        # branch on ``kind`` directly.
+        # CLAUDE.md domain rule). Codex review #12 P2 fix: probe now
+        # splits the external ``contracts.schemas`` import from the in-
+        # repo ``graph_engine.models`` import into two separate try
+        # blocks, each producing a distinct ``kind`` tag. The caller
+        # branches on ``kind`` directly — only ``contracts_missing``
+        # (top-level ``contracts`` package absent from this venv —
+        # legitimate offline-first dev state) downgrades to
+        # ``degraded``. ``graph_engine_models_broken`` /
+        # ``contracts_broken`` / ``drift`` always block, so a renamed
+        # or deleted in-repo namespace surfaces as a real regression
+        # instead of being masked as benign dev-only mode.
         re_exports = _probe_contracts_re_exports()
         details["contracts_re_exports"] = re_exports
         if not re_exports["available"]:
             kind = re_exports.get("kind")
-            if kind == "import_unavailable":
+            if kind == "contracts_missing":
                 status_after_re_exports = _DEGRADED
                 message_after_re_exports = (
-                    "graph-engine running in dev-only mode (contracts not "
-                    "importable; functional path unavailable)"
+                    "graph-engine running in dev-only mode (contracts "
+                    "package not importable; functional path unavailable)"
                 )
             elif kind == "drift":
                 return self._build_result(
@@ -218,10 +305,30 @@ class _HealthProbe:
                     ),
                     details=details,
                 )
+            elif kind == "graph_engine_models_broken":
+                return self._build_result(
+                    started_at,
+                    status=_DOWN,
+                    message=(
+                        "graph-engine in-repo models import failed — "
+                        "source-side regression in graph_engine.models "
+                        "or its transitive in-repo deps"
+                    ),
+                    details=details,
+                )
+            elif kind == "contracts_broken":
+                return self._build_result(
+                    started_at,
+                    status=_DOWN,
+                    message=(
+                        "graph-engine contracts schema import failed "
+                        "with non-whitelisted error — contracts env "
+                        "broken (not a benign offline-first miss)"
+                    ),
+                    details=details,
+                )
             else:
-                # ``import_failed`` (defensive catch) or unknown — treat
-                # as blocked since we can't tell whether contracts is
-                # missing or broken.
+                # Unknown kind — defensive: treat as blocked.
                 return self._build_result(
                     started_at,
                     status=_DOWN,
