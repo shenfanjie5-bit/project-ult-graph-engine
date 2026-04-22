@@ -80,9 +80,22 @@ def _probe_contracts_re_exports() -> dict[str, Any]:
             GraphImpactSnapshot,
             GraphSnapshot,
         )
+    except ModuleNotFoundError as exc:
+        # Codex review #11 P2 fix: distinguish "contracts package not
+        # installed in this venv" (offline-first dev — degraded) from
+        # "contracts package broke or graph-engine forked the schema"
+        # (real domain regression — blocked). The caller key off
+        # ``kind`` rather than substring-matching the reason string,
+        # which previously created an unreachable degraded branch.
+        return {
+            "available": False,
+            "kind": "import_unavailable",
+            "reason": f"contracts schema re-export check failed: {exc!r}",
+        }
     except Exception as exc:  # pragma: no cover - defensive
         return {
             "available": False,
+            "kind": "import_failed",
             "reason": f"contracts schema re-export check failed: {exc!r}",
         }
 
@@ -96,6 +109,7 @@ def _probe_contracts_re_exports() -> dict[str, Any]:
     if drift:
         return {
             "available": False,
+            "kind": "drift",
             "reason": (
                 "graph_engine.models forked contracts schema for: "
                 f"{drift}; CLAUDE.md violation (only contracts owns "
@@ -176,28 +190,44 @@ class _HealthProbe:
         }
 
         # Invariant 1: contracts re-exports are identity (no fork —
-        # CLAUDE.md domain rule).
+        # CLAUDE.md domain rule). Codex review #11 P2 fix: probe now
+        # tags failures with ``kind`` (``import_unavailable`` vs
+        # ``drift`` vs ``import_failed``) so we don't substring-match
+        # reason strings — the previous matcher (``"could not import"``
+        # / ``"import failed"``) never matched the actual reason text
+        # (``"contracts schema re-export check failed: ..."``), making
+        # the offline-first ``degraded`` branch unreachable. Now we
+        # branch on ``kind`` directly.
         re_exports = _probe_contracts_re_exports()
         details["contracts_re_exports"] = re_exports
-        # Treat missing contracts as ``degraded`` (offline-first dev
-        # venv without [contracts-schemas] extra is allowed); fork
-        # detection is fatal (``blocked``).
         if not re_exports["available"]:
-            if "could not import" in re_exports.get("reason", "") or (
-                "import failed" in re_exports.get("reason", "")
-            ):
+            kind = re_exports.get("kind")
+            if kind == "import_unavailable":
                 status_after_re_exports = _DEGRADED
                 message_after_re_exports = (
                     "graph-engine running in dev-only mode (contracts not "
                     "importable; functional path unavailable)"
                 )
-            else:
+            elif kind == "drift":
                 return self._build_result(
                     started_at,
                     status=_DOWN,
                     message=(
                         "graph-engine contracts re-exports forked from "
                         "contracts package — domain invariant violated"
+                    ),
+                    details=details,
+                )
+            else:
+                # ``import_failed`` (defensive catch) or unknown — treat
+                # as blocked since we can't tell whether contracts is
+                # missing or broken.
+                return self._build_result(
+                    started_at,
+                    status=_DOWN,
+                    message=(
+                        "graph-engine contracts re-export check failed "
+                        "with unknown error kind — investigate"
                     ),
                     details=details,
                 )
