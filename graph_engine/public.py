@@ -52,7 +52,7 @@ from graph_engine.version import __version__ as _GRAPH_ENGINE_VERSION
 
 _HEALTHY: Final[str] = "healthy"
 _DEGRADED: Final[str] = "degraded"
-_DOWN: Final[str] = "down"
+_DOWN: Final[str] = "blocked"
 
 # Ex types graph-engine CONSUMES (from contracts). graph-engine does
 # NOT produce Ex-1/2/3 wire payloads (it consumes Ex-3 / writes Layer
@@ -151,10 +151,28 @@ class _HealthProbe:
     do IO.
     """
 
+    _PROBE_NAME: Final[str] = "graph_engine.health"
+
     def check(self, *, timeout_sec: float) -> dict[str, Any]:
+        # Stage 4 §4.3 Lite-stack e2e fix: assembly's
+        # ``HealthResult.model_validate`` (per ``assembly.contracts.models
+        # .HealthResult``) requires ``module_id``/``probe_name``/
+        # ``latency_ms``/``message`` in addition to the ``status``/
+        # ``details`` block. Status enum must be one of
+        # ``healthy``/``degraded``/``blocked`` (NOT ``"down"`` — that
+        # was an internal nomenclature that diverged from the assembly
+        # contract). The previous return shape returned only
+        # ``status``/``details``/``timeout_sec`` and used ``"down"``,
+        # which made assembly's e2e healthcheck collapse this module to
+        # ``blocked`` with a generic "validation failed" message,
+        # blocking Stage 4 §4.3 evidence collection.
+        from time import perf_counter
+
+        started_at = perf_counter()
         details: dict[str, Any] = {
             "consumed_ex_types": list(_CONSUMED_EX_TYPES),
             "canonical_truth_layer": "iceberg",
+            "timeout_sec": timeout_sec,
         }
 
         # Invariant 1: contracts re-exports are identity (no fork —
@@ -163,20 +181,31 @@ class _HealthProbe:
         details["contracts_re_exports"] = re_exports
         # Treat missing contracts as ``degraded`` (offline-first dev
         # venv without [contracts-schemas] extra is allowed); fork
-        # detection is fatal (``down``).
+        # detection is fatal (``blocked``).
         if not re_exports["available"]:
             if "could not import" in re_exports.get("reason", "") or (
                 "import failed" in re_exports.get("reason", "")
             ):
                 status_after_re_exports = _DEGRADED
+                message_after_re_exports = (
+                    "graph-engine running in dev-only mode (contracts not "
+                    "importable; functional path unavailable)"
+                )
             else:
-                return {
-                    "status": _DOWN,
-                    "details": details,
-                    "timeout_sec": timeout_sec,
-                }
+                return self._build_result(
+                    started_at,
+                    status=_DOWN,
+                    message=(
+                        "graph-engine contracts re-exports forked from "
+                        "contracts package — domain invariant violated"
+                    ),
+                    details=details,
+                )
         else:
             status_after_re_exports = _HEALTHY
+            message_after_re_exports = (
+                "graph-engine contracts re-exports identity verified"
+            )
 
         # Invariant 2: Neo4jGraphStatus.graph_status Literal stable
         # (CLAUDE.md §10 #7 status guard depends on this exact 3-state
@@ -184,16 +213,40 @@ class _HealthProbe:
         status_enum = _probe_neo4j_status_literal()
         details["neo4j_status_literal"] = status_enum
         if not status_enum["available"]:
-            return {
-                "status": _DOWN,
-                "details": details,
-                "timeout_sec": timeout_sec,
-            }
+            return self._build_result(
+                started_at,
+                status=_DOWN,
+                message=(
+                    "graph-engine Neo4jGraphStatus.graph_status Literal "
+                    "drifted — CLAUDE.md §10 #7 status guard broken"
+                ),
+                details=details,
+            )
+
+        return self._build_result(
+            started_at,
+            status=status_after_re_exports,
+            message=message_after_re_exports,
+            details=details,
+        )
+
+    def _build_result(
+        self,
+        started_at: float,
+        *,
+        status: str,
+        message: str,
+        details: dict[str, Any],
+    ) -> dict[str, Any]:
+        from time import perf_counter
 
         return {
-            "status": status_after_re_exports,
+            "module_id": "graph-engine",
+            "probe_name": self._PROBE_NAME,
+            "status": status,
+            "latency_ms": max(0.0, (perf_counter() - started_at) * 1000.0),
+            "message": message,
             "details": details,
-            "timeout_sec": timeout_sec,
         }
 
 
@@ -440,11 +493,18 @@ class _VersionDeclaration:
     """
 
     def declare(self) -> dict[str, Any]:
+        # Stage 4 §4.1.5: include compatible_contract_range so assembly's
+        # VersionInfo (model_config = ConfigDict(extra="forbid")) accepts
+        # this declaration. Without compatible_contract_range, VersionInfo
+        # validation reports `Field required` and the contract suite
+        # blocks Stage 4 promotion. The range matches the contracts
+        # package versions graph-engine is built against.
         return {
             "module_id": "graph-engine",
             "module_version": _GRAPH_ENGINE_VERSION,
-            "consumed_ex_types": list(_CONSUMED_EX_TYPES),
             "contract_version": self._safe_contract_version(),
+            "compatible_contract_range": ">=0.1.3,<0.2.0",
+            "consumed_ex_types": list(_CONSUMED_EX_TYPES),
             "neo4j_status_enum_values": self._safe_status_enum_values(),
             # CLAUDE.md §10 #1 truth-before-mirror invariant: Iceberg is
             # the canonical truth, Neo4j is the hot mirror only. Marker
