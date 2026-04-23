@@ -47,7 +47,10 @@ contracts-schemas = [
     "project-ult-contracts @ git+https://github.com/shenfanjie5-bit/project-ult-contracts.git@v0.1.3",
 ]
 shared-fixtures = [
-    "project-ult-audit-eval @ git+https://github.com/shenfanjie5-bit/project-ult-audit-eval.git@v0.2.2",
+    # Pinned to v0.2.4 (project-wide canonical_entity_id format
+    # reconciliation: every shared case now uses the runtime-aligned
+    # dot form ENT_STOCK_<symbol>.<exchange>).
+    "project-ult-audit-eval @ git+https://github.com/shenfanjie5-bit/project-ult-audit-eval.git@v0.2.4",
 ]
 
 [tool.setuptools.packages.find]
