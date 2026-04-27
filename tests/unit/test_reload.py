@@ -170,7 +170,7 @@ def test_cold_reload_success_path_uses_required_order_and_ready_metrics(
         projection_name: str,
     ) -> None:
         order.append("rebuild_gds_projection")
-        assert projection_client is client
+        assert getattr(projection_client, "_client", projection_client) is client
         assert projection_name == plan.projection_name
 
     def fake_check_live_graph_consistency(
@@ -239,7 +239,7 @@ def test_cold_reload_success_path_uses_required_order_and_ready_metrics(
     assert promotion_batch.delta_ids == []
     assert promotion_batch.node_records == plan.node_records
     assert promotion_batch.edge_records == plan.edge_records
-    assert captured_sync["client"] is client
+    assert getattr(captured_sync["client"], "_client", captured_sync["client"]) is client
     assert captured_sync["batch_size"] == 17
 
 
@@ -452,6 +452,57 @@ def test_cold_reload_timeout_during_blocking_stage_marks_failed(
     assert store.status.graph_status == "failed"
     assert "sync_live_graph" in order
     assert "mark_failed" in order
+    assert "mark_ready" not in order
+
+
+def test_cold_reload_timeout_blocks_background_post_timeout_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    store = InMemoryStatusStore(_status(graph_generation_id=3))
+    release_late_write = threading.Event()
+    late_write_finished = threading.Event()
+    client = MagicMock(spec=Neo4jClient)
+    client.execute_write.side_effect = AssertionError(
+        "timeout barrier must block post-timeout writes before Neo4j",
+    )
+
+    def blocking_sync_live_graph(
+        promotion_batch: PromotionPlan,
+        sync_client: Neo4jClient,
+        *,
+        batch_size: int,
+    ) -> None:
+        order.append("sync_live_graph")
+        release_late_write.wait(timeout=5)
+        try:
+            sync_client.execute_write("CREATE (:LateWriteAfterTimeout)", {})
+        except reload_service.ColdReloadTimeoutError:
+            order.append("late_write_blocked")
+        finally:
+            late_write_finished.set()
+
+    monkeypatch.setattr(reload_service, "sync_live_graph", blocking_sync_live_graph)
+
+    with pytest.raises(
+        reload_service.ColdReloadTimeoutError,
+        match="during sync_live_graph",
+    ):
+        reload_service.cold_reload(
+            "snapshot-ref-1",
+            client=client,
+            canonical_reader=StaticCanonicalReader(_reload_plan()),
+            status_manager=RecordingStatusManager(store, order),
+            schema_manager=RecordingSchemaManager(order),  # type: ignore[arg-type]
+            timeout_seconds=0.1,
+        )
+
+    release_late_write.set()
+    assert late_write_finished.wait(timeout=5)
+    client.execute_write.assert_not_called()
+    assert "late_write_blocked" in order
+    assert store.status is not None
+    assert store.status.graph_status == "failed"
     assert "mark_ready" not in order
 
 

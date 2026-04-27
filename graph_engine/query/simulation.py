@@ -299,7 +299,7 @@ class _ReadonlyProjectionClient:
         parameters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         params = parameters or {}
-        if "gds.graph.project" in query:
+        if _is_gds_projection_project(query):
             graph_name = _graph_name_from_parameters(params)
             self._require_owned_projection(graph_name)
             self._ensure_projection_available(graph_name)
@@ -327,6 +327,10 @@ class _ReadonlyProjectionClient:
         if "gds.graph.drop" in query:
             graph_name = _graph_name_from_parameters(params)
             self._require_owned_projection(graph_name)
+            if not _is_gds_projection_drop(query):
+                raise PermissionError(
+                    "readonly simulation only permits scoped GDS projection drop",
+                )
             if graph_name not in self._created_projection_names:
                 raise PermissionError(
                     "readonly simulation cannot drop a projection it did not create",
@@ -591,6 +595,20 @@ def _all_edge_ids(edge_ids_by_channel: Mapping[str, list[str]]) -> list[str]:
 
 def _is_gds_graph_exists(query: str) -> bool:
     return "gds.graph.exists" in query
+
+
+def _is_gds_projection_project(query: str) -> bool:
+    return "gds.graph.project" in query
+
+
+def _is_gds_projection_drop(query: str) -> bool:
+    return _normalized_cypher(query) == (
+        "call gds.graph.drop($graph_name) yield graphname return graphname"
+    )
+
+
+def _normalized_cypher(query: str) -> str:
+    return " ".join(query.lower().split())
 
 
 def _is_activated_path_read(query: str) -> bool:

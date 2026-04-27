@@ -505,6 +505,39 @@ RETURN path_score
         )
 
 
+def test_readonly_simulation_blocks_propagation_mutation_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeSimulationClient()
+
+    def run_full(
+        context: PropagationContext,
+        run_client: Any,
+        *,
+        status_manager: Any,
+        graph_name: str | None = None,
+        max_iterations: int = 20,
+        result_limit: int = 100,
+    ) -> PropagationResult:
+        run_client.execute_write(
+            "MATCH (n:Entity) SET n.readonly_escape = true RETURN n",
+            {},
+        )
+        raise AssertionError("readonly mutation candidate should be blocked")
+
+    monkeypatch.setattr(simulation_module, "run_full_propagation", run_full)
+
+    with pytest.raises(PermissionError, match="GDS projection writes"):
+        simulate_readonly_impact(
+            ["entity-a"],
+            _request(),
+            client=client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
+        )
+
+    assert not any("readonly_escape" in query for query, _ in client.write_calls)
+
+
 def test_simulation_module_has_no_snapshot_writer_runtime_dependency() -> None:
     source = Path(simulation_module.__file__).read_text()
 

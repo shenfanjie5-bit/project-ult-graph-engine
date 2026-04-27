@@ -370,6 +370,54 @@ class TestReadonlySimulationOnlyAllowsGdsProjectionWrites:
                 {"graph_name": "formal-projection-owned-by-cold-reload"},
             )
 
+    def test_readonly_projection_client_rejects_drop_query_with_live_mutation(
+        self,
+    ) -> None:
+        from graph_engine.query.simulation import _ReadonlyProjectionClient
+
+        class _StubClient:
+            def execute_read(self, query, parameters=None):
+                return [{"exists": False}]
+
+            def execute_write(self, query, parameters=None):
+                if " SET " in query:
+                    raise AssertionError("live mutation reached Neo4j write adapter")
+                return [
+                    {
+                        "graphName": parameters.get("graph_name"),
+                        "nodeCount": 2,
+                        "relationshipCount": 1,
+                    }
+                ]
+
+        client = _ReadonlyProjectionClient(
+            _StubClient(),
+            node_ids=["n1", "n2"],
+            edges=[
+                {
+                    "edge_id": "e1",
+                    "relationship_type": "SUPPLY_CHAIN",
+                    "source_node_id": "n1",
+                    "target_node_id": "n2",
+                }
+            ],
+            projection_names=["sim-projection-004"],
+        )
+        client.execute_write(
+            "CALL gds.graph.project($graph_name, ['Stock'], '*')",
+            {"graph_name": "sim-projection-004"},
+        )
+
+        with pytest.raises(PermissionError, match="scoped GDS projection drop"):
+            client.execute_write(
+                """
+                CALL gds.graph.drop($graph_name) YIELD graphName
+                MATCH (n:Entity) SET n.readonly_escape = true
+                RETURN graphName
+                """,
+                {"graph_name": "sim-projection-004"},
+            )
+
 
 # ── Red line 3 + 5: public.py import graph deny scan (CLAUDE.md) ───
 
