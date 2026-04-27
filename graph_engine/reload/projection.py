@@ -23,7 +23,7 @@ def rebuild_gds_projection(client: Neo4jClient, projection_name: str) -> None:
                 },
             },
         }
-        for relationship_type in RelationshipType
+        for relationship_type in _existing_graph_engine_relationship_types(client)
     }
     _execute_gds_write(
         client,
@@ -52,6 +52,40 @@ def _drop_projection_if_exists(client: Neo4jClient, projection_name: str) -> Non
             "CALL gds.graph.drop($projection_name) YIELD graphName RETURN graphName",
             {"projection_name": projection_name},
         )
+
+
+def _existing_graph_engine_relationship_types(client: Neo4jClient) -> list[RelationshipType]:
+    rows = client.execute_read(
+        """
+MATCH ()-[relationship]->()
+RETURN collect(DISTINCT type(relationship)) AS relationship_types
+""",
+    )
+    raw_relationship_types = rows[0].get("relationship_types", []) if rows else []
+    if not isinstance(raw_relationship_types, list):
+        raw_relationship_types = []
+    live_relationship_types = {
+        str(relationship_type)
+        for relationship_type in raw_relationship_types
+        if str(relationship_type)
+    }
+    supported_relationship_types = {
+        relationship_type.value
+        for relationship_type in RelationshipType
+    }
+    unsupported_relationship_types = sorted(
+        live_relationship_types - supported_relationship_types,
+    )
+    if unsupported_relationship_types:
+        raise ValueError(
+            "live graph contains unsupported relationship types: "
+            + ", ".join(unsupported_relationship_types),
+        )
+    return [
+        relationship_type
+        for relationship_type in RelationshipType
+        if relationship_type.value in live_relationship_types
+    ]
 
 
 def _execute_gds_read(

@@ -609,13 +609,19 @@ def test_cold_reload_timeout_blocks_background_post_timeout_writes(
 
 def test_rebuild_gds_projection_drops_existing_projection_and_creates_full_projection() -> None:
     client = MagicMock(spec=Neo4jClient)
-    client.execute_read.return_value = [{"exists": True}]
+    client.execute_read.side_effect = [
+        [{"exists": True}],
+        [{"relationship_types": [RelationshipType.SUPPLY_CHAIN.value]}],
+    ]
 
     rebuild_gds_projection(client, "graph_engine_reload")
 
-    client.execute_read.assert_called_once()
-    assert "gds.graph.exists" in client.execute_read.call_args.args[0]
-    assert client.execute_read.call_args.args[1] == {"projection_name": "graph_engine_reload"}
+    assert client.execute_read.call_count == 2
+    assert "gds.graph.exists" in client.execute_read.call_args_list[0].args[0]
+    assert client.execute_read.call_args_list[0].args[1] == {
+        "projection_name": "graph_engine_reload",
+    }
+    assert "collect(DISTINCT type(relationship))" in client.execute_read.call_args_list[1].args[0]
     assert client.execute_write.call_count == 2
     drop_query, drop_parameters = client.execute_write.call_args_list[0].args
     create_query, create_parameters = client.execute_write.call_args_list[1].args
@@ -623,9 +629,7 @@ def test_rebuild_gds_projection_drops_existing_projection_and_creates_full_proje
     assert drop_parameters == {"projection_name": "graph_engine_reload"}
     assert "gds.graph.project" in create_query
     assert create_parameters["node_projection"] == [label.value for label in NodeLabel]
-    assert set(create_parameters["relationship_projection"]) == {
-        relationship_type.value for relationship_type in RelationshipType
-    }
+    assert set(create_parameters["relationship_projection"]) == {"SUPPLY_CHAIN"}
     assert create_parameters["relationship_projection"]["SUPPLY_CHAIN"]["properties"] == {
         "weight": {"property": "weight", "defaultValue": 1.0},
     }
@@ -633,12 +637,31 @@ def test_rebuild_gds_projection_drops_existing_projection_and_creates_full_proje
 
 def test_rebuild_gds_projection_creates_without_drop_when_projection_absent() -> None:
     client = MagicMock(spec=Neo4jClient)
-    client.execute_read.return_value = [{"exists": False}]
+    client.execute_read.side_effect = [
+        [{"exists": False}],
+        [{"relationship_types": [RelationshipType.EVENT_IMPACT.value]}],
+    ]
 
     rebuild_gds_projection(client, "graph_engine_reload")
 
     assert client.execute_write.call_count == 1
     assert "gds.graph.project" in client.execute_write.call_args.args[0]
+    assert set(client.execute_write.call_args.args[1]["relationship_projection"]) == {
+        "EVENT_IMPACT",
+    }
+
+
+def test_rebuild_gds_projection_rejects_unknown_live_relationship_types() -> None:
+    client = MagicMock(spec=Neo4jClient)
+    client.execute_read.side_effect = [
+        [{"exists": False}],
+        [{"relationship_types": ["UNKNOWN_EDGE"]}],
+    ]
+
+    with pytest.raises(ValueError, match="unsupported relationship types"):
+        rebuild_gds_projection(client, "graph_engine_reload")
+
+    client.execute_write.assert_not_called()
 
 
 def test_rebuild_gds_projection_normalizes_missing_gds_errors() -> None:
@@ -655,7 +678,10 @@ def test_rebuild_gds_projection_normalizes_missing_gds_errors() -> None:
 
 def test_rebuild_gds_projection_preserves_non_missing_gds_runtime_errors() -> None:
     client = MagicMock(spec=Neo4jClient)
-    client.execute_read.return_value = [{"exists": False}]
+    client.execute_read.side_effect = [
+        [{"exists": False}],
+        [{"relationship_types": [RelationshipType.SUPPLY_CHAIN.value]}],
+    ]
     client.execute_write.side_effect = RuntimeError("gds.graph.project failed at runtime")
 
     with pytest.raises(RuntimeError, match="failed at runtime"):

@@ -95,19 +95,24 @@ def read_live_graph_metric_payload(
         nodes = _permissive_list(row.get("nodes"))
         relationships = _permissive_list(row.get("relationships"))
 
+    normalized_nodes = [_jsonable_mapping(node) for node in nodes]
+    normalized_relationships = [
+        _jsonable_mapping(relationship)
+        for relationship in relationships
+    ]
     payload = {
         "node_count": node_count,
         "edge_count": edge_count,
-        "nodes": sorted_payload_list(nodes),
-        "relationships": sorted_payload_list(relationships),
+        "nodes": sorted_payload_list(normalized_nodes),
+        "relationships": sorted_payload_list(normalized_relationships),
     }
     return LiveGraphMetrics(
         node_count=node_count,
         edge_count=edge_count,
         key_label_counts=key_label_counts,
         checksum=checksum_payload(payload),
-        nodes=[dict(node) for node in nodes],
-        relationships=[dict(relationship) for relationship in relationships],
+        nodes=normalized_nodes,
+        relationships=normalized_relationships,
     )
 
 
@@ -219,3 +224,10 @@ def _jsonable(value: Any) -> Any:
     if callable(isoformat):
         return str(isoformat())
     return str(value)
+
+
+def _jsonable_mapping(value: Any) -> dict[str, Any]:
+    normalized = _jsonable(value)
+    if not isinstance(normalized, dict):
+        raise ValueError("Neo4j graph metrics payload contains a malformed mapping")
+    return normalized
