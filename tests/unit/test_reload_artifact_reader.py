@@ -157,6 +157,23 @@ def test_artifact_canonical_reader_reads_graph_snapshot_bundle(
     }
 
 
+def test_artifact_canonical_reader_does_not_parse_numeric_checksum_as_generation(
+    tmp_path: Path,
+) -> None:
+    graph_snapshot = _graph_snapshot().model_copy(
+        update={"graph_snapshot_id": "graph-snapshot-cycle-1-4-123456789012"},
+    )
+    artifact_path = tmp_path / "graph_snapshot.json"
+    _write_json(
+        artifact_path,
+        {"payload": {"graph_snapshot": graph_snapshot.model_dump(mode="json")}},
+    )
+
+    plan = ArtifactCanonicalReader().read_cold_reload_plan(str(artifact_path))
+
+    assert plan.expected_snapshot.graph_generation_id == 4
+
+
 def test_artifact_canonical_reader_resolves_relative_snapshot_ref_from_root(
     tmp_path: Path,
 ) -> None:

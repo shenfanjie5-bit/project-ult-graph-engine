@@ -82,7 +82,10 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _generation_id_from_snapshot_id(snapshot_id: str) -> int | None:
-    for part in reversed(snapshot_id.split("-")):
-        if part.isdecimal():
-            return int(part)
+    parts = snapshot_id.split("-")
+    if len(parts) < 4 or parts[0:2] != ["graph", "snapshot"]:
+        return None
+    generation_part = parts[-2]
+    if generation_part.isdecimal():
+        return int(generation_part)
     return None

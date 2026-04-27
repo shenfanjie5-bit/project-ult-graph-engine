@@ -298,9 +298,11 @@ def _graph_generation_id(
 
 def _generation_id_from_snapshot_id(snapshot_id: str) -> int | None:
     parts = snapshot_id.split("-")
-    for part in reversed(parts):
-        if part.isdecimal():
-            return int(part)
+    if len(parts) < 4 or parts[0:2] != ["graph", "snapshot"]:
+        return None
+    generation_part = parts[-2]
+    if generation_part.isdecimal():
+        return int(generation_part)
     return None
 
 

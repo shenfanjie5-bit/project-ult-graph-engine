@@ -27,6 +27,7 @@ from graph_engine.providers import (
     build_graph_phase1_provider,
     prove_cold_reload_artifact,
 )
+from graph_engine.providers.phase1 import _cycle_binding_from_phase0
 from graph_engine.reload import ArtifactCanonicalReader, CanonicalArtifactError
 from graph_engine.reload import service as reload_service
 from graph_engine.reload.service import metrics_snapshot_from_graph_snapshot
@@ -173,6 +174,28 @@ def test_phase1_provider_assets_have_required_ancestry() -> None:
     assert set(resources) == {GRAPH_PHASE1_RESOURCE_KEY}
 
 
+def test_phase1_requires_frozen_candidate_selection_ref() -> None:
+    with pytest.raises(ValueError, match="frozen selection_ref"):
+        _cycle_binding_from_phase0(
+            {"cycle_id": "CYCLE_20260427"},
+            context=object(),
+        )
+
+    with pytest.raises(ValueError, match="must expose cycle_id"):
+        _cycle_binding_from_phase0(
+            {"selection_ref": "cycle_candidate_selection:CYCLE_20260427"},
+            context=object(),
+        )
+
+    assert _cycle_binding_from_phase0(
+        {
+            "cycle_id": "CYCLE_20260427",
+            "selection_ref": "cycle_candidate_selection:CYCLE_20260427",
+        },
+        context=object(),
+    ) == ("CYCLE_20260427", "cycle_candidate_selection:CYCLE_20260427")
+
+
 def test_phase1_snapshot_runtime_missing_gds_fails_closed_without_artifact_write() -> None:
     client = MissingGDSClient()
     node_count, edge_count, key_label_counts, checksum = read_live_graph_metrics(  # type: ignore[arg-type]
@@ -284,6 +307,19 @@ def test_cold_reload_from_persisted_formal_artifact_succeeds(
     assert captured["batch_size"] == 17
     assert captured["promotion_batch"].node_records
     assert captured["promotion_batch"].edge_records
+
+
+def test_formal_artifact_writer_does_not_parse_numeric_checksum_as_generation(
+    tmp_path: Path,
+) -> None:
+    graph_snapshot = _graph_snapshot().model_copy(
+        update={"graph_snapshot_id": "graph-snapshot-cycle-1-4-123456789012"},
+    )
+    writer = FormalArtifactSnapshotWriter(tmp_path)
+
+    payload = writer.artifact_payload(graph_snapshot, _impact_snapshot())
+
+    assert payload["graph_generation_id"] == 4
 
 
 def _write_formal_artifact(tmp_path: Path) -> tuple[str, Neo4jGraphStatus]:

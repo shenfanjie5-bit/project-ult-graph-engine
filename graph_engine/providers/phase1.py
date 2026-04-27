@@ -442,22 +442,19 @@ def _cycle_binding_from_phase0(
     context: object,
 ) -> tuple[str, str]:
     cycle_id = _value_by_name(candidate_freeze, ("cycle_id",))
-    if cycle_id is None and isinstance(candidate_freeze, str) and candidate_freeze.startswith("CYCLE_"):
-        cycle_id = candidate_freeze
-    if cycle_id is None:
-        cycle_id = _context_tag(context, "cycle_id")
     if cycle_id is None or not str(cycle_id):
         raise ValueError(
-            "candidate_freeze Phase 0 dependency must expose cycle_id "
-            "or run tag 'cycle_id'",
+            "candidate_freeze Phase 0 dependency must expose cycle_id",
         )
 
     selection_ref = _value_by_name(
         candidate_freeze,
         ("selection_ref", "candidate_selection_ref", "snapshot_ref"),
     )
-    if selection_ref is None:
-        selection_ref = f"cycle_candidate_selection:{cycle_id}"
+    if selection_ref is None or not str(selection_ref):
+        raise ValueError(
+            "candidate_freeze Phase 0 dependency must expose frozen selection_ref",
+        )
     return str(cycle_id), str(selection_ref)
 
 
