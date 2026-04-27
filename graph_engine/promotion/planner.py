@@ -32,8 +32,18 @@ _STABLE_CONTRACT_EDGE_TIMESTAMP_BASE = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _STABLE_CONTRACT_EDGE_TIMESTAMP_SPAN_SECONDS = 10 * 365 * 24 * 60 * 60
 _InternalContractDeltaType = Literal["edge_add"]
 _CONTRACT_DELTA_TYPE_TO_INTERNAL: Mapping[str, _InternalContractDeltaType] = {
+    "add": "edge_add",
+    "add_edge": "edge_add",
     "upsert_edge": "edge_add",
     "upsert_relation": "edge_add",
+}
+_CONTRACT_RELATION_TYPE_TO_INTERNAL: Mapping[str, str] = {
+    **{
+        relationship.value.lower(): relationship.value
+        for relationship in RelationshipType
+    },
+    "supplier_of": RelationshipType.SUPPLY_CHAIN.value,
+    "supply_contract": RelationshipType.SUPPLY_CHAIN.value,
 }
 
 
@@ -84,7 +94,9 @@ def freeze_contract_deltas(
 def _internal_delta_type_for_contract_delta(
     contract_delta: CandidateGraphDelta,
 ) -> _InternalContractDeltaType:
-    delta_type = _CONTRACT_DELTA_TYPE_TO_INTERNAL.get(contract_delta.delta_type)
+    delta_type = _CONTRACT_DELTA_TYPE_TO_INTERNAL.get(
+        _contract_token(contract_delta.delta_type),
+    )
     if delta_type is None:
         raise ValueError(
             "unsupported contract delta_type "
@@ -261,12 +273,32 @@ def _edge_payload_from_contract_delta(
         "edge_id": contract_delta.delta_id,
         "source_node_id": contract_delta.source_node,
         "target_node_id": contract_delta.target_node,
-        "relationship_type": contract_delta.relation_type,
+        "relationship_type": _internal_relationship_type_for_contract_delta(
+            contract_delta,
+        ),
         "properties": properties,
         "weight": _edge_weight(properties),
         "created_at": created_at,
         "updated_at": created_at,
     }
+
+
+def _internal_relationship_type_for_contract_delta(
+    contract_delta: CandidateGraphDelta,
+) -> str:
+    relationship_type = _CONTRACT_RELATION_TYPE_TO_INTERNAL.get(
+        _contract_token(contract_delta.relation_type),
+    )
+    if relationship_type is None:
+        raise ValueError(
+            "unsupported contract relation_type "
+            f"{contract_delta.relation_type!r} for delta {contract_delta.delta_id}",
+        )
+    return relationship_type
+
+
+def _contract_token(value: str) -> str:
+    return value.strip().lower().replace("-", "_")
 
 
 def _edge_payload_with_evidence_refs(

@@ -10,7 +10,15 @@ from time import monotonic
 from typing import Any, TypeVar, cast
 
 from graph_engine.client import Neo4jClient
-from graph_engine.models import ColdReloadPlan, GraphMetricsSnapshot, Neo4jGraphStatus, PromotionPlan
+from graph_engine.evidence import evidence_refs_from_value
+from graph_engine.live_metrics import checksum_payload, sorted_payload_list
+from graph_engine.models import (
+    ColdReloadPlan,
+    GraphMetricsSnapshot,
+    GraphSnapshot,
+    Neo4jGraphStatus,
+    PromotionPlan,
+)
 from graph_engine.reload.interfaces import CanonicalReader
 from graph_engine.reload.projection import rebuild_gds_projection
 from graph_engine.schema.manager import DROP_ALL_CONFIRMATION_TOKEN, SchemaManager
@@ -153,6 +161,163 @@ def build_reload_promotion_plan(
         assertion_records=plan.assertion_records,
         created_at=plan.created_at,
     )
+
+
+def metrics_snapshot_from_graph_snapshot(
+    graph_snapshot: GraphSnapshot,
+    *,
+    graph_generation_id: int,
+) -> GraphMetricsSnapshot:
+    """Derive reload consistency metrics from a live-metric-shaped GraphSnapshot."""
+
+    key_label_counts: dict[str, int] = {}
+    nodes: list[dict[str, Any]] = []
+    for node in graph_snapshot.nodes:
+        labels = sorted(str(label) for label in node.labels)
+        _validate_single_label_node(node.node_id, labels)
+        for label in labels:
+            key_label_counts[label] = key_label_counts.get(label, 0) + 1
+        properties = dict(node.properties)
+        _validate_live_metric_node_properties(node, labels[0], properties)
+        nodes.append(
+            {
+                "labels": labels,
+                "node_id": node.node_id,
+                "canonical_entity_id": (
+                    node.entity.entity_id
+                    if node.entity is not None
+                    else properties.get("canonical_entity_id")
+                ),
+                "properties": properties,
+            },
+        )
+
+    relationships: list[dict[str, Any]] = []
+    for edge in graph_snapshot.edges:
+        properties = dict(edge.properties)
+        _validate_live_metric_edge_properties(edge, properties)
+        evidence_refs = evidence_refs_from_value(edge.evidence_refs)
+        if evidence_refs:
+            properties["evidence_refs"] = evidence_refs
+        relationships.append(
+            {
+                "source_node_id": edge.source_node,
+                "target_node_id": edge.target_node,
+                "relationship_type": edge.relation_type,
+                "edge_id": edge.edge_id,
+                "properties": properties,
+            },
+        )
+
+    payload = {
+        "node_count": graph_snapshot.node_count,
+        "edge_count": graph_snapshot.edge_count,
+        "nodes": sorted_payload_list(nodes),
+        "relationships": sorted_payload_list(relationships),
+    }
+    return GraphMetricsSnapshot(
+        cycle_id=graph_snapshot.cycle_id,
+        snapshot_id=graph_snapshot.graph_snapshot_id,
+        graph_generation_id=graph_generation_id,
+        node_count=graph_snapshot.node_count,
+        edge_count=graph_snapshot.edge_count,
+        key_label_counts=key_label_counts,
+        checksum=checksum_payload(payload),
+        created_at=graph_snapshot.created_at,
+    )
+
+
+def _validate_single_label_node(node_id: str, labels: list[str]) -> None:
+    if len(labels) != 1:
+        raise ValueError(
+            "cold reload GraphSnapshot bridge requires single-label nodes; "
+            f"node {node_id!r} has labels {labels!r}",
+        )
+
+
+def _validate_live_metric_node_properties(
+    node: Any,
+    label: str,
+    properties: dict[str, Any],
+) -> None:
+    _require_snapshot_properties(
+        "node",
+        node.node_id,
+        properties,
+        {"node_id", "label", "properties_json", "created_at", "updated_at"},
+    )
+    mismatches = []
+    if properties.get("node_id") != node.node_id:
+        mismatches.append("node_id")
+    if properties.get("label") != label:
+        mismatches.append("label")
+    if node.entity is not None:
+        _require_snapshot_properties(
+            "node",
+            node.node_id,
+            properties,
+            {"canonical_entity_id"},
+        )
+        if properties.get("canonical_entity_id") != node.entity.entity_id:
+            mismatches.append("canonical_entity_id")
+    if mismatches:
+        raise ValueError(
+            "cold reload GraphSnapshot bridge requires live-metric-shaped "
+            f"node properties for {node.node_id!r}; mismatched "
+            + ", ".join(mismatches),
+        )
+
+
+def _validate_live_metric_edge_properties(
+    edge: Any,
+    properties: dict[str, Any],
+) -> None:
+    _require_snapshot_properties(
+        "edge",
+        edge.edge_id,
+        properties,
+        {
+            "edge_id",
+            "source_node_id",
+            "target_node_id",
+            "relationship_type",
+            "weight",
+            "properties_json",
+            "created_at",
+            "updated_at",
+        },
+    )
+    mismatches = [
+        field_name
+        for field_name, expected_value in (
+            ("edge_id", edge.edge_id),
+            ("source_node_id", edge.source_node),
+            ("target_node_id", edge.target_node),
+            ("relationship_type", edge.relation_type),
+        )
+        if properties.get(field_name) != expected_value
+    ]
+    if mismatches:
+        raise ValueError(
+            "cold reload GraphSnapshot bridge requires live-metric-shaped "
+            f"edge properties for {edge.edge_id!r}; mismatched "
+            + ", ".join(mismatches),
+        )
+
+
+def _require_snapshot_properties(
+    object_kind: str,
+    object_id: str,
+    properties: dict[str, Any],
+    required_keys: set[str],
+) -> None:
+    missing_keys = sorted(required_keys - set(properties))
+    if missing_keys:
+        raise ValueError(
+            "cold reload GraphSnapshot bridge requires live-metric-shaped "
+            f"{object_kind} properties for {object_id!r}; missing "
+            + ", ".join(missing_keys),
+        )
 
 
 class _ExpectedSnapshotReader:

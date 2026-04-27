@@ -291,6 +291,35 @@ def test_contract_delta_upsert_relation_maps_to_edge_promotion() -> None:
     assert plan.edge_records[0].relationship_type == contract_delta.relation_type
 
 
+@pytest.mark.parametrize(
+    ("delta_type", "relation_type"),
+    [
+        ("add_edge", "supply_contract"),
+        ("add", "supplier_of"),
+    ],
+)
+def test_contract_delta_external_ex3_terms_map_to_supply_chain_edge_promotion(
+    delta_type: str,
+    relation_type: str,
+) -> None:
+    contract_delta = _contract_delta(
+        delta_type=delta_type,
+        relation_type=relation_type,
+    )
+
+    plan = promote_graph_deltas(
+        "cycle-1",
+        "selection-1",
+        candidate_reader=FakeCandidateReader([contract_delta]),
+        entity_reader=_contract_entity_reader(),
+        canonical_writer=FakeCanonicalWriter(),
+        sync_to_live_graph=False,
+    )
+
+    assert [edge.edge_id for edge in plan.edge_records] == [contract_delta.delta_id]
+    assert plan.edge_records[0].relationship_type == RelationshipType.SUPPLY_CHAIN.value
+
+
 def test_contract_delta_evidence_flows_through_promotion_to_impact_snapshot() -> None:
     contract_delta = CandidateGraphDelta(
         delta_id="contract-edge-1",
@@ -525,6 +554,11 @@ def test_promote_graph_deltas_writes_canonical_before_live_graph(
 
     mock_client = MagicMock(spec=Neo4jClient)
     monkeypatch.setattr(service_module, "sync_live_graph", fake_sync_live_graph)
+    monkeypatch.setattr(
+        service_module,
+        "read_live_graph_metrics",
+        lambda client: (4, 3, {"Entity": 4}, "checksum-after-sync"),
+    )
     writer = FakeCanonicalWriter(calls)
 
     plan = promote_graph_deltas(
@@ -546,8 +580,16 @@ def test_promote_graph_deltas_writes_canonical_before_live_graph(
     assert locked_status.graph_status == "ready"
     assert locked_status.writer_lock_token is not None
     assert finish_expected == locked_status
-    assert finish_ready == _status()
-    assert store.status == _status()
+    assert finish_ready.graph_status == "ready"
+    assert finish_ready.writer_lock_token is None
+    assert finish_ready.graph_generation_id == _status().graph_generation_id + 1
+    assert finish_ready.node_count == 4
+    assert finish_ready.edge_count == 3
+    assert finish_ready.key_label_counts == {"Entity": 4}
+    assert finish_ready.checksum == "checksum-after-sync"
+    assert finish_ready.last_verified_at is not None
+    assert finish_ready.last_reload_at == _status().last_reload_at
+    assert store.status == finish_ready
 
 
 def test_promote_graph_deltas_does_not_sync_when_canonical_write_fails(
@@ -788,13 +830,14 @@ def _contract_delta(
     delta_type: str = "upsert_edge",
     source_node: str = "node-1",
     target_node: str = "node-2",
+    relation_type: str = RelationshipType.SUPPLY_CHAIN.value,
 ) -> CandidateGraphDelta:
     return CandidateGraphDelta(
         delta_id=delta_id,
         delta_type=delta_type,
         source_node=source_node,
         target_node=target_node,
-        relation_type=RelationshipType.SUPPLY_CHAIN.value,
+        relation_type=relation_type,
         properties={"weight": 0.7},
         evidence=[f"fact-{delta_id}"],
         subsystem_id="subsystem-news",

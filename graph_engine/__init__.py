@@ -24,6 +24,7 @@ from graph_engine.reload import (
     CanonicalReader,
     ColdReloadTimeoutError,
     cold_reload,
+    metrics_snapshot_from_graph_snapshot,
     rebuild_gds_projection,
 )
 from graph_engine.schema import (
@@ -79,6 +80,7 @@ __all__ = [
     "get_index_statements",
     "hold_ready_read",
     "load_config_from_env",
+    "metrics_snapshot_from_graph_snapshot",
     "promote_graph_deltas",
     "query_propagation_paths",
     "query_subgraph",

@@ -10,7 +10,7 @@ import pytest
 from graph_engine.client import Neo4jClient
 from graph_engine.config import load_config_from_env
 from graph_engine.models import (
-    FrozenGraphDelta,
+    CandidateGraphDelta,
     GraphEdgeRecord,
     GraphNodeRecord,
     Neo4jGraphStatus,
@@ -32,20 +32,28 @@ NOW = datetime(2026, 4, 17, 1, 2, 3, tzinfo=timezone.utc)
 
 
 class StaticCandidateReader:
-    def __init__(self, deltas: list[FrozenGraphDelta]) -> None:
+    def __init__(self, deltas: list[CandidateGraphDelta]) -> None:
         self.deltas = deltas
 
     def read_candidate_graph_deltas(
         self,
         cycle_id: str,
         selection_ref: str,
-    ) -> list[FrozenGraphDelta]:
+    ) -> list[CandidateGraphDelta]:
         return self.deltas
 
 
 class StaticEntityReader:
-    def __init__(self, entity_ids: set[str]) -> None:
-        self.entity_ids = entity_ids
+    def __init__(self, node_entity_ids: dict[str, str]) -> None:
+        self.node_entity_ids = node_entity_ids
+        self.entity_ids = set(node_entity_ids.values())
+
+    def canonical_entity_ids_for_node_ids(self, node_ids: set[str]) -> dict[str, str]:
+        return {
+            node_id: self.node_entity_ids[node_id]
+            for node_id in node_ids
+            if node_id in self.node_entity_ids
+        }
 
     def existing_entity_ids(self, entity_ids: set[str]) -> set[str]:
         return entity_ids & self.entity_ids
@@ -64,25 +72,18 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
     prefix = f"promotion-sync-{uuid4().hex}"
     source_node_id = f"{prefix}-source"
     target_node_id = f"{prefix}-target"
-    assertion_id = f"{prefix}-assertion"
     edge_id = f"{prefix}-edge"
-    node_ids = [source_node_id, target_node_id, assertion_id]
+    node_ids = [source_node_id, target_node_id]
+    node_entity_ids = {
+        source_node_id: f"{prefix}-entity-source",
+        target_node_id: f"{prefix}-entity-target",
+    }
     deltas = [
-        _node_delta("delta-1", source_node_id, f"{prefix}-entity-source"),
-        _node_delta("delta-2", target_node_id, f"{prefix}-entity-target"),
-        _edge_delta(
-            "delta-3",
+        _contract_edge_delta(
+            edge_id,
             edge_id,
             source_node_id,
             target_node_id,
-            [f"{prefix}-entity-source", f"{prefix}-entity-target"],
-        ),
-        _assertion_delta(
-            "delta-4",
-            assertion_id,
-            source_node_id,
-            target_node_id,
-            [f"{prefix}-entity-source", f"{prefix}-entity-target"],
         ),
     ]
     writer = CapturingCanonicalWriter()
@@ -97,25 +98,31 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
         status_manager = GraphStatusManager(InMemoryStatusStore(_ready_status()))
 
         try:
+            sync_live_graph(
+                _direct_node_plan(
+                    source_node_id,
+                    target_node_id,
+                    source_entity_id=node_entity_ids[source_node_id],
+                    target_entity_id=node_entity_ids[target_node_id],
+                ),
+                client,
+            )
             for _ in range(2):
                 promote_graph_deltas(
                     "cycle-1",
                     "selection-1",
                     candidate_reader=StaticCandidateReader(deltas),
-                    entity_reader=StaticEntityReader(
-                        {f"{prefix}-entity-source", f"{prefix}-entity-target"},
-                    ),
+                    entity_reader=StaticEntityReader(node_entity_ids),
                     canonical_writer=writer,
                     client=client,
                     status_manager=status_manager,
                 )
 
-            counts = _live_graph_counts(client, node_ids, edge_id, assertion_id)
+            counts = _live_graph_counts(client, node_ids, edge_id)
             serialized_payloads = _live_graph_serialized_payloads(
                 client,
                 source_node_id,
                 edge_id,
-                assertion_id,
             )
         finally:
             client.execute_write(
@@ -127,8 +134,6 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
     assert counts == {
         "business_nodes": 2,
         "business_edges": 1,
-        "assertion_nodes": 1,
-        "assertion_links": 2,
     }
     assert serialized_payloads == {
         "node_properties_json": _json_payload(_node_properties(source_node_id)),
@@ -140,8 +145,6 @@ def test_repeated_promotion_sync_is_idempotent_in_live_graph() -> None:
         "edge_metadata": None,
         "edge_mixed_aliases": None,
         "edge_properties": None,
-        "assertion_evidence_json": _json_payload(_assertion_evidence()),
-        "assertion_evidence": None,
     }
 
 
@@ -218,7 +221,6 @@ def _live_graph_counts(
     client: Neo4jClient,
     node_ids: list[str],
     edge_id: str,
-    assertion_id: str,
 ) -> dict[str, int]:
     rows = client.execute_read(
         """
@@ -226,24 +228,17 @@ MATCH (business_node)
 WHERE business_node.node_id IN $business_node_ids
 WITH count(business_node) AS business_nodes
 MATCH ()-[business_edge:SUPPLY_CHAIN {edge_id: $edge_id}]->()
-WITH business_nodes, count(business_edge) AS business_edges
-MATCH (assertion:Assertion {node_id: $assertion_id})
-WITH business_nodes, business_edges, count(assertion) AS assertion_nodes
-MATCH ()-[assertion_link:ASSERTION_LINK {assertion_id: $assertion_id}]-()
-RETURN business_nodes, business_edges, assertion_nodes, count(assertion_link) AS assertion_links
+RETURN business_nodes, count(business_edge) AS business_edges
 """,
         {
-            "business_node_ids": node_ids[:2],
+            "business_node_ids": node_ids,
             "edge_id": edge_id,
-            "assertion_id": assertion_id,
         },
     )
     row = rows[0]
     return {
         "business_nodes": row["business_nodes"],
         "business_edges": row["business_edges"],
-        "assertion_nodes": row["assertion_nodes"],
-        "assertion_links": row["assertion_links"],
     }
 
 
@@ -251,13 +246,11 @@ def _live_graph_serialized_payloads(
     client: Neo4jClient,
     source_node_id: str,
     edge_id: str,
-    assertion_id: str,
 ) -> dict[str, object]:
     rows = client.execute_read(
         """
 MATCH (node {node_id: $source_node_id})
 MATCH ()-[edge:SUPPLY_CHAIN {edge_id: $edge_id}]->()
-MATCH (assertion:Assertion {node_id: $assertion_id})
 RETURN node.properties_json AS node_properties_json,
        node.integration_prefix AS node_integration_prefix,
        node.metadata AS node_metadata,
@@ -266,14 +259,11 @@ RETURN node.properties_json AS node_properties_json,
        edge.integration_prefix AS edge_integration_prefix,
        edge.metadata AS edge_metadata,
        edge.mixed_aliases AS edge_mixed_aliases,
-       edge.properties AS edge_properties,
-       assertion.evidence_json AS assertion_evidence_json,
-       assertion.evidence AS assertion_evidence
+       edge.properties AS edge_properties
 """,
         {
             "source_node_id": source_node_id,
             "edge_id": edge_id,
-            "assertion_id": assertion_id,
         },
     )
     return rows[0]
@@ -361,82 +351,56 @@ def _direct_sync_plan(
     )
 
 
-def _node_delta(
-    delta_id: str,
-    node_id: str,
-    canonical_entity_id: str,
-) -> FrozenGraphDelta:
-    return FrozenGraphDelta(
-        delta_id=delta_id,
+def _direct_node_plan(
+    source_node_id: str,
+    target_node_id: str,
+    *,
+    source_entity_id: str,
+    target_entity_id: str,
+) -> PromotionPlan:
+    return PromotionPlan(
         cycle_id="cycle-1",
-        delta_type="node_add",
-        source_entity_ids=[canonical_entity_id],
-        payload={
-            "node": {
-                "node_id": node_id,
-                "canonical_entity_id": canonical_entity_id,
-                "label": NodeLabel.ENTITY.value,
-                "properties": _node_properties(node_id),
-                "created_at": NOW,
-                "updated_at": NOW,
-            }
-        },
-        validation_status="frozen",
+        selection_ref="endpoint-node-seed",
+        delta_ids=[],
+        node_records=[
+            GraphNodeRecord(
+                node_id=source_node_id,
+                canonical_entity_id=source_entity_id,
+                label=NodeLabel.ENTITY.value,
+                properties=_node_properties(source_node_id),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            GraphNodeRecord(
+                node_id=target_node_id,
+                canonical_entity_id=target_entity_id,
+                label=NodeLabel.ENTITY.value,
+                properties=_node_properties(target_node_id),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        ],
+        edge_records=[],
+        assertion_records=[],
+        created_at=NOW,
     )
 
 
-def _edge_delta(
+def _contract_edge_delta(
     delta_id: str,
     edge_id: str,
     source_node_id: str,
     target_node_id: str,
-    source_entity_ids: list[str],
-) -> FrozenGraphDelta:
-    return FrozenGraphDelta(
+) -> CandidateGraphDelta:
+    return CandidateGraphDelta(
         delta_id=delta_id,
-        cycle_id="cycle-1",
-        delta_type="edge_add",
-        source_entity_ids=source_entity_ids,
-        payload={
-            "edge": {
-                "edge_id": edge_id,
-                "source_node_id": source_node_id,
-                "target_node_id": target_node_id,
-                "relationship_type": RelationshipType.SUPPLY_CHAIN.value,
-                "properties": _edge_properties(edge_id),
-                "weight": 0.7,
-                "created_at": NOW,
-                "updated_at": NOW,
-            }
-        },
-        validation_status="frozen",
-    )
-
-
-def _assertion_delta(
-    delta_id: str,
-    assertion_id: str,
-    source_node_id: str,
-    target_node_id: str,
-    source_entity_ids: list[str],
-) -> FrozenGraphDelta:
-    return FrozenGraphDelta(
-        delta_id=delta_id,
-        cycle_id="cycle-1",
-        delta_type="assertion_add",
-        source_entity_ids=source_entity_ids,
-        payload={
-            "assertion": {
-                "assertion_id": assertion_id,
-                "source_node_id": source_node_id,
-                "target_node_id": target_node_id,
-                "assertion_type": "integration",
-                "evidence": _assertion_evidence(),
-                "confidence": 0.9,
-                "created_at": NOW,
-            }
-        },
-        validation_status="frozen",
+        delta_type="add_edge",
+        source_node=source_node_id,
+        target_node=target_node_id,
+        relation_type="supply_contract",
+        properties=_edge_properties(edge_id),
+        evidence=[f"{edge_id}-fact"],
+        subsystem_id="subsystem-news",
     )
 
 

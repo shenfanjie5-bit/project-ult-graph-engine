@@ -2,11 +2,16 @@
 
 from graph_engine.reload.interfaces import CanonicalReader
 from graph_engine.reload.projection import rebuild_gds_projection
-from graph_engine.reload.service import ColdReloadTimeoutError, cold_reload
+from graph_engine.reload.service import (
+    ColdReloadTimeoutError,
+    cold_reload,
+    metrics_snapshot_from_graph_snapshot,
+)
 
 __all__ = [
     "CanonicalReader",
     "ColdReloadTimeoutError",
     "cold_reload",
+    "metrics_snapshot_from_graph_snapshot",
     "rebuild_gds_projection",
 ]

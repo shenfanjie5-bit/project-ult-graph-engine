@@ -7,11 +7,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from contracts.schemas.entities import EntityReference
+from contracts.schemas.graph import GraphEdge, GraphNode
 from graph_engine.client import Neo4jClient
 from graph_engine.models import (
     ColdReloadPlan,
     GraphEdgeRecord,
-    GraphMetricsSnapshot as GraphSnapshot,
+    GraphMetricsSnapshot,
+    GraphSnapshot,
     GraphNodeRecord,
     Neo4jGraphStatus,
     PromotionPlan,
@@ -241,6 +244,104 @@ def test_cold_reload_success_path_uses_required_order_and_ready_metrics(
     assert promotion_batch.edge_records == plan.edge_records
     assert getattr(captured_sync["client"], "_client", captured_sync["client"]) is client
     assert captured_sync["batch_size"] == 17
+
+
+def test_metrics_snapshot_from_graph_snapshot_derives_cold_reload_expected_snapshot() -> None:
+    graph_snapshot = GraphSnapshot(
+        graph_snapshot_id="graph-snapshot-cycle-1-4-abc",
+        cycle_id="cycle-1",
+        version="v0.1.3",
+        created_at=NOW,
+        node_count=2,
+        edge_count=1,
+        nodes=[
+            GraphNode(
+                node_id="node-2",
+                labels=["Entity"],
+                properties=_live_metric_node_properties(
+                    "node-2",
+                    "entity-2",
+                    label="Entity",
+                    source_properties={"ticker": "BBB"},
+                ),
+                entity=EntityReference(
+                    entity_id="entity-2",
+                    entity_type="equity",
+                    canonical_id_rule_version="ent-id-rule-v1",
+                ),
+            ),
+            GraphNode(
+                node_id="node-1",
+                labels=["Entity"],
+                properties=_live_metric_node_properties(
+                    "node-1",
+                    "entity-1",
+                    label="Entity",
+                    source_properties={"ticker": "AAA"},
+                ),
+                entity=EntityReference(
+                    entity_id="entity-1",
+                    entity_type="equity",
+                    canonical_id_rule_version="ent-id-rule-v1",
+                ),
+            ),
+        ],
+        edges=[
+            GraphEdge(
+                edge_id="edge-1",
+                source_node="node-1",
+                target_node="node-2",
+                relation_type=RelationshipType.SUPPLY_CHAIN.value,
+                properties=_live_metric_edge_properties(
+                    "edge-1",
+                    "node-1",
+                    "node-2",
+                    relationship_type=RelationshipType.SUPPLY_CHAIN.value,
+                    source_properties={"weight": 0.7, "evidence_refs": ["fact-edge-1"]},
+                ),
+                evidence_refs=["fact-edge-1"],
+            ),
+        ],
+    )
+
+    metrics = reload_service.metrics_snapshot_from_graph_snapshot(
+        graph_snapshot,
+        graph_generation_id=4,
+    )
+    repeated = reload_service.metrics_snapshot_from_graph_snapshot(
+        graph_snapshot,
+        graph_generation_id=4,
+    )
+
+    assert metrics == repeated
+    assert metrics.snapshot_id == graph_snapshot.graph_snapshot_id
+    assert metrics.graph_generation_id == 4
+    assert metrics.node_count == 2
+    assert metrics.edge_count == 1
+    assert metrics.key_label_counts == {"Entity": 2}
+    assert metrics.checksum
+
+
+def test_metrics_snapshot_from_graph_snapshot_rejects_compact_snapshot_properties() -> None:
+    graph_snapshot = _compact_graph_snapshot()
+
+    with pytest.raises(ValueError, match="live-metric-shaped node properties"):
+        reload_service.metrics_snapshot_from_graph_snapshot(
+            graph_snapshot,
+            graph_generation_id=4,
+        )
+
+
+def test_metrics_snapshot_from_graph_snapshot_rejects_multi_label_nodes() -> None:
+    graph_snapshot = _compact_graph_snapshot(
+        first_node_labels=["Entity", "Sector"],
+    )
+
+    with pytest.raises(ValueError, match="single-label nodes"):
+        reload_service.metrics_snapshot_from_graph_snapshot(
+            graph_snapshot,
+            graph_generation_id=4,
+        )
 
 
 @pytest.mark.parametrize(
@@ -616,8 +717,8 @@ def _status(
     )
 
 
-def _snapshot(*, graph_generation_id: int) -> GraphSnapshot:
-    return GraphSnapshot(
+def _snapshot(*, graph_generation_id: int) -> GraphMetricsSnapshot:
+    return GraphMetricsSnapshot(
         cycle_id="cycle-1",
         snapshot_id="snapshot-1",
         graph_generation_id=graph_generation_id,
@@ -651,3 +752,90 @@ def _edge_record() -> GraphEdgeRecord:
         created_at=NOW,
         updated_at=NOW,
     )
+
+
+def _compact_graph_snapshot(
+    *,
+    first_node_labels: list[str] | None = None,
+) -> GraphSnapshot:
+    return GraphSnapshot(
+        graph_snapshot_id="graph-snapshot-cycle-1-4-abc",
+        cycle_id="cycle-1",
+        version="v0.1.3",
+        created_at=NOW,
+        node_count=2,
+        edge_count=1,
+        nodes=[
+            GraphNode(
+                node_id="node-1",
+                labels=first_node_labels or ["Entity"],
+                properties={"ticker": "AAA"},
+                entity=EntityReference(
+                    entity_id="entity-1",
+                    entity_type="equity",
+                    canonical_id_rule_version="ent-id-rule-v1",
+                ),
+            ),
+            GraphNode(
+                node_id="node-2",
+                labels=["Entity"],
+                properties={"ticker": "BBB"},
+                entity=EntityReference(
+                    entity_id="entity-2",
+                    entity_type="equity",
+                    canonical_id_rule_version="ent-id-rule-v1",
+                ),
+            ),
+        ],
+        edges=[
+            GraphEdge(
+                edge_id="edge-1",
+                source_node="node-1",
+                target_node="node-2",
+                relation_type=RelationshipType.SUPPLY_CHAIN.value,
+                properties={"weight": 0.7},
+                evidence_refs=["fact-edge-1"],
+            ),
+        ],
+    )
+
+
+def _live_metric_node_properties(
+    node_id: str,
+    canonical_entity_id: str,
+    *,
+    label: str,
+    source_properties: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "node_id": node_id,
+        "canonical_entity_id": canonical_entity_id,
+        "label": label,
+        "properties_json": '{"ticker":"'
+        + str(source_properties["ticker"])
+        + '"}',
+        "created_at": NOW,
+        "updated_at": NOW,
+        **source_properties,
+    }
+
+
+def _live_metric_edge_properties(
+    edge_id: str,
+    source_node_id: str,
+    target_node_id: str,
+    *,
+    relationship_type: str,
+    source_properties: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "edge_id": edge_id,
+        "source_node_id": source_node_id,
+        "target_node_id": target_node_id,
+        "relationship_type": relationship_type,
+        "weight": source_properties["weight"],
+        "properties_json": '{"evidence_refs":["fact-edge-1"],"weight":0.7}',
+        "created_at": NOW,
+        "updated_at": NOW,
+        **source_properties,
+    }

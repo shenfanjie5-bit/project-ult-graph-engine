@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from contracts.schemas import CandidateGraphDelta
 
 from graph_engine.client import Neo4jClient
+from graph_engine.live_metrics import read_live_graph_metrics
 from graph_engine.models import Neo4jGraphStatus, PromotionPlan
 from graph_engine.promotion.interfaces import (
     CandidateDeltaReader,
@@ -90,7 +93,7 @@ def _sync_live_graph_with_status_barrier(
         )
         status_manager.finish_sync(
             expected_status=locked_status,
-            ready_status=ready_status,
+            ready_status=_ready_status_from_live_graph(client, ready_status),
         )
     except Exception:
         _mark_sync_failed_safely(status_manager, locked_status)
@@ -118,3 +121,20 @@ def _mark_sync_failed_safely(
         status_manager.mark_sync_failed(expected_status=locked_status)
     except Exception:  # noqa: BLE001 - preserve the original promotion sync failure.
         return
+
+
+def _ready_status_from_live_graph(
+    client: Neo4jClient,
+    previous_ready_status: Neo4jGraphStatus,
+) -> Neo4jGraphStatus:
+    node_count, edge_count, key_label_counts, checksum = read_live_graph_metrics(client)
+    return Neo4jGraphStatus(
+        graph_status="ready",
+        graph_generation_id=previous_ready_status.graph_generation_id + 1,
+        node_count=node_count,
+        edge_count=edge_count,
+        key_label_counts=key_label_counts,
+        checksum=checksum,
+        last_verified_at=datetime.now(timezone.utc),
+        last_reload_at=previous_ready_status.last_reload_at,
+    )
