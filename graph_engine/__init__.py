@@ -21,7 +21,10 @@ from graph_engine.models import (
 from graph_engine.promotion import promote_graph_deltas
 from graph_engine.query import query_propagation_paths, query_subgraph, simulate_readonly_impact
 from graph_engine.reload import (
+    ArtifactCanonicalReader,
     CanonicalReader,
+    CanonicalArtifactError,
+    CanonicalArtifactNotFound,
     ColdReloadTimeoutError,
     cold_reload,
     metrics_snapshot_from_graph_snapshot,
@@ -47,7 +50,10 @@ from graph_engine.status import (
 from graph_engine.version import __version__
 
 __all__ = [
+    "ArtifactCanonicalReader",
     "CandidateGraphDelta",
+    "CanonicalArtifactError",
+    "CanonicalArtifactNotFound",
     "CanonicalReader",
     "CanonicalSnapshotReader",
     "ColdReloadPlan",
