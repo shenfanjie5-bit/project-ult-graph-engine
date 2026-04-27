@@ -59,6 +59,21 @@ def test_artifact_canonical_reader_reads_persisted_cold_reload_plan(
     assert loaded == plan
 
 
+def test_artifact_canonical_reader_rejects_inconsistent_cold_reload_plan(
+    tmp_path: Path,
+) -> None:
+    plan = _reload_plan().model_copy(
+        update={"expected_snapshot": _snapshot(graph_generation_id=4).model_copy(
+            update={"node_count": 3},
+        )},
+    )
+    artifact_path = tmp_path / "cold_reload_plan.json"
+    _write_json(artifact_path, plan.model_dump(mode="json"))
+
+    with pytest.raises(CanonicalArtifactError, match="record counts disagree"):
+        ArtifactCanonicalReader().read_cold_reload_plan(str(artifact_path))
+
+
 def test_cold_reload_uses_persisted_artifact_reader_before_sync(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

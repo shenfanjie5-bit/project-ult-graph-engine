@@ -246,11 +246,19 @@ def _mapping_value(payload: Mapping[str, Any], *keys: str) -> Any:
 
 def _validate_plan(payload: Any, artifact_path: Path) -> ColdReloadPlan:
     try:
-        return ColdReloadPlan.model_validate(payload)
+        plan = ColdReloadPlan.model_validate(payload)
     except ValidationError as exc:
         raise CanonicalArtifactError(
             f"cold reload plan artifact is invalid: {artifact_path}",
         ) from exc
+    _validate_record_counts(
+        plan.expected_snapshot,
+        node_records=plan.node_records,
+        edge_records=plan.edge_records,
+        assertion_records=plan.assertion_records,
+        artifact_path=artifact_path,
+    )
+    return plan
 
 
 def _validate_graph_snapshot(payload: Any, artifact_path: Path) -> GraphSnapshot:
