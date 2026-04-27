@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import json
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
@@ -110,11 +111,11 @@ def load_synthetic_graph(
             f"MERGE (n:{_quote_identifier(label)} {{node_id: row.node_id}})\n"
             "SET n.canonical_entity_id = row.canonical_entity_id,\n"
             "    n.label = row.label,\n"
-            "    n.properties = row.properties,\n"
+            "    n.properties_json = row.properties_json,\n"
             "    n += row.properties"
         )
         for batch in _batched(rows, batch_size):
-            client.execute_write(query, {"rows": batch})
+            client.execute_write(query, {"rows": [_write_row(row) for row in batch]})
 
     node_labels_by_id = {_node_id(node): _row_string(node, "label") for node in nodes}
     edge_rows = _normalize_edge_rows(edges, node_labels_by_id)
@@ -129,11 +130,11 @@ def load_synthetic_graph(
             "{edge_id: row.edge_id}]->(target)\n"
             "SET r.relationship_type = row.relationship_type,\n"
             "    r.weight = row.weight,\n"
-            "    r.properties = row.properties,\n"
+            "    r.properties_json = row.properties_json,\n"
             "    r += row.properties"
         )
         for batch in _batched(rows, batch_size):
-            client.execute_write(query, {"rows": batch})
+            client.execute_write(query, {"rows": [_write_row(row) for row in batch]})
 
 
 def clear_graph(
@@ -216,6 +217,16 @@ def _normalize_edge_rows(
         )
         normalized_edges.append(normalized)
     return normalized_edges
+
+
+def _write_row(row: dict[str, Any]) -> dict[str, Any]:
+    write_row = dict(row)
+    properties = write_row.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    write_row["properties"] = dict(properties)
+    write_row["properties_json"] = json.dumps(properties, sort_keys=True)
+    return write_row
 
 
 def _edge_label(
