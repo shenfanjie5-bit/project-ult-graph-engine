@@ -281,10 +281,20 @@ class GraphPhase1AssetFactoryProvider:
         return ()
 
     def get_resources(self) -> Mapping[str, object]:
+        # Check runtime configuration BEFORE the dagster availability check
+        # so the error message ("not configured") is the one callers act on
+        # rather than the implicit "Dagster is required" prerequisite.
+        if self.runtime is None:
+            # Phase 0 pattern (M2.3a-2): raise an explicit error rather than
+            # silently substituting a fail-closed runtime that only surfaces
+            # at asset-evaluation time. The orchestrator's
+            # ``_resolve_graph_phase1_provider`` (or any caller) is expected
+            # to either pass a runtime explicitly or call
+            # ``build_graph_phase1_runtime_from_env`` ahead of time.
+            raise RuntimeError(_FAIL_CLOSED_RUNTIME_MESSAGE)
         dagster = _require_dagster()
-        runtime = self.runtime or _FailClosedGraphPhase1Runtime()
         return {
-            self.resource_key: dagster.ResourceDefinition.hardcoded_resource(runtime),
+            self.resource_key: dagster.ResourceDefinition.hardcoded_resource(self.runtime),
         }
 
 
@@ -294,12 +304,198 @@ def build_graph_phase1_provider(
     resource_key: str = GRAPH_PHASE1_RESOURCE_KEY,
     world_state_ref: str = "world-state:latest",
 ) -> GraphPhase1AssetFactoryProvider:
-    """Return an orchestrator-compatible graph Phase 1 provider."""
+    """Return an orchestrator-compatible graph Phase 1 provider.
 
+    If ``runtime`` is omitted, an env-driven runtime is constructed via
+    :func:`build_graph_phase1_runtime_from_env`. Callers that want
+    fail-closed behaviour on env misconfiguration must catch
+    :class:`EnvironmentError` (cf. orchestrator's
+    ``_resolve_graph_phase1_provider`` helper) or use
+    :func:`build_fail_closed_graph_phase1_provider` to obtain a provider
+    whose runtime is the typed fail-closed stub.
+    """
+
+    if runtime is None:
+        runtime = build_graph_phase1_runtime_from_env(
+            world_state_ref=world_state_ref,
+        )
     return GraphPhase1AssetFactoryProvider(
         runtime,
         resource_key=resource_key,
         world_state_ref=world_state_ref,
+    )
+
+
+def build_fail_closed_graph_phase1_provider(
+    *,
+    resource_key: str = GRAPH_PHASE1_RESOURCE_KEY,
+    world_state_ref: str = "world-state:latest",
+) -> GraphPhase1AssetFactoryProvider:
+    """Construct a Phase 1 provider whose runtime fails closed at evaluation.
+
+    Public alternative to ``build_graph_phase1_provider(runtime=
+    _FailClosedGraphPhase1Runtime())`` so callers (e.g. orchestrator's
+    ``_default_graph_phase1_provider`` fall-back) do not have to import
+    the leading-underscore private class across module boundaries.
+    """
+
+    return build_graph_phase1_provider(
+        runtime=_FailClosedGraphPhase1Runtime(),
+        resource_key=resource_key,
+        world_state_ref=world_state_ref,
+    )
+
+
+def build_graph_phase1_runtime_from_env(
+    *,
+    world_state_ref: str = "world-state:latest",
+    candidate_reader: CandidateDeltaReader | None = None,
+    entity_reader: EntityAnchorReader | None = None,
+    canonical_writer: CanonicalWriter | None = None,
+    regime_reader: RegimeContextReader | None = None,
+    snapshot_writer: SnapshotWriter | None = None,
+) -> GraphPhase1Runtime:
+    """Construct a real :class:`GraphPhase1Service` from environment variables.
+
+    Composes the cross-module adapters required by the Phase 1 service:
+
+    * :class:`graph_engine.client.Neo4jClient` from ``NEO4J_*`` env (graph-engine).
+    * :class:`graph_engine.status.GraphStatusManager` over
+      :class:`graph_engine.status.PostgreSQLStatusStore` from ``DATABASE_URL``.
+    * :class:`graph_engine.snapshots.FormalArtifactSnapshotWriter` from
+      ``GRAPH_PHASE1_SNAPSHOT_ARTIFACT_ROOT`` (snapshot-writer-internal env).
+    * data-platform's ``PostgresCandidateDeltaReader`` and
+      ``IcebergEntityAnchorReader`` for the contract delta / entity anchor
+      reads, plus its ``StubCanonicalGraphWriter`` for the promotion
+      write-back stub (M2.6 follow-up).
+    * main-core's ``PlaceholderRegimeContextReader`` (neutral 1.0
+      multipliers; M2.6 follow-up replaces with real regime mapping).
+
+    Each adapter override is a test seam — overriding all five is equivalent
+    to constructing :class:`GraphPhase1Service` directly. Raises
+    :class:`EnvironmentError` when env-driven construction of any required
+    piece fails (e.g. ``NEO4J_PASSWORD`` absent, optional cross-module
+    package not installed in the runtime env).
+    """
+
+    import os
+    from pathlib import Path
+
+    from graph_engine.client import Neo4jClient
+    from graph_engine.config import load_config_from_env
+    from graph_engine.snapshots import FormalArtifactSnapshotWriter
+    from graph_engine.status import GraphStatusManager, PostgreSQLStatusStore
+
+    # --- graph-engine internals (NEO4J_* + DATABASE_URL) -------------------
+
+    try:
+        neo4j_config = load_config_from_env()
+    except (ValueError, RuntimeError) as exc:
+        raise EnvironmentError(
+            "Phase 1 runtime requires NEO4J_URI/USER/PASSWORD/DATABASE for "
+            "the live-graph client",
+        ) from exc
+
+    try:
+        store = PostgreSQLStatusStore.from_database_url()
+    except (RuntimeError, ValueError) as exc:
+        raise EnvironmentError(
+            "Phase 1 runtime requires DATABASE_URL pointing at the "
+            "PostgreSQL instance hosting neo4j_graph_status",
+        ) from exc
+
+    client = Neo4jClient(neo4j_config)
+    status_manager = GraphStatusManager(store)
+
+    # --- snapshot writer (graph-engine, FormalArtifactSnapshotWriter) -------
+
+    if snapshot_writer is None:
+        artifact_root = os.environ.get("GRAPH_PHASE1_SNAPSHOT_ARTIFACT_ROOT")
+        if not artifact_root:
+            raise EnvironmentError(
+                "Phase 1 runtime requires GRAPH_PHASE1_SNAPSHOT_ARTIFACT_ROOT "
+                "for the formal artifact snapshot writer",
+            )
+        snapshot_writer = FormalArtifactSnapshotWriter(Path(artifact_root))
+
+    # --- cross-module adapters (data-platform + main-core) ------------------
+    #
+    # All three data-platform adapters live in the same module — load them
+    # in a single try/except block so they either all succeed or all fail
+    # (the real semantics; they are co-located in
+    # ``data_platform.cycle.graph_phase1_adapters``). Each adapter
+    # ``from_env()`` constructor is then called inside its own guard so a
+    # ``pydantic.ValidationError`` / ``ValueError`` from a future env-aware
+    # constructor surfaces as ``EnvironmentError`` per the docstring contract.
+
+    if (
+        candidate_reader is None
+        or entity_reader is None
+        or canonical_writer is None
+    ):
+        try:
+            from data_platform.cycle.graph_phase1_adapters import (
+                IcebergEntityAnchorReader,
+                PostgresCandidateDeltaReader,
+                StubCanonicalGraphWriter,
+            )
+        except ImportError as exc:
+            raise EnvironmentError(
+                "Phase 1 runtime requires data-platform "
+                "(data_platform.cycle.graph_phase1_adapters) to be installed",
+            ) from exc
+
+        if candidate_reader is None:
+            try:
+                candidate_reader = PostgresCandidateDeltaReader.from_env()
+            except (ValueError, RuntimeError) as exc:
+                raise EnvironmentError(
+                    "data-platform PostgresCandidateDeltaReader.from_env() failed",
+                ) from exc
+
+        if entity_reader is None:
+            try:
+                entity_reader = IcebergEntityAnchorReader.from_env()
+            except (ValueError, RuntimeError) as exc:
+                raise EnvironmentError(
+                    "data-platform IcebergEntityAnchorReader.from_env() failed",
+                ) from exc
+
+        if canonical_writer is None:
+            try:
+                canonical_writer = StubCanonicalGraphWriter.from_env()
+            except (ValueError, RuntimeError) as exc:
+                raise EnvironmentError(
+                    "data-platform StubCanonicalGraphWriter.from_env() failed",
+                ) from exc
+
+    if regime_reader is None:
+        try:
+            from main_core.adapters.graph_engine import (
+                build_regime_context_reader_from_env,
+            )
+        except ImportError as exc:
+            raise EnvironmentError(
+                "Phase 1 runtime requires main-core "
+                "(main_core.adapters.graph_engine) to be installed",
+            ) from exc
+        try:
+            regime_reader = build_regime_context_reader_from_env()
+        except (ValueError, RuntimeError) as exc:
+            raise EnvironmentError(
+                "main-core build_regime_context_reader_from_env() failed",
+            ) from exc
+
+    # --- compose the real service ------------------------------------------
+
+    return GraphPhase1Service(
+        candidate_reader=candidate_reader,
+        entity_reader=entity_reader,
+        canonical_writer=canonical_writer,
+        client=client,
+        status_manager=status_manager,
+        regime_reader=regime_reader,
+        snapshot_writer=snapshot_writer,
     )
 
 
