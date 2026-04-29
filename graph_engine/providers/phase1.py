@@ -366,10 +366,11 @@ def build_graph_phase1_runtime_from_env(
       ``GRAPH_PHASE1_SNAPSHOT_ARTIFACT_ROOT`` (snapshot-writer-internal env).
     * data-platform's ``PostgresCandidateDeltaReader`` and
       ``IcebergEntityAnchorReader`` for the contract delta / entity anchor
-      reads, plus its ``StubCanonicalGraphWriter`` for the promotion
-      write-back stub (M2.6 follow-up).
+      reads, plus its ``IcebergCanonicalGraphWriter`` for the real
+      promotion write-back to ``canonical.graph_*`` Iceberg tables (M2.6
+      follow-up #1 replaced the M2.3a-2 ``StubCanonicalGraphWriter``).
     * main-core's ``PlaceholderRegimeContextReader`` (neutral 1.0
-      multipliers; M2.6 follow-up replaces with real regime mapping).
+      multipliers; M2.6 follow-up #2 replaces with real regime mapping).
 
     Each adapter override is a test seam — overriding all five is equivalent
     to constructing :class:`GraphPhase1Service` directly. Raises
@@ -435,9 +436,9 @@ def build_graph_phase1_runtime_from_env(
     ):
         try:
             from data_platform.cycle.graph_phase1_adapters import (
+                IcebergCanonicalGraphWriter,
                 IcebergEntityAnchorReader,
                 PostgresCandidateDeltaReader,
-                StubCanonicalGraphWriter,
             )
         except ImportError as exc:
             raise EnvironmentError(
@@ -462,11 +463,15 @@ def build_graph_phase1_runtime_from_env(
                 ) from exc
 
         if canonical_writer is None:
+            # M2.6 follow-up #1: Real Iceberg-backed writer replaces the
+            # M2.3a-2 NotImplementedError stub. Phase 1 graph_promotion
+            # now actually persists ``PromotionPlan`` records into the
+            # ``canonical.graph_*`` Iceberg table family.
             try:
-                canonical_writer = StubCanonicalGraphWriter.from_env()
+                canonical_writer = IcebergCanonicalGraphWriter.from_env()
             except (ValueError, RuntimeError) as exc:
                 raise EnvironmentError(
-                    "data-platform StubCanonicalGraphWriter.from_env() failed",
+                    "data-platform IcebergCanonicalGraphWriter.from_env() failed",
                 ) from exc
 
     if regime_reader is None:

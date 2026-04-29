@@ -192,7 +192,7 @@ def _install_fake_data_platform(monkeypatch: pytest.MonkeyPatch) -> dict[str, An
     calls: dict[str, Any] = {
         "PostgresCandidateDeltaReader.from_env": False,
         "IcebergEntityAnchorReader.from_env": False,
-        "StubCanonicalGraphWriter.from_env": False,
+        "IcebergCanonicalGraphWriter.from_env": False,
     }
 
     class _FakeCandidateReader:
@@ -222,7 +222,7 @@ def _install_fake_data_platform(monkeypatch: pytest.MonkeyPatch) -> dict[str, An
 
         @classmethod
         def from_env(cls):
-            calls["StubCanonicalGraphWriter.from_env"] = True
+            calls["IcebergCanonicalGraphWriter.from_env"] = True
             return cls()
 
     fake_module = types.ModuleType(
@@ -230,7 +230,9 @@ def _install_fake_data_platform(monkeypatch: pytest.MonkeyPatch) -> dict[str, An
     )
     fake_module.PostgresCandidateDeltaReader = _FakeCandidateReader  # type: ignore[attr-defined]
     fake_module.IcebergEntityAnchorReader = _FakeEntityReader  # type: ignore[attr-defined]
-    fake_module.StubCanonicalGraphWriter = _FakeCanonicalWriter  # type: ignore[attr-defined]
+    # M2.6 follow-up #1: real writer name (StubCanonicalGraphWriter alias
+    # also available for backwards compat but we exercise the canonical name).
+    fake_module.IcebergCanonicalGraphWriter = _FakeCanonicalWriter  # type: ignore[attr-defined]
 
     fake_data_platform = types.ModuleType("data_platform")
     fake_data_platform_cycle = types.ModuleType("data_platform.cycle")
@@ -298,7 +300,7 @@ def test_build_runtime_from_env_lazy_imports_cross_module_adapters(
     # Verify each lazy-import path actually fired.
     assert dp_calls["PostgresCandidateDeltaReader.from_env"] is True
     assert dp_calls["IcebergEntityAnchorReader.from_env"] is True
-    assert dp_calls["StubCanonicalGraphWriter.from_env"] is True
+    assert dp_calls["IcebergCanonicalGraphWriter.from_env"] is True
     assert mc_calls["build_regime_context_reader_from_env"] is True
 
 
