@@ -304,6 +304,63 @@ def test_build_runtime_from_env_lazy_imports_cross_module_adapters(
     assert mc_calls["build_regime_context_reader_from_env"] is True
 
 
+def test_build_runtime_wraps_adapter_validation_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Env-aware cross-module constructors may use Pydantic settings models;
+    graph-engine must surface those failures as ``EnvironmentError`` so the
+    orchestrator's fail-closed provider path catches them."""
+
+    import sys
+    import types
+
+    from pydantic import BaseModel, Field
+
+    _live_env(monkeypatch, tmp_path)
+    _install_fake_main_core(monkeypatch)
+
+    class _Settings(BaseModel):
+        required_value: str = Field(min_length=1)
+
+    class _FailingCandidateReader:
+        @classmethod
+        def from_env(cls):
+            return _Settings.model_validate({})
+
+    class _UnusedEntityReader:
+        @classmethod
+        def from_env(cls):
+            raise AssertionError("entity reader should not be constructed")
+
+    class _UnusedCanonicalWriter:
+        @classmethod
+        def from_env(cls):
+            raise AssertionError("canonical writer should not be constructed")
+
+    fake_module = types.ModuleType(
+        "data_platform.cycle.graph_phase1_adapters"
+    )
+    fake_module.PostgresCandidateDeltaReader = _FailingCandidateReader  # type: ignore[attr-defined]
+    fake_module.IcebergEntityAnchorReader = _UnusedEntityReader  # type: ignore[attr-defined]
+    fake_module.IcebergCanonicalGraphWriter = _UnusedCanonicalWriter  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "data_platform", types.ModuleType("data_platform"))
+    monkeypatch.setitem(
+        sys.modules, "data_platform.cycle", types.ModuleType("data_platform.cycle")
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "data_platform.cycle.graph_phase1_adapters",
+        fake_module,
+    )
+
+    with pytest.raises(
+        EnvironmentError,
+        match="PostgresCandidateDeltaReader.from_env",
+    ):
+        build_graph_phase1_runtime_from_env()
+
+
 def test_build_runtime_raises_when_data_platform_not_installed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -357,3 +414,10 @@ def test_build_fail_closed_graph_phase1_provider_returns_typed_provider() -> Non
     # asset-evaluation will raise rather than silently no-op.
     assert provider.__class__.__name__ == "GraphPhase1AssetFactoryProvider"
     assert provider.runtime.__class__.__name__ == "_FailClosedGraphPhase1Runtime"
+
+
+def test_phase1_module_all_exports_runtime_factories() -> None:
+    from graph_engine.providers import phase1
+
+    assert "build_fail_closed_graph_phase1_provider" in phase1.__all__
+    assert "build_graph_phase1_runtime_from_env" in phase1.__all__

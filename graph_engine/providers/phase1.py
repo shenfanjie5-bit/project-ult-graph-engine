@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Protocol
 
+from pydantic import ValidationError
+
 from graph_engine.client import Neo4jClient
 from graph_engine.models import GraphImpactSnapshot, GraphSnapshot, Neo4jGraphStatus, PromotionPlan
 from graph_engine.promotion import promote_graph_deltas
@@ -27,6 +29,8 @@ PHASE1_GROUP_NAME = "phase1"
 PHASE1_GRAPH_PROMOTION_ASSET_KEY = "graph_promotion"
 PHASE1_GRAPH_SNAPSHOT_ASSET_KEY = "graph_snapshot"
 GRAPH_PHASE1_RESOURCE_KEY = "graph_phase1_runtime"
+
+_ENV_ADAPTER_FACTORY_ERRORS = (RuntimeError, ValueError, ValidationError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,7 +453,7 @@ def build_graph_phase1_runtime_from_env(
         if candidate_reader is None:
             try:
                 candidate_reader = PostgresCandidateDeltaReader.from_env()
-            except (ValueError, RuntimeError) as exc:
+            except _ENV_ADAPTER_FACTORY_ERRORS as exc:
                 raise EnvironmentError(
                     "data-platform PostgresCandidateDeltaReader.from_env() failed",
                 ) from exc
@@ -457,7 +461,7 @@ def build_graph_phase1_runtime_from_env(
         if entity_reader is None:
             try:
                 entity_reader = IcebergEntityAnchorReader.from_env()
-            except (ValueError, RuntimeError) as exc:
+            except _ENV_ADAPTER_FACTORY_ERRORS as exc:
                 raise EnvironmentError(
                     "data-platform IcebergEntityAnchorReader.from_env() failed",
                 ) from exc
@@ -469,7 +473,7 @@ def build_graph_phase1_runtime_from_env(
             # ``canonical.graph_*`` Iceberg table family.
             try:
                 canonical_writer = IcebergCanonicalGraphWriter.from_env()
-            except (ValueError, RuntimeError) as exc:
+            except _ENV_ADAPTER_FACTORY_ERRORS as exc:
                 raise EnvironmentError(
                     "data-platform IcebergCanonicalGraphWriter.from_env() failed",
                 ) from exc
@@ -486,7 +490,7 @@ def build_graph_phase1_runtime_from_env(
             ) from exc
         try:
             regime_reader = build_regime_context_reader_from_env()
-        except (ValueError, RuntimeError) as exc:
+        except _ENV_ADAPTER_FACTORY_ERRORS as exc:
             raise EnvironmentError(
                 "main-core build_regime_context_reader_from_env() failed",
             ) from exc
@@ -748,6 +752,8 @@ __all__ = [
     "GraphPromotionAssetResult",
     "GraphSnapshotAssetRequest",
     "GraphSnapshotAssetResult",
+    "build_fail_closed_graph_phase1_provider",
     "build_graph_phase1_provider",
+    "build_graph_phase1_runtime_from_env",
     "prove_cold_reload_artifact",
 ]
