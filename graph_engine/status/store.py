@@ -416,7 +416,15 @@ def _build_psycopg_connection_factory(
             "PostgreSQLStatusStore requires the optional 'psycopg' package",
         ) from exc
 
-    return lambda: psycopg.connect(database_url, **connect_kwargs)
+    psycopg_database_url = _normalize_psycopg_database_url(database_url)
+    return lambda: psycopg.connect(psycopg_database_url, **connect_kwargs)
+
+
+def _normalize_psycopg_database_url(database_url: str) -> str:
+    sqlalchemy_psycopg_scheme = "postgresql+psycopg://"
+    if database_url.startswith(sqlalchemy_psycopg_scheme):
+        return "postgresql://" + database_url.removeprefix(sqlalchemy_psycopg_scheme)
+    return database_url
 
 
 def _quote_qualified_identifier(identifier: str) -> str:
