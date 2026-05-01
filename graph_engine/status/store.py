@@ -200,7 +200,16 @@ WHERE status_key = %s
             raise
         finally:
             if locked:
-                assert lock_key is not None
+                if lock_key is None:
+                    # Invariant: lock_key is set inside the cursor block above
+                    # before `locked` becomes True, so it cannot be None when
+                    # entering this branch. Retained as explicit raise so
+                    # the invariant survives `python -O`. Critical because
+                    # this sits inside a PG-backed locking flow where None
+                    # would corrupt the unlock SQL.
+                    raise AssertionError(
+                        "invariant: lock_key must be non-None when locked=True"
+                    )
                 try:
                     with connection.cursor() as cursor:
                         cursor.execute(

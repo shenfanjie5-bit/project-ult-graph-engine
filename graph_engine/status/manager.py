@@ -158,7 +158,13 @@ class GraphStatusManager:
                 "cannot transition graph_status from "
                 f"{current_state!r} to 'ready'",
             )
-        assert current is not None
+        if current is None:
+            # Invariant: current cannot be None here — current_state would
+            # have been None and the guard above would have raised. Retained
+            # as explicit raise so the invariant survives `python -O`.
+            raise AssertionError(
+                "invariant: current must be non-None after the rebuilding-state guard"
+            )
 
         next_generation_id = (
             current.graph_generation_id + 1
@@ -206,7 +212,14 @@ class GraphStatusManager:
                 "cannot transition graph_status from "
                 f"{current_state!r} to 'failed'",
             )
-        assert current is not None
+        if current is None:
+            # Invariant: current cannot be None — current_state would be None
+            # and the guard above would have raised. Retained as explicit
+            # raise so the invariant survives `python -O`.
+            raise AssertionError(
+                "invariant: current must be non-None after the "
+                "{rebuilding,ready}-state guard"
+            )
 
         status = Neo4jGraphStatus(
             graph_status="failed",

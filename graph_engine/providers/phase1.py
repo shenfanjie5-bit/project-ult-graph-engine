@@ -180,6 +180,16 @@ class GraphPhase1Service:
         self,
         request: GraphSnapshotAssetRequest,
     ) -> GraphSnapshotAssetResult:
+        # spec v5.0.1 L466 + audit ⚠️ #11: Layer C must read
+        # world_state(N-1), not (N). Guard against the orchestrator
+        # accidentally passing the current cycle's ref — that would feed
+        # propagation its own output. The orchestrator wiring is
+        # responsible for resolving the actual previous-cycle ref;
+        # here we only ensure the obvious self-reference is rejected.
+        _validate_world_state_ref_is_not_current_cycle(
+            request.world_state_ref,
+            request.cycle_id,
+        )
         graph_snapshot, impact_snapshot = compute_graph_snapshots(
             request.cycle_id,
             request.world_state_ref,
@@ -672,6 +682,41 @@ def _world_state_ref_from_promotion(
     if value is None or not str(value):
         return default
     return str(value)
+
+
+def _validate_world_state_ref_is_not_current_cycle(
+    world_state_ref: str,
+    current_cycle_id: str,
+) -> None:
+    """Reject world_state_ref values that point at the current cycle.
+
+    spec L466: Layer C must read world_state(N-1), not (N). The
+    canonical refs we recognise are:
+
+      - ``world-state:latest`` — caller is letting Layer C resolve the
+        latest published world state (orchestrator must ensure this is
+        not the current in-flight cycle's, but it is intentionally
+        opaque here);
+      - ``world-state:{cycle_id}`` — caller has resolved a specific
+        cycle's world_state to read.
+
+    Refs of the second form are checked literally against the current
+    cycle_id; matches raise ValueError so the orchestrator's Phase 1
+    wiring fails loudly instead of silently feeding propagation its own
+    output. Other shapes are accepted (defensive — we don't pretend to
+    own the ref grammar; that's a contracts concern).
+    """
+
+    if not world_state_ref or not current_cycle_id:
+        return
+    if world_state_ref == f"world-state:{current_cycle_id}":
+        raise ValueError(
+            f"Layer C must read world_state(N-1) (spec L466); got "
+            f"world_state_ref={world_state_ref!r} which points at the "
+            f"current cycle {current_cycle_id!r}. The orchestrator's "
+            "Phase 1 wiring must resolve the previous cycle's "
+            "world_state ref before invoking compute_graph_snapshot."
+        )
 
 
 def _artifact_ref_from_snapshot_writer(

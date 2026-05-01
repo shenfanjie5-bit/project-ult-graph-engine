@@ -55,7 +55,15 @@ def promote_graph_deltas(
     canonical_writer.write_canonical_records(plan)
 
     if sync_to_live_graph and client is not None:
-        assert status_manager is not None
+        if status_manager is None:
+            # Invariant: when sync_to_live_graph is True, the
+            # `status_manager.require_ready()` block above already ran, which
+            # requires status_manager to be non-None. Retained as explicit
+            # raise so the invariant survives `python -O`.
+            raise AssertionError(
+                "invariant: status_manager must be non-None when sync_to_live_graph "
+                "is True (already enforced by require_ready barrier above)"
+            )
         _sync_live_graph_with_status_barrier(plan, client, status_manager)
 
     return plan

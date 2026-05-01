@@ -97,7 +97,7 @@ def test_candidate_delta_to_artifact_backed_cold_reload_live_closure(tmp_path) -
     prefix = f"live-closure-{uuid4().hex}"
     cycle_id = f"{prefix}-cycle"
     selection_ref = f"cycle_candidate_selection:{cycle_id}"
-    world_state_ref = f"world-state:{cycle_id}"
+    world_state_ref = f"world-state:{prefix}-previous-cycle"
     source_node_id = f"{prefix}-source"
     target_node_id = f"{prefix}-target"
     evidence_ref = f"{prefix}-fact"
