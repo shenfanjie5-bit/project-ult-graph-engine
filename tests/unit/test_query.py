@@ -85,6 +85,7 @@ class FakeQueryClient:
         visited_relationships = set(parameters.get("visited_relationship_keys", []))
         channel_filter = parameters.get("channel_filter")
         channel_set = set(channel_filter) if isinstance(channel_filter, list) else None
+        include_channel = "UNWIND channels AS channel" in query
         nodes_by_id = {_node_key(node): node for node in self.nodes}
         rows: list[dict[str, Any]] = []
         for edge in self.edges:
@@ -98,28 +99,30 @@ class FakeQueryClient:
             source = nodes_by_id[source_key]
             target = nodes_by_id[target_key]
             neighbor = target if source_key in frontier else source
-            channel = (
-                _edge_channel(edge, channel_set=channel_set)
-                if " AS channel" in query
-                else None
-            )
-            if channel_set is not None and channel not in channel_set:
+            channels: tuple[str | None, ...] = (None,)
+            if include_channel:
+                channels = _edge_channels(edge)
+                if channel_set is not None:
+                    channels = tuple(channel for channel in channels if channel in channel_set)
+            if include_channel and not channels:
                 continue
-            row = {
-                "relationship_key": edge_key,
-                "source_key": source_key,
-                "target_key": target_key,
-                "neighbor_key": _node_key(neighbor),
-                "channel": channel,
-                "source": source,
-                "target": target,
-                "neighbor": neighbor,
-                "relationship": edge,
-            }
-            rows.append(row)
+            for channel in channels:
+                row = {
+                    "relationship_key": edge_key,
+                    "source_key": source_key,
+                    "target_key": target_key,
+                    "neighbor_key": _node_key(neighbor),
+                    "channel": channel,
+                    "source": source,
+                    "target": target,
+                    "neighbor": neighbor,
+                    "relationship": edge,
+                }
+                rows.append(row)
         rows.sort(
             key=lambda row: (
                 str(row["relationship_key"]),
+                str(row["channel"]),
                 str(row["source_key"]),
                 str(row["target_key"]),
             ),
@@ -430,6 +433,63 @@ def test_query_propagation_paths_filters_channels_and_normalizes_paths() -> None
     )
 
 
+@pytest.mark.parametrize("channels", [None, ["event", "reflexive"]])
+def test_query_propagation_paths_expands_northbound_hold_multi_channel(
+    channels: list[str] | None,
+) -> None:
+    client = FakeQueryClient(
+        edges=[
+            {
+                "edge_id": "edge-northbound",
+                "source_node_id": "node-a",
+                "target_node_id": "node-b",
+                "relationship_type": "NORTHBOUND_HOLD",
+                "properties": {},
+                "weight": 0.8,
+            }
+        ],
+    )
+
+    result = query_propagation_paths(
+        ["entity-a"],
+        1,
+        client=client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+        channels=channels,
+        result_limit=5,
+    )
+
+    assert result.paths == [
+        {
+            "channel": "event",
+            "edge_id": "edge-northbound",
+            "source_node_id": "node-a",
+            "target_node_id": "node-b",
+            "relationship_type": "NORTHBOUND_HOLD",
+            "score": 0.8,
+            "path_length": 1,
+            "properties": {},
+        },
+        {
+            "channel": "reflexive",
+            "edge_id": "edge-northbound",
+            "source_node_id": "node-a",
+            "target_node_id": "node-b",
+            "relationship_type": "NORTHBOUND_HOLD",
+            "score": 0.8,
+            "path_length": 1,
+            "properties": {},
+        },
+    ]
+    assert any("UNWIND channels AS channel" in query for query, _ in client.read_calls)
+    assert any('"NORTHBOUND_HOLD" THEN ["event", "reflexive"]' in query for query, _ in client.read_calls)
+    if channels is not None:
+        assert any(
+            read_parameters.get("channel_filter") == ["event", "reflexive"]
+            for _, read_parameters in client.read_calls
+        )
+
+
 def test_query_propagation_paths_can_filter_northbound_hold_as_reflexive() -> None:
     client = FakeQueryClient(
         edges=[
@@ -697,23 +757,11 @@ def _edge_key(edge: dict[str, Any]) -> str:
     return str(edge["edge_id"])
 
 
-def _edge_channel(
-    edge: dict[str, Any],
-    *,
-    channel_set: set[str] | None = None,
-) -> str:
-    channels = _edge_channels(edge)
-    if channel_set is not None:
-        for channel in channels:
-            if channel in channel_set:
-                return channel
-    return channels[0] if channels else "fundamental"
-
-
 def _edge_channels(edge: dict[str, Any]) -> tuple[str, ...]:
     properties = edge.get("properties", {})
-    if properties.get("propagation_channel") is not None:
-        return (str(properties["propagation_channel"]),)
+    for property_name in ("propagation_channel", "channel", "impact_channel"):
+        if properties.get(property_name) is not None:
+            return (str(properties[property_name]),)
     if edge["relationship_type"] == "EVENT_IMPACT":
         return ("event",)
     if edge["relationship_type"] == "CO_HOLDING":
