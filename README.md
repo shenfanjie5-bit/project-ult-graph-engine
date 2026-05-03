@@ -43,7 +43,10 @@ Implemented interface/type decisions:
   `RelationshipType.CO_HOLDING` and `RelationshipType.NORTHBOUND_HOLD`.
 - `CO_HOLDING` means a fund/portfolio entity holds a listed-security entity;
   holdings producers may include `producer_context.graph_node_upserts` when
-  the fund entity node is not already present.
+  the fund entity node is not already present. The upserted
+  `canonical_entity_id` must already exist as a public entity-registry anchor
+  confirmed by `EntityAnchorReader.existing_entity_ids`; graph-engine and
+  producers do not create canonical entities in issue #56.
 - `NORTHBOUND_HOLD` means northbound aggregate capital holds or changes a
   position in a listed-security entity.
 - Represent top shareholder relationships with existing `OWNERSHIP`.

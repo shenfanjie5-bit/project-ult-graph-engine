@@ -159,16 +159,8 @@ def validate_entity_anchors(
         for delta in deltas
         for entity_id in delta.source_entity_ids
     }
-    upserted_entity_ids = {
-        entity_id
-        for delta in deltas
-        for entity_id in _node_upsert_entity_ids_from_payload(delta.payload)
-    }
-    entity_ids_requiring_existing_anchor = entity_ids - upserted_entity_ids
-    existing_entity_ids = entity_reader.existing_entity_ids(
-        entity_ids_requiring_existing_anchor,
-    )
-    missing_entity_ids = sorted(entity_ids_requiring_existing_anchor - existing_entity_ids)
+    existing_entity_ids = entity_reader.existing_entity_ids(entity_ids)
+    missing_entity_ids = sorted(entity_ids - existing_entity_ids)
     if missing_entity_ids:
         raise ValueError(
             "missing entity anchors: " + ", ".join(missing_entity_ids),
@@ -372,17 +364,6 @@ def _node_upsert_entity_ids_by_node_id(
     return upsert_entity_ids
 
 
-def _node_upsert_entity_ids_from_payload(payload: Mapping[str, Any]) -> set[str]:
-    contract_delta = _contract_delta_from_payload(payload)
-    if contract_delta is None:
-        return set()
-    return {
-        str(node_payload["canonical_entity_id"])
-        for node_payload in _node_upsert_payloads_from_contract_delta(contract_delta)
-        if isinstance(node_payload.get("canonical_entity_id"), str)
-    }
-
-
 def _node_upsert_payloads_from_contract_delta(
     contract_delta: CandidateGraphDelta,
 ) -> list[Mapping[str, Any]]:
@@ -392,6 +373,13 @@ def _node_upsert_payloads_from_contract_delta(
     raw_upserts = producer_context.get("graph_node_upserts")
     if raw_upserts is None:
         return []
+    relationship_type = _internal_relationship_type_for_contract_delta(contract_delta)
+    if relationship_type not in _HOLDINGS_UPSERT_RELATIONSHIP_TYPES:
+        raise ValueError(
+            "graph_node_upserts are only supported for "
+            f"{RelationshipType.CO_HOLDING.value} and "
+            f"{RelationshipType.NORTHBOUND_HOLD.value}",
+        )
     return _coerce_node_upsert_payloads(raw_upserts)
 
 

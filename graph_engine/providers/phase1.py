@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Protocol
 
-from pydantic import ValidationError
-
 from graph_engine.client import Neo4jClient
 from graph_engine.models import GraphImpactSnapshot, GraphSnapshot, Neo4jGraphStatus, PromotionPlan
 from graph_engine.promotion import promote_graph_deltas
@@ -29,8 +27,6 @@ PHASE1_GROUP_NAME = "phase1"
 PHASE1_GRAPH_PROMOTION_ASSET_KEY = "graph_promotion"
 PHASE1_GRAPH_SNAPSHOT_ASSET_KEY = "graph_snapshot"
 GRAPH_PHASE1_RESOURCE_KEY = "graph_phase1_runtime"
-
-_ENV_ADAPTER_FACTORY_ERRORS = (RuntimeError, ValueError, ValidationError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,9 +107,10 @@ class GraphPhase1Runtime(Protocol):
 class GraphPhase1Service:
     """Default runtime backed by graph-engine services.
 
-    This service expects data-platform-facing adapters for candidate reads and
-    Layer A writes. Graph-engine does not synthesize Phase 0 data: it only
-    consumes the frozen candidate selection reference emitted by Phase 0.
+    This service expects externally injected adapters for candidate reads,
+    entity-registry anchor reads, Layer A writes, and regime context reads.
+    Graph-engine does not synthesize Phase 0 data: it only consumes the
+    frozen candidate selection reference emitted by Phase 0.
     """
 
     def __init__(
@@ -371,26 +368,21 @@ def build_graph_phase1_runtime_from_env(
 ) -> GraphPhase1Runtime:
     """Construct a real :class:`GraphPhase1Service` from environment variables.
 
-    Composes the cross-module adapters required by the Phase 1 service:
+    Composes the graph-engine owned pieces required by the Phase 1 service:
 
     * :class:`graph_engine.client.Neo4jClient` from ``NEO4J_*`` env (graph-engine).
     * :class:`graph_engine.status.GraphStatusManager` over
       :class:`graph_engine.status.PostgreSQLStatusStore` from ``DATABASE_URL``.
     * :class:`graph_engine.snapshots.FormalArtifactSnapshotWriter` from
       ``GRAPH_PHASE1_SNAPSHOT_ARTIFACT_ROOT`` (snapshot-writer-internal env).
-    * data-platform's ``PostgresCandidateDeltaReader`` and
-      ``IcebergEntityAnchorReader`` for the contract delta / entity anchor
-      reads, plus its ``IcebergCanonicalGraphWriter`` for the real
-      promotion write-back to ``canonical.graph_*`` Iceberg tables (M2.6
-      follow-up #1 replaced the M2.3a-2 ``StubCanonicalGraphWriter``).
-    * main-core's ``PlaceholderRegimeContextReader`` (neutral 1.0
-      multipliers; M2.6 follow-up #2 replaces with real regime mapping).
 
-    Each adapter override is a test seam — overriding all five is equivalent
-    to constructing :class:`GraphPhase1Service` directly. Raises
-    :class:`EnvironmentError` when env-driven construction of any required
-    piece fails (e.g. ``NEO4J_PASSWORD`` absent, optional cross-module
-    package not installed in the runtime env).
+    Cross-module pieces must be supplied by orchestrator / assembly via the
+    Protocol arguments: ``candidate_reader``, ``entity_reader``,
+    ``canonical_writer``, and ``regime_reader``. Graph-engine never imports
+    data-platform or main-core adapter implementations. Raises
+    :class:`EnvironmentError` when env-driven construction of any
+    graph-engine-owned piece fails or when a required injected Protocol is
+    omitted.
     """
 
     import os
@@ -433,77 +425,25 @@ def build_graph_phase1_runtime_from_env(
             )
         snapshot_writer = FormalArtifactSnapshotWriter(Path(artifact_root))
 
-    # --- cross-module adapters (data-platform + main-core) ------------------
-    #
-    # All three data-platform adapters live in the same module — load them
-    # in a single try/except block so they either all succeed or all fail
-    # (the real semantics; they are co-located in
-    # ``data_platform.cycle.graph_phase1_adapters``). Each adapter
-    # ``from_env()`` constructor is then called inside its own guard so a
-    # ``pydantic.ValidationError`` / ``ValueError`` from a future env-aware
-    # constructor surfaces as ``EnvironmentError`` per the docstring contract.
+    # --- injected cross-module adapters ------------------------------------
 
-    if (
-        candidate_reader is None
-        or entity_reader is None
-        or canonical_writer is None
-    ):
-        try:
-            from data_platform.cycle.graph_phase1_adapters import (
-                IcebergCanonicalGraphWriter,
-                IcebergEntityAnchorReader,
-                PostgresCandidateDeltaReader,
-            )
-        except ImportError as exc:
-            raise EnvironmentError(
-                "Phase 1 runtime requires data-platform "
-                "(data_platform.cycle.graph_phase1_adapters) to be installed",
-            ) from exc
-
-        if candidate_reader is None:
-            try:
-                candidate_reader = PostgresCandidateDeltaReader.from_env()
-            except _ENV_ADAPTER_FACTORY_ERRORS as exc:
-                raise EnvironmentError(
-                    "data-platform PostgresCandidateDeltaReader.from_env() failed",
-                ) from exc
-
-        if entity_reader is None:
-            try:
-                entity_reader = IcebergEntityAnchorReader.from_env()
-            except _ENV_ADAPTER_FACTORY_ERRORS as exc:
-                raise EnvironmentError(
-                    "data-platform IcebergEntityAnchorReader.from_env() failed",
-                ) from exc
-
-        if canonical_writer is None:
-            # M2.6 follow-up #1: Real Iceberg-backed writer replaces the
-            # M2.3a-2 NotImplementedError stub. Phase 1 graph_promotion
-            # now actually persists ``PromotionPlan`` records into the
-            # ``canonical.graph_*`` Iceberg table family.
-            try:
-                canonical_writer = IcebergCanonicalGraphWriter.from_env()
-            except _ENV_ADAPTER_FACTORY_ERRORS as exc:
-                raise EnvironmentError(
-                    "data-platform IcebergCanonicalGraphWriter.from_env() failed",
-                ) from exc
-
-    if regime_reader is None:
-        try:
-            from main_core.adapters.graph_engine import (
-                build_regime_context_reader_from_env,
-            )
-        except ImportError as exc:
-            raise EnvironmentError(
-                "Phase 1 runtime requires main-core "
-                "(main_core.adapters.graph_engine) to be installed",
-            ) from exc
-        try:
-            regime_reader = build_regime_context_reader_from_env()
-        except _ENV_ADAPTER_FACTORY_ERRORS as exc:
-            raise EnvironmentError(
-                "main-core build_regime_context_reader_from_env() failed",
-            ) from exc
+    missing_dependencies = [
+        name
+        for name, value in (
+            ("candidate_reader", candidate_reader),
+            ("entity_reader", entity_reader),
+            ("canonical_writer", canonical_writer),
+            ("regime_reader", regime_reader),
+        )
+        if value is None
+    ]
+    if missing_dependencies:
+        raise EnvironmentError(
+            "Phase 1 runtime requires injected Protocol adapters for "
+            + ", ".join(missing_dependencies)
+            + "; graph-engine does not import data-platform or main-core "
+            "adapter implementations",
+        )
 
     # --- compose the real service ------------------------------------------
 
@@ -575,8 +515,8 @@ class _FailClosedGraphPhase1Runtime:
 
 _FAIL_CLOSED_RUNTIME_MESSAGE = (
     "Graph Phase 1 runtime dependencies are not configured; provide real "
-    "candidate_reader, canonical_writer, Neo4j client/status, regime_reader, "
-    "and formal artifact snapshot writer resources."
+    "candidate_reader, entity_reader, canonical_writer, Neo4j client/status, "
+    "regime_reader, and formal artifact snapshot writer resources."
 )
 
 

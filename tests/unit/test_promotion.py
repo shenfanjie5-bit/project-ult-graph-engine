@@ -336,7 +336,7 @@ def test_holdings_contract_delta_can_upsert_endpoint_nodes_before_edge() -> None
         ],
     }
     entity_reader = _contract_entity_reader(
-        existing_ids={"entity-stock-1"},
+        existing_ids={"entity-fund-1", "entity-stock-1"},
         node_entity_ids={"node-stock-1": "entity-stock-1"},
     )
 
@@ -354,7 +354,76 @@ def test_holdings_contract_delta_can_upsert_endpoint_nodes_before_edge() -> None
     assert plan.edge_records[0].source_node_id == "node-fund-1"
     assert plan.edge_records[0].target_node_id == "node-stock-1"
     assert entity_reader.node_calls == [{"node-fund-1", "node-stock-1"}]
-    assert entity_reader.calls == [{"entity-stock-1"}]
+    assert entity_reader.calls == [{"entity-fund-1", "entity-stock-1"}]
+
+
+def test_holdings_node_upsert_requires_existing_canonical_entity_anchor() -> None:
+    contract_delta = _contract_delta(
+        delta_id="co-holding-delta-1",
+        source_node="node-fund-1",
+        target_node="node-stock-1",
+        relation_type=RelationshipType.CO_HOLDING.value,
+    )
+    contract_delta.producer_context = {
+        "graph_node_upserts": [
+            _node_payload(
+                "node-fund-1",
+                canonical_entity_id="entity-fund-1",
+                properties={"fund_code": "001753.OF"},
+            ),
+        ],
+    }
+    entity_reader = _contract_entity_reader(
+        existing_ids={"entity-stock-1"},
+        node_entity_ids={"node-stock-1": "entity-stock-1"},
+    )
+    writer = FakeCanonicalWriter()
+
+    with pytest.raises(ValueError, match="missing entity anchors: entity-fund-1"):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([contract_delta]),
+            entity_reader=entity_reader,
+            canonical_writer=writer,
+            sync_to_live_graph=False,
+        )
+
+    assert entity_reader.node_calls == [{"node-fund-1", "node-stock-1"}]
+    assert entity_reader.calls == [{"entity-fund-1", "entity-stock-1"}]
+    assert writer.plans == []
+
+
+def test_graph_node_upserts_are_limited_to_holdings_relationships() -> None:
+    contract_delta = _contract_delta(
+        delta_id="supply-chain-delta-1",
+        relation_type=RelationshipType.SUPPLY_CHAIN.value,
+    )
+    contract_delta.producer_context = {
+        "graph_node_upserts": [
+            _node_payload(
+                "node-1",
+                canonical_entity_id="entity-1",
+            ),
+        ],
+    }
+    entity_reader = _contract_entity_reader()
+
+    with pytest.raises(
+        ValueError,
+        match="graph_node_upserts are only supported for CO_HOLDING and NORTHBOUND_HOLD",
+    ):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([contract_delta]),
+            entity_reader=entity_reader,
+            canonical_writer=FakeCanonicalWriter(),
+            sync_to_live_graph=False,
+        )
+
+    assert entity_reader.node_calls == []
+    assert entity_reader.calls == []
 
 
 def test_holdings_relationships_use_pair_stable_edge_ids_for_property_upserts() -> None:
