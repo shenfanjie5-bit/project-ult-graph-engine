@@ -44,17 +44,19 @@ Implemented interface/type decisions:
 - `CO_HOLDING` means a fund/portfolio entity holds a listed-security entity;
   holdings producers may include `producer_context.graph_node_upserts` when
   a source or target endpoint node is not already present. `graph_node_upserts`
-  are endpoint-only, must not conflict with an existing endpoint mapping, and
-  every upserted `canonical_entity_id` must already exist as a public
-  entity-registry anchor confirmed by `EntityAnchorReader.existing_entity_ids`;
-  graph-engine and producers do not create canonical entities in issue #56.
+  are holdings-only (`CO_HOLDING` / `NORTHBOUND_HOLD`), endpoint-only, must
+  not conflict with an existing endpoint mapping, and every upserted
+  `canonical_entity_id` must already exist as a public entity-registry anchor
+  confirmed by `EntityAnchorReader.existing_entity_ids`; graph-engine and
+  producers do not create canonical entities in issue #56.
 - `NORTHBOUND_HOLD` means northbound aggregate capital holds or changes a
   position in a listed-security entity.
 - Represent top shareholder relationships with existing `OWNERSHIP`.
 - Represent pledge status as `OWNERSHIP` properties such as `pledge_ratio`;
   do not add a separate `PLEDGE_STATUS` relationship.
-- Issue #56 covers enum + planner promotion support only. Issue #55 remains
-  the later place for co-holding cluster or northbound-anomaly algorithms.
+- Issue #56 covers enum, planner, query, and propagation-channel support only.
+  Issue #55 remains the later place for co-holding cluster or
+  northbound-anomaly algorithms.
 
 CLAUDE.md §10 domain invariants this module enforces by construction:
 
@@ -114,7 +116,6 @@ which guards against re-introducing the codex #13 P2 conflation.
 ## Test baseline
 
 ```bash
-.venv/bin/python -m pytest                                    # 371 passed, 15 skipped
 .venv/bin/python -m pytest tests/contract/                    # public API + kind-tag boundary
 .venv/bin/python -m pytest tests/smoke/                       # 5 singletons end-to-end
 .venv/bin/python -m pytest tests/boundary/                    # CLAUDE.md red-line guards
@@ -122,9 +123,17 @@ which guards against re-introducing the codex #13 P2 conflation.
 .venv/bin/python -m pytest tests/integration/                 # subgraph query / propagation
 ```
 
-15 skipped tests are the optional-cross-repo gates that disable when
-`audit_eval_fixtures` or other cross-repo modules are not present in
-the current venv (offline-first dev mode).
+Focused #56 holdings evidence:
+
+```bash
+.venv/bin/python -m pytest tests/contract/test_contracts_alignment.py \
+  tests/unit/test_schema.py tests/unit/test_promotion.py \
+  tests/unit/test_query.py tests/unit/test_propagation_channels.py \
+  tests/boundary/test_red_lines.py -q
+```
+
+Refresh global pass/skip counts only after running the full suite in the
+current venv; this README intentionally avoids a stale full-suite count.
 
 ## Execution rules
 
