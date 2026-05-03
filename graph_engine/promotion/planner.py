@@ -79,11 +79,18 @@ def freeze_contract_deltas(
     """Adapt contract graph deltas after resolving endpoint nodes to entity anchors."""
 
     endpoint_node_ids = _supported_contract_endpoint_node_ids(contract_deltas)
-    upsert_node_entity_ids = _node_upsert_entity_ids_by_node_id(contract_deltas)
+    upsert_node_entity_ids = _node_upsert_entity_ids_by_node_id(
+        contract_deltas,
+        endpoint_node_ids=endpoint_node_ids,
+    )
     node_entity_ids = (
         entity_reader.canonical_entity_ids_for_node_ids(endpoint_node_ids)
         if endpoint_node_ids
         else {}
+    )
+    _validate_node_upserts_match_existing_endpoint_mappings(
+        upsert_node_entity_ids,
+        node_entity_ids,
     )
     resolved_node_entity_ids = {**upsert_node_entity_ids, **node_entity_ids}
     _validate_endpoint_entity_resolution(endpoint_node_ids, resolved_node_entity_ids)
@@ -242,12 +249,19 @@ def _parse_node_upsert_records(delta: FrozenGraphDelta) -> list[GraphNodeRecord]
     if contract_delta is None:
         return []
 
+    return _node_upsert_records_from_contract_delta(delta.delta_id, contract_delta)
+
+
+def _node_upsert_records_from_contract_delta(
+    delta_id: str,
+    contract_delta: CandidateGraphDelta,
+) -> list[GraphNodeRecord]:
     node_records: list[GraphNodeRecord] = []
     for node_payload in _node_upsert_payloads_from_contract_delta(contract_delta):
         node_record = GraphNodeRecord.model_validate(node_payload)
         if node_record.label not in _VALID_NODE_LABELS:
             raise ValueError(
-                f"delta {delta.delta_id} uses unsupported node label {node_record.label!r}",
+                f"delta {delta_id} uses unsupported node label {node_record.label!r}",
             )
         node_records.append(node_record)
     return node_records
@@ -353,15 +367,58 @@ def _edge_id_for_contract_delta(
 
 def _node_upsert_entity_ids_by_node_id(
     contract_deltas: Sequence[CandidateGraphDelta],
+    *,
+    endpoint_node_ids: set[str],
 ) -> dict[str, str]:
     upsert_entity_ids: dict[str, str] = {}
     for contract_delta in contract_deltas:
-        for node_payload in _node_upsert_payloads_from_contract_delta(contract_delta):
-            node_id = node_payload.get("node_id")
-            canonical_entity_id = node_payload.get("canonical_entity_id")
-            if isinstance(node_id, str) and isinstance(canonical_entity_id, str):
-                upsert_entity_ids[node_id] = canonical_entity_id
+        for node_record in _node_upsert_records_from_contract_delta(
+            contract_delta.delta_id,
+            contract_delta,
+        ):
+            if node_record.node_id not in endpoint_node_ids:
+                raise ValueError(
+                    "graph_node_upserts are endpoint-only; unsupported node ids: "
+                    f"{node_record.node_id}",
+                )
+            existing_entity_id = upsert_entity_ids.get(node_record.node_id)
+            if (
+                existing_entity_id is not None
+                and existing_entity_id != node_record.canonical_entity_id
+            ):
+                raise ValueError(
+                    "graph_node_upserts conflict for endpoint node "
+                    f"{node_record.node_id}: "
+                    f"{existing_entity_id} != {node_record.canonical_entity_id}",
+                )
+            upsert_entity_ids[node_record.node_id] = node_record.canonical_entity_id
     return upsert_entity_ids
+
+
+def _validate_node_upserts_match_existing_endpoint_mappings(
+    upsert_node_entity_ids: Mapping[str, str],
+    node_entity_ids: Mapping[str, str],
+) -> None:
+    conflicts = [
+        (
+            node_id,
+            upsert_entity_id,
+            node_entity_ids[node_id],
+        )
+        for node_id, upsert_entity_id in sorted(upsert_node_entity_ids.items())
+        if node_id in node_entity_ids and node_entity_ids[node_id] != upsert_entity_id
+    ]
+    if not conflicts:
+        return
+
+    details = ", ".join(
+        f"{node_id} ({upsert_entity_id} != {existing_entity_id})"
+        for node_id, upsert_entity_id, existing_entity_id in conflicts
+    )
+    raise ValueError(
+        "graph_node_upserts conflict with existing endpoint canonical entity "
+        f"mappings: {details}",
+    )
 
 
 def _node_upsert_payloads_from_contract_delta(

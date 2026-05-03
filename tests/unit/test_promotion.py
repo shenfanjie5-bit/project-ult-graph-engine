@@ -394,6 +394,100 @@ def test_holdings_node_upsert_requires_existing_canonical_entity_anchor() -> Non
     assert writer.plans == []
 
 
+def test_holdings_node_upsert_rejects_non_endpoint_node() -> None:
+    contract_delta = _contract_delta(
+        delta_id="co-holding-delta-1",
+        source_node="node-fund-1",
+        target_node="node-stock-1",
+        relation_type=RelationshipType.CO_HOLDING.value,
+    )
+    contract_delta.producer_context = {
+        "graph_node_upserts": [
+            _node_payload(
+                "node-fund-1",
+                canonical_entity_id="entity-fund-1",
+                properties={"fund_code": "001753.OF"},
+            ),
+            _node_payload(
+                "node-extra-1",
+                canonical_entity_id="entity-extra-1",
+            ),
+        ],
+    }
+    entity_reader = _contract_entity_reader(
+        existing_ids={"entity-fund-1", "entity-stock-1", "entity-extra-1"},
+        node_entity_ids={"node-stock-1": "entity-stock-1"},
+    )
+    writer = FakeCanonicalWriter()
+
+    with pytest.raises(
+        ValueError,
+        match="graph_node_upserts are endpoint-only.*node-extra-1",
+    ):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([contract_delta]),
+            entity_reader=entity_reader,
+            canonical_writer=writer,
+            sync_to_live_graph=False,
+        )
+
+    assert entity_reader.node_calls == []
+    assert entity_reader.calls == []
+    assert writer.plans == []
+
+
+def test_holdings_node_upsert_rejects_conflicting_endpoint_mapping() -> None:
+    contract_delta = _contract_delta(
+        delta_id="co-holding-delta-1",
+        source_node="node-fund-1",
+        target_node="node-stock-1",
+        relation_type=RelationshipType.CO_HOLDING.value,
+    )
+    contract_delta.producer_context = {
+        "graph_node_upserts": [
+            _node_payload(
+                "node-fund-1",
+                canonical_entity_id="entity-fund-from-producer",
+                properties={"fund_code": "001753.OF"},
+            ),
+        ],
+    }
+    entity_reader = _contract_entity_reader(
+        existing_ids={
+            "entity-fund-from-registry",
+            "entity-fund-from-producer",
+            "entity-stock-1",
+        },
+        node_entity_ids={
+            "node-fund-1": "entity-fund-from-registry",
+            "node-stock-1": "entity-stock-1",
+        },
+    )
+    writer = FakeCanonicalWriter()
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "graph_node_upserts conflict.*node-fund-1.*"
+            "entity-fund-from-producer.*entity-fund-from-registry"
+        ),
+    ):
+        promote_graph_deltas(
+            "cycle-1",
+            "selection-1",
+            candidate_reader=FakeCandidateReader([contract_delta]),
+            entity_reader=entity_reader,
+            canonical_writer=writer,
+            sync_to_live_graph=False,
+        )
+
+    assert entity_reader.node_calls == [{"node-fund-1", "node-stock-1"}]
+    assert entity_reader.calls == []
+    assert writer.plans == []
+
+
 def test_graph_node_upserts_are_limited_to_holdings_relationships() -> None:
     contract_delta = _contract_delta(
         delta_id="supply-chain-delta-1",
