@@ -292,6 +292,112 @@ def test_contract_delta_upsert_relation_maps_to_edge_promotion() -> None:
 
 
 @pytest.mark.parametrize(
+    "relationship_type",
+    [
+        RelationshipType.CO_HOLDING.value,
+        RelationshipType.NORTHBOUND_HOLD.value,
+    ],
+)
+def test_contract_delta_promotes_holdings_relationship_types(
+    relationship_type: str,
+) -> None:
+    contract_delta = _contract_delta(
+        delta_id=f"{relationship_type.lower()}-delta-1",
+        relation_type=relationship_type,
+    )
+
+    plan = promote_graph_deltas(
+        "cycle-1",
+        "selection-1",
+        candidate_reader=FakeCandidateReader([contract_delta]),
+        entity_reader=_contract_entity_reader(),
+        canonical_writer=FakeCanonicalWriter(),
+        sync_to_live_graph=False,
+    )
+
+    assert plan.edge_records[0].relationship_type == relationship_type
+    assert plan.edge_records[0].edge_id.startswith(f"{relationship_type.lower()}:")
+
+
+def test_holdings_contract_delta_can_upsert_endpoint_nodes_before_edge() -> None:
+    contract_delta = _contract_delta(
+        delta_id="co-holding-delta-1",
+        source_node="node-fund-1",
+        target_node="node-stock-1",
+        relation_type=RelationshipType.CO_HOLDING.value,
+    )
+    contract_delta.producer_context = {
+        "graph_node_upserts": [
+            _node_payload(
+                "node-fund-1",
+                canonical_entity_id="entity-fund-1",
+                properties={"fund_code": "001753.OF"},
+            ),
+        ],
+    }
+    entity_reader = _contract_entity_reader(
+        existing_ids={"entity-stock-1"},
+        node_entity_ids={"node-stock-1": "entity-stock-1"},
+    )
+
+    plan = promote_graph_deltas(
+        "cycle-1",
+        "selection-1",
+        candidate_reader=FakeCandidateReader([contract_delta]),
+        entity_reader=entity_reader,
+        canonical_writer=FakeCanonicalWriter(),
+        sync_to_live_graph=False,
+    )
+
+    assert [node.node_id for node in plan.node_records] == ["node-fund-1"]
+    assert plan.node_records[0].canonical_entity_id == "entity-fund-1"
+    assert plan.edge_records[0].source_node_id == "node-fund-1"
+    assert plan.edge_records[0].target_node_id == "node-stock-1"
+    assert entity_reader.node_calls == [{"node-fund-1", "node-stock-1"}]
+    assert entity_reader.calls == [{"entity-stock-1"}]
+
+
+def test_holdings_relationships_use_pair_stable_edge_ids_for_property_upserts() -> None:
+    first = _contract_delta(
+        delta_id="co-holding-2026q1",
+        source_node="node-fund-1",
+        target_node="node-stock-1",
+        relation_type=RelationshipType.CO_HOLDING.value,
+    )
+    second = _contract_delta(
+        delta_id="co-holding-2026q2",
+        source_node="node-fund-1",
+        target_node="node-stock-1",
+        relation_type=RelationshipType.CO_HOLDING.value,
+    )
+    first.properties = {"report_date": "20260331", "weight": 0.3}
+    second.properties = {"report_date": "20260630", "weight": 0.4}
+
+    plan = promote_graph_deltas(
+        "cycle-1",
+        "selection-1",
+        candidate_reader=FakeCandidateReader([second, first]),
+        entity_reader=_contract_entity_reader(
+            existing_ids={"entity-fund-1", "entity-stock-1"},
+            node_entity_ids={
+                "node-fund-1": "entity-fund-1",
+                "node-stock-1": "entity-stock-1",
+            },
+        ),
+        canonical_writer=FakeCanonicalWriter(),
+        sync_to_live_graph=False,
+    )
+
+    edge_ids = [edge.edge_id for edge in plan.edge_records]
+    assert edge_ids[0] == edge_ids[1]
+    assert edge_ids[0] not in {first.delta_id, second.delta_id}
+    assert [edge.properties["report_date"] for edge in plan.edge_records] == [
+        "20260331",
+        "20260630",
+    ]
+
+
+@pytest.mark.parametrize(
     ("delta_type", "relation_type"),
     [
         ("add_edge", "supply_contract"),

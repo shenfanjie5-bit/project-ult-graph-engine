@@ -7,6 +7,7 @@ import pytest
 
 from graph_engine.models import Neo4jGraphStatus, PropagationContext
 from graph_engine.propagation import EVENT_RELATIONSHIP_TYPES, run_event_propagation
+from graph_engine.propagation.channels import effective_channel_selector
 from graph_engine.status import GraphStatusManager
 from tests.fakes import InMemoryStatusStore
 
@@ -230,15 +231,7 @@ def test_run_event_propagation_uses_projection_and_explains_paths() -> None:
     assert result.impacted_entities[0]["path_count"] == 1
     assert result.channel_breakdown["event"] == {
         "relationship_types": list(EVENT_RELATIONSHIP_TYPES),
-        "path_selector": (
-            'coalesce(relationship.propagation_channel, relationship.channel, '
-            'relationship.impact_channel, CASE type(relationship) '
-            'WHEN "SUPPLY_CHAIN" THEN "fundamental" '
-            'WHEN "OWNERSHIP" THEN "fundamental" '
-            'WHEN "INDUSTRY_CHAIN" THEN "fundamental" '
-            'WHEN "SECTOR_MEMBERSHIP" THEN "fundamental" '
-            'WHEN "EVENT_IMPACT" THEN "event" ELSE null END) = "event"'
-        ),
+        "path_selector": effective_channel_selector("event"),
         "path_count": 2,
         "impacted_entity_count": 2,
         "total_path_score": 2.5,

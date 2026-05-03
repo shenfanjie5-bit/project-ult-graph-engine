@@ -98,7 +98,11 @@ class FakeQueryClient:
             source = nodes_by_id[source_key]
             target = nodes_by_id[target_key]
             neighbor = target if source_key in frontier else source
-            channel = _edge_channel(edge) if " AS channel" in query else None
+            channel = (
+                _edge_channel(edge, channel_set=channel_set)
+                if " AS channel" in query
+                else None
+            )
             if channel_set is not None and channel not in channel_set:
                 continue
             row = {
@@ -426,6 +430,44 @@ def test_query_propagation_paths_filters_channels_and_normalizes_paths() -> None
     )
 
 
+def test_query_propagation_paths_can_filter_northbound_hold_as_reflexive() -> None:
+    client = FakeQueryClient(
+        edges=[
+            {
+                "edge_id": "edge-northbound",
+                "source_node_id": "node-a",
+                "target_node_id": "node-b",
+                "relationship_type": "NORTHBOUND_HOLD",
+                "properties": {},
+                "weight": 0.8,
+            }
+        ]
+    )
+
+    result = query_propagation_paths(
+        ["entity-a"],
+        1,
+        client=client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+        channels=["reflexive"],
+        result_limit=5,
+    )
+
+    assert result.paths == [
+        {
+            "channel": "reflexive",
+            "edge_id": "edge-northbound",
+            "source_node_id": "node-a",
+            "target_node_id": "node-b",
+            "relationship_type": "NORTHBOUND_HOLD",
+            "score": 0.8,
+            "path_length": 1,
+            "properties": {},
+        }
+    ]
+    assert any('"NORTHBOUND_HOLD"' in query for query, _ in client.read_calls)
+
+
 def test_query_propagation_paths_depth_zero_returns_empty_path_summary() -> None:
     client = FakeQueryClient()
 
@@ -655,13 +697,30 @@ def _edge_key(edge: dict[str, Any]) -> str:
     return str(edge["edge_id"])
 
 
-def _edge_channel(edge: dict[str, Any]) -> str:
+def _edge_channel(
+    edge: dict[str, Any],
+    *,
+    channel_set: set[str] | None = None,
+) -> str:
+    channels = _edge_channels(edge)
+    if channel_set is not None:
+        for channel in channels:
+            if channel in channel_set:
+                return channel
+    return channels[0] if channels else "fundamental"
+
+
+def _edge_channels(edge: dict[str, Any]) -> tuple[str, ...]:
     properties = edge.get("properties", {})
     if properties.get("propagation_channel") is not None:
-        return str(properties["propagation_channel"])
+        return (str(properties["propagation_channel"]),)
     if edge["relationship_type"] == "EVENT_IMPACT":
-        return "event"
-    return "fundamental"
+        return ("event",)
+    if edge["relationship_type"] == "CO_HOLDING":
+        return ("reflexive",)
+    if edge["relationship_type"] == "NORTHBOUND_HOLD":
+        return ("event", "reflexive")
+    return ("fundamental",)
 
 
 def _status_manager(

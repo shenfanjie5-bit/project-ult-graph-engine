@@ -160,6 +160,35 @@ class TestConsumerSideRoundTripsThroughRealContracts:
         assert consumer_validated.target_node == wire_payload["target_node"]
         assert consumer_validated.relation_type == wire_payload["relation_type"]
 
+    @pytest.mark.parametrize("relation_type", ["CO_HOLDING", "NORTHBOUND_HOLD"])
+    def test_holdings_relationship_terms_stay_inside_generic_ex3_contract(
+        self,
+        relation_type: str,
+    ) -> None:
+        from contracts.schemas import CandidateGraphDelta
+
+        from graph_engine.models import CandidateGraphDelta as GeDelta
+        from graph_engine.schema.definitions import RelationshipType
+
+        assert relation_type in {relationship.value for relationship in RelationshipType}
+
+        payload = {
+            "subsystem_id": "subsystem-holdings",
+            "delta_id": f"{relation_type.lower()}-alignment-001",
+            "delta_type": "upsert_edge",
+            "source_node": "ENT_HOLDING_SRC",
+            "target_node": "ENT_HOLDING_DST",
+            "relation_type": relation_type,
+            "properties": {"weight": 0.7},
+            "evidence": ["holdings-evidence-ref-001"],
+        }
+
+        contract_validated = CandidateGraphDelta.model_validate(payload)
+        graph_validated = GeDelta.model_validate(contract_validated.model_dump(mode="json"))
+
+        assert graph_validated is not contract_validated
+        assert graph_validated.relation_type == relation_type
+
     def test_graph_snapshot_round_trip_output_path(self) -> None:
         """A synthetic ``GraphSnapshot`` (what graph-engine PRODUCES
         and writes back to Layer A for downstream main-core / audit-

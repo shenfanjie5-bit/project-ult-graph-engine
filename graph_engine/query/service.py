@@ -13,7 +13,10 @@ from graph_engine.models import (
     GraphQueryResult,
     PropagationChannel,
 )
-from graph_engine.propagation.channels import effective_channel_expression
+from graph_engine.propagation.channels import (
+    effective_channel_expression,
+    relationship_types_for_channel,
+)
 from graph_engine.status import GraphStatusManager
 
 MAX_QUERY_DEPTH = 4
@@ -40,6 +43,7 @@ _EDGE_STRUCTURAL_PROPERTY_KEYS = frozenset(
         "weight",
     },
 )
+_CHANNEL_FILTER_ORDER: tuple[str, ...] = ("fundamental", "event", "reflexive")
 
 
 @dataclass(frozen=True)
@@ -294,8 +298,9 @@ def _path_query(depth: int) -> str:
 
 
 def _frontier_expansion_query(*, include_channel: bool) -> str:
-    channel_expression = effective_channel_expression("relationship")
-    channel_projection = f"{channel_expression} AS channel" if include_channel else "null AS channel"
+    channel_projection = (
+        f"{_channel_projection_expression()} AS channel" if include_channel else "null AS channel"
+    )
     channel_filter = (
         "WHERE $channel_filter IS NULL OR channel IN $channel_filter"
         if include_channel
@@ -388,6 +393,31 @@ RETURN relationship_key,
            weight: coalesce(relationship.weight, 1.0)
        }} AS relationship
 """
+
+
+def _channel_projection_expression(relationship_variable: str = "relationship") -> str:
+    default_expression = effective_channel_expression(relationship_variable)
+    requested_channel_cases = "\n".join(
+        (
+            f'         WHEN $channel_filter IS NOT NULL AND "{channel}" IN $channel_filter '
+            f"AND type({relationship_variable}) IN "
+            f"{_cypher_string_list(relationship_types_for_channel(channel))} "
+            f'THEN "{channel}"'
+        )
+        for channel in _CHANNEL_FILTER_ORDER
+        if relationship_types_for_channel(channel)
+    )
+    return f"""CASE
+         WHEN {relationship_variable}.propagation_channel IS NOT NULL THEN {relationship_variable}.propagation_channel
+         WHEN {relationship_variable}.channel IS NOT NULL THEN {relationship_variable}.channel
+         WHEN {relationship_variable}.impact_channel IS NOT NULL THEN {relationship_variable}.impact_channel
+{requested_channel_cases}
+         ELSE {default_expression}
+     END"""
+
+
+def _cypher_string_list(values: tuple[str, ...]) -> str:
+    return "[" + ", ".join(f'"{value}"' for value in values) + "]"
 
 
 def _read_propagation_paths(

@@ -23,6 +23,35 @@ NOT produce Ex-1/2/3 wire payloads (those come from announcement /
 news / other subsystem producers). It does NOT exercise
 `subsystem-sdk.SubmitClient` — that's the producer side.
 
+M4.4 live bridge evidence was produced on 2026-05-03 from a real
+`data-platform.candidate_queue` Ex-3 row through `PostgresCandidateDeltaReader`
+into `promote_graph_deltas(..., sync_to_live_graph=False)`, yielding a
+`PromotionPlan` with edge output. Evidence is recorded under assembly's
+`reports/stabilization/m4-bridge-live-proof-20260503.md`.
+
+## Holdings graph support plan
+
+The next domain extension is holdings graph support, but it must stay within
+the existing graph-engine boundary: consume canonical Ex-3 only, promote to
+Layer A first, then sync Neo4j.
+
+Implemented interface/type decisions:
+
+- Do **not** add holdings-specific Pydantic models in `contracts`; producers
+  continue to submit `Ex3CandidateGraphDelta`.
+- Add only two graph relationship enum values for holdings:
+  `RelationshipType.CO_HOLDING` and `RelationshipType.NORTHBOUND_HOLD`.
+- `CO_HOLDING` means a fund/portfolio entity holds a listed-security entity;
+  holdings producers may include `producer_context.graph_node_upserts` when
+  the fund entity node is not already present.
+- `NORTHBOUND_HOLD` means northbound aggregate capital holds or changes a
+  position in a listed-security entity.
+- Represent top shareholder relationships with existing `OWNERSHIP`.
+- Represent pledge status as `OWNERSHIP` properties such as `pledge_ratio`;
+  do not add a separate `PLEDGE_STATUS` relationship.
+- Issue #56 covers enum + planner promotion support only. Issue #55 remains
+  the later place for co-holding cluster or northbound-anomaly algorithms.
+
 CLAUDE.md §10 domain invariants this module enforces by construction:
 
 - **Truth Before Mirror** (#1): Iceberg is canonical truth; Neo4j is

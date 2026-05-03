@@ -14,11 +14,15 @@ from graph_engine.propagation._gds import (
     execute_gds_read,
     execute_gds_write,
 )
-from graph_engine.propagation.channels import effective_channel_selector
+from graph_engine.propagation.channels import (
+    effective_channel_selector,
+    relationship_types_for_channel,
+)
 from graph_engine.propagation.scoring import build_score_explanation
 from graph_engine.status import GraphStatusManager, hold_ready_read
 
 _REFLEXIVE_CHANNEL = "reflexive"
+REFLEXIVE_RELATIONSHIP_TYPES = relationship_types_for_channel(_REFLEXIVE_CHANNEL)
 _REFLEXIVE_PATH_SELECTOR = effective_channel_selector(_REFLEXIVE_CHANNEL)
 
 
@@ -77,6 +81,7 @@ def run_reflexive_propagation(
     )
     channel_breakdown: dict[str, Any] = {
         _REFLEXIVE_CHANNEL: {
+            "relationship_types": list(REFLEXIVE_RELATIONSHIP_TYPES),
             "path_selector": _REFLEXIVE_PATH_SELECTOR,
             "path_count": len(activated_paths),
             "impacted_entity_count": len(impacted_entities),

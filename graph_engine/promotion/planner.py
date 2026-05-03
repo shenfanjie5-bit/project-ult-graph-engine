@@ -28,6 +28,10 @@ _FORBIDDEN_PAYLOAD_FIELDS = {
 }
 _VALID_NODE_LABELS = {label.value for label in NodeLabel}
 _VALID_RELATIONSHIP_TYPES = {relationship.value for relationship in RelationshipType}
+_HOLDINGS_UPSERT_RELATIONSHIP_TYPES = {
+    RelationshipType.CO_HOLDING.value,
+    RelationshipType.NORTHBOUND_HOLD.value,
+}
 _STABLE_CONTRACT_EDGE_TIMESTAMP_BASE = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _STABLE_CONTRACT_EDGE_TIMESTAMP_SPAN_SECONDS = 10 * 365 * 24 * 60 * 60
 _InternalContractDeltaType = Literal["edge_add"]
@@ -75,17 +79,19 @@ def freeze_contract_deltas(
     """Adapt contract graph deltas after resolving endpoint nodes to entity anchors."""
 
     endpoint_node_ids = _supported_contract_endpoint_node_ids(contract_deltas)
+    upsert_node_entity_ids = _node_upsert_entity_ids_by_node_id(contract_deltas)
     node_entity_ids = (
         entity_reader.canonical_entity_ids_for_node_ids(endpoint_node_ids)
         if endpoint_node_ids
         else {}
     )
-    _validate_endpoint_entity_resolution(endpoint_node_ids, node_entity_ids)
+    resolved_node_entity_ids = {**upsert_node_entity_ids, **node_entity_ids}
+    _validate_endpoint_entity_resolution(endpoint_node_ids, resolved_node_entity_ids)
     return [
         freeze_contract_delta(
             cycle_id,
             contract_delta,
-            node_entity_ids=node_entity_ids,
+            node_entity_ids=resolved_node_entity_ids,
         )
         for contract_delta in contract_deltas
     ]
@@ -153,8 +159,16 @@ def validate_entity_anchors(
         for delta in deltas
         for entity_id in delta.source_entity_ids
     }
-    existing_entity_ids = entity_reader.existing_entity_ids(entity_ids)
-    missing_entity_ids = sorted(entity_ids - existing_entity_ids)
+    upserted_entity_ids = {
+        entity_id
+        for delta in deltas
+        for entity_id in _node_upsert_entity_ids_from_payload(delta.payload)
+    }
+    entity_ids_requiring_existing_anchor = entity_ids - upserted_entity_ids
+    existing_entity_ids = entity_reader.existing_entity_ids(
+        entity_ids_requiring_existing_anchor,
+    )
+    missing_entity_ids = sorted(entity_ids_requiring_existing_anchor - existing_entity_ids)
     if missing_entity_ids:
         raise ValueError(
             "missing entity anchors: " + ", ".join(missing_entity_ids),
@@ -169,7 +183,7 @@ def build_promotion_plan(
     """Parse frozen candidate deltas into a stable promotion plan."""
 
     sorted_deltas = sorted(deltas, key=lambda delta: delta.delta_id)
-    node_records: list[GraphNodeRecord] = []
+    node_records_by_id: dict[str, GraphNodeRecord] = {}
     edge_records: list[GraphEdgeRecord] = []
     assertion_records: list[GraphAssertionRecord] = []
 
@@ -178,8 +192,11 @@ def build_promotion_plan(
         _reject_forbidden_payload_fields(delta.payload)
 
         if delta.delta_type == "node_add":
-            node_records.append(_parse_node_record(delta))
+            node_record = _parse_node_record(delta)
+            node_records_by_id[node_record.node_id] = node_record
         elif delta.delta_type in {"edge_add", "edge_update"}:
+            for node_record in _parse_node_upsert_records(delta):
+                node_records_by_id[node_record.node_id] = node_record
             edge_records.append(_parse_edge_record(delta))
         elif delta.delta_type == "assertion_add":
             assertion_records.append(_parse_assertion_record(delta))
@@ -188,7 +205,7 @@ def build_promotion_plan(
         cycle_id=cycle_id,
         selection_ref=selection_ref,
         delta_ids=[delta.delta_id for delta in sorted_deltas],
-        node_records=node_records,
+        node_records=list(node_records_by_id.values()),
         edge_records=edge_records,
         assertion_records=assertion_records,
         created_at=datetime.now(timezone.utc),
@@ -226,6 +243,22 @@ def _parse_edge_record(delta: FrozenGraphDelta) -> GraphEdgeRecord:
             f"{edge_record.relationship_type!r}",
         )
     return edge_record
+
+
+def _parse_node_upsert_records(delta: FrozenGraphDelta) -> list[GraphNodeRecord]:
+    contract_delta = _contract_delta_from_payload(delta.payload)
+    if contract_delta is None:
+        return []
+
+    node_records: list[GraphNodeRecord] = []
+    for node_payload in _node_upsert_payloads_from_contract_delta(contract_delta):
+        node_record = GraphNodeRecord.model_validate(node_payload)
+        if node_record.label not in _VALID_NODE_LABELS:
+            raise ValueError(
+                f"delta {delta.delta_id} uses unsupported node label {node_record.label!r}",
+            )
+        node_records.append(node_record)
+    return node_records
 
 
 def _parse_assertion_record(delta: FrozenGraphDelta) -> GraphAssertionRecord:
@@ -269,13 +302,12 @@ def _edge_payload_from_contract_delta(
     properties = dict(contract_delta.properties)
     existing_refs = set(evidence_refs_from_mapping(properties))
     properties["evidence_refs"] = sorted(existing_refs | set(evidence_refs))
+    relationship_type = _internal_relationship_type_for_contract_delta(contract_delta)
     return {
-        "edge_id": contract_delta.delta_id,
+        "edge_id": _edge_id_for_contract_delta(contract_delta, relationship_type),
         "source_node_id": contract_delta.source_node,
         "target_node_id": contract_delta.target_node,
-        "relationship_type": _internal_relationship_type_for_contract_delta(
-            contract_delta,
-        ),
+        "relationship_type": relationship_type,
         "properties": properties,
         "weight": _edge_weight(properties),
         "created_at": created_at,
@@ -299,6 +331,88 @@ def _internal_relationship_type_for_contract_delta(
 
 def _contract_token(value: str) -> str:
     return value.strip().lower().replace("-", "_")
+
+
+def _edge_id_for_contract_delta(
+    contract_delta: CandidateGraphDelta,
+    relationship_type: str,
+) -> str:
+    explicit_edge_id = contract_delta.properties.get("edge_id")
+    if isinstance(explicit_edge_id, str) and explicit_edge_id.strip():
+        return explicit_edge_id.strip()
+    if relationship_type not in _HOLDINGS_UPSERT_RELATIONSHIP_TYPES:
+        return contract_delta.delta_id
+
+    explicit_edge_key = contract_delta.properties.get("edge_key")
+    material = (
+        explicit_edge_key
+        if isinstance(explicit_edge_key, str) and explicit_edge_key.strip()
+        else "|".join(
+            (
+                relationship_type,
+                contract_delta.source_node,
+                contract_delta.target_node,
+            )
+        )
+    )
+    digest = hashlib.sha256(str(material).encode("utf-8")).hexdigest()[:24]
+    return f"{relationship_type.lower()}:{digest}"
+
+
+def _node_upsert_entity_ids_by_node_id(
+    contract_deltas: Sequence[CandidateGraphDelta],
+) -> dict[str, str]:
+    upsert_entity_ids: dict[str, str] = {}
+    for contract_delta in contract_deltas:
+        for node_payload in _node_upsert_payloads_from_contract_delta(contract_delta):
+            node_id = node_payload.get("node_id")
+            canonical_entity_id = node_payload.get("canonical_entity_id")
+            if isinstance(node_id, str) and isinstance(canonical_entity_id, str):
+                upsert_entity_ids[node_id] = canonical_entity_id
+    return upsert_entity_ids
+
+
+def _node_upsert_entity_ids_from_payload(payload: Mapping[str, Any]) -> set[str]:
+    contract_delta = _contract_delta_from_payload(payload)
+    if contract_delta is None:
+        return set()
+    return {
+        str(node_payload["canonical_entity_id"])
+        for node_payload in _node_upsert_payloads_from_contract_delta(contract_delta)
+        if isinstance(node_payload.get("canonical_entity_id"), str)
+    }
+
+
+def _node_upsert_payloads_from_contract_delta(
+    contract_delta: CandidateGraphDelta,
+) -> list[Mapping[str, Any]]:
+    producer_context = contract_delta.producer_context
+    if not isinstance(producer_context, Mapping):
+        return []
+    raw_upserts = producer_context.get("graph_node_upserts")
+    if raw_upserts is None:
+        return []
+    return _coerce_node_upsert_payloads(raw_upserts)
+
+
+def _coerce_node_upsert_payloads(value: Any) -> list[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        if "node_id" in value:
+            return [value]
+        payloads: list[Mapping[str, Any]] = []
+        for key in ("source", "source_node", "target", "target_node"):
+            nested_value = value.get(key)
+            if isinstance(nested_value, Mapping):
+                payloads.append(nested_value)
+        return payloads
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        payloads = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                raise ValueError("graph_node_upserts entries must be mappings")
+            payloads.append(item)
+        return payloads
+    raise ValueError("graph_node_upserts must be a mapping or sequence of mappings")
 
 
 def _edge_payload_with_evidence_refs(
