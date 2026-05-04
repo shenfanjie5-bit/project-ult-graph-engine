@@ -79,10 +79,7 @@ def freeze_contract_deltas(
     """Adapt contract graph deltas after resolving endpoint nodes to entity anchors."""
 
     endpoint_node_ids = _supported_contract_endpoint_node_ids(contract_deltas)
-    upsert_node_entity_ids = _node_upsert_entity_ids_by_node_id(
-        contract_deltas,
-        endpoint_node_ids=endpoint_node_ids,
-    )
+    upsert_node_entity_ids = _node_upsert_entity_ids_by_node_id(contract_deltas)
     node_entity_ids = (
         entity_reader.canonical_entity_ids_for_node_ids(endpoint_node_ids)
         if endpoint_node_ids
@@ -343,11 +340,12 @@ def _edge_id_for_contract_delta(
     contract_delta: CandidateGraphDelta,
     relationship_type: str,
 ) -> str:
+    if relationship_type not in _HOLDINGS_UPSERT_RELATIONSHIP_TYPES:
+        return contract_delta.delta_id
+
     explicit_edge_id = contract_delta.properties.get("edge_id")
     if isinstance(explicit_edge_id, str) and explicit_edge_id.strip():
         return explicit_edge_id.strip()
-    if relationship_type not in _HOLDINGS_UPSERT_RELATIONSHIP_TYPES:
-        return contract_delta.delta_id
 
     explicit_edge_key = contract_delta.properties.get("edge_key")
     material = (
@@ -367,16 +365,18 @@ def _edge_id_for_contract_delta(
 
 def _node_upsert_entity_ids_by_node_id(
     contract_deltas: Sequence[CandidateGraphDelta],
-    *,
-    endpoint_node_ids: set[str],
 ) -> dict[str, str]:
     upsert_entity_ids: dict[str, str] = {}
     for contract_delta in contract_deltas:
+        delta_endpoint_node_ids = {
+            contract_delta.source_node,
+            contract_delta.target_node,
+        }
         for node_record in _node_upsert_records_from_contract_delta(
             contract_delta.delta_id,
             contract_delta,
         ):
-            if node_record.node_id not in endpoint_node_ids:
+            if node_record.node_id not in delta_endpoint_node_ids:
                 raise ValueError(
                     "graph_node_upserts are endpoint-only; unsupported node ids: "
                     f"{node_record.node_id}",
