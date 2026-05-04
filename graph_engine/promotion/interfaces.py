@@ -21,13 +21,13 @@ class CandidateDeltaReader(Protocol):
 
 
 class EntityAnchorReader(Protocol):
-    """Read endpoint entity mappings and canonical entity anchors."""
+    """Read endpoint mappings and public entity-registry anchors."""
 
     def canonical_entity_ids_for_node_ids(self, node_ids: set[str]) -> dict[str, str]:
         """Return canonical entity ids for graph node ids referenced by contract deltas."""
 
     def existing_entity_ids(self, entity_ids: set[str]) -> set[str]:
-        """Return the subset of entity ids that already exist as canonical anchors."""
+        """Return entity ids that already exist as canonical entity-registry anchors."""
 
 
 class CanonicalWriter(Protocol):

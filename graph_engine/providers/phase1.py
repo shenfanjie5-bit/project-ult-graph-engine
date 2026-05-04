@@ -107,9 +107,10 @@ class GraphPhase1Runtime(Protocol):
 class GraphPhase1Service:
     """Default runtime backed by graph-engine services.
 
-    This service expects data-platform-facing adapters for candidate reads and
-    Layer A writes. Graph-engine does not synthesize Phase 0 data: it only
-    consumes the frozen candidate selection reference emitted by Phase 0.
+    This service expects externally injected adapters for candidate reads,
+    entity-registry anchor reads, Layer A writes, and regime context reads.
+    Graph-engine does not synthesize Phase 0 data: it only consumes the
+    frozen candidate selection reference emitted by Phase 0.
     """
 
     def __init__(
@@ -176,6 +177,16 @@ class GraphPhase1Service:
         self,
         request: GraphSnapshotAssetRequest,
     ) -> GraphSnapshotAssetResult:
+        # spec v5.0.1 L466 + audit ⚠️ #11: Layer C must read
+        # world_state(N-1), not (N). Guard against the orchestrator
+        # accidentally passing the current cycle's ref — that would feed
+        # propagation its own output. The orchestrator wiring is
+        # responsible for resolving the actual previous-cycle ref;
+        # here we only ensure the obvious self-reference is rejected.
+        _validate_world_state_ref_is_not_current_cycle(
+            request.world_state_ref,
+            request.cycle_id,
+        )
         graph_snapshot, impact_snapshot = compute_graph_snapshots(
             request.cycle_id,
             request.world_state_ref,
@@ -281,10 +292,20 @@ class GraphPhase1AssetFactoryProvider:
         return ()
 
     def get_resources(self) -> Mapping[str, object]:
+        # Check runtime configuration BEFORE the dagster availability check
+        # so the error message ("not configured") is the one callers act on
+        # rather than the implicit "Dagster is required" prerequisite.
+        if self.runtime is None:
+            # Phase 0 pattern (M2.3a-2): raise an explicit error rather than
+            # silently substituting a fail-closed runtime that only surfaces
+            # at asset-evaluation time. The orchestrator's
+            # ``_resolve_graph_phase1_provider`` (or any caller) is expected
+            # to either pass a runtime explicitly or call
+            # ``build_graph_phase1_runtime_from_env`` ahead of time.
+            raise RuntimeError(_FAIL_CLOSED_RUNTIME_MESSAGE)
         dagster = _require_dagster()
-        runtime = self.runtime or _FailClosedGraphPhase1Runtime()
         return {
-            self.resource_key: dagster.ResourceDefinition.hardcoded_resource(runtime),
+            self.resource_key: dagster.ResourceDefinition.hardcoded_resource(self.runtime),
         }
 
 
@@ -294,12 +315,146 @@ def build_graph_phase1_provider(
     resource_key: str = GRAPH_PHASE1_RESOURCE_KEY,
     world_state_ref: str = "world-state:latest",
 ) -> GraphPhase1AssetFactoryProvider:
-    """Return an orchestrator-compatible graph Phase 1 provider."""
+    """Return an orchestrator-compatible graph Phase 1 provider.
 
+    If ``runtime`` is omitted, an env-driven runtime is constructed via
+    :func:`build_graph_phase1_runtime_from_env`. Callers that want
+    fail-closed behaviour on env misconfiguration must catch
+    :class:`EnvironmentError` (cf. orchestrator's
+    ``_resolve_graph_phase1_provider`` helper) or use
+    :func:`build_fail_closed_graph_phase1_provider` to obtain a provider
+    whose runtime is the typed fail-closed stub.
+    """
+
+    if runtime is None:
+        runtime = build_graph_phase1_runtime_from_env(
+            world_state_ref=world_state_ref,
+        )
     return GraphPhase1AssetFactoryProvider(
         runtime,
         resource_key=resource_key,
         world_state_ref=world_state_ref,
+    )
+
+
+def build_fail_closed_graph_phase1_provider(
+    *,
+    resource_key: str = GRAPH_PHASE1_RESOURCE_KEY,
+    world_state_ref: str = "world-state:latest",
+) -> GraphPhase1AssetFactoryProvider:
+    """Construct a Phase 1 provider whose runtime fails closed at evaluation.
+
+    Public alternative to ``build_graph_phase1_provider(runtime=
+    _FailClosedGraphPhase1Runtime())`` so callers (e.g. orchestrator's
+    ``_default_graph_phase1_provider`` fall-back) do not have to import
+    the leading-underscore private class across module boundaries.
+    """
+
+    return build_graph_phase1_provider(
+        runtime=_FailClosedGraphPhase1Runtime(),
+        resource_key=resource_key,
+        world_state_ref=world_state_ref,
+    )
+
+
+def build_graph_phase1_runtime_from_env(
+    *,
+    world_state_ref: str = "world-state:latest",
+    candidate_reader: CandidateDeltaReader | None = None,
+    entity_reader: EntityAnchorReader | None = None,
+    canonical_writer: CanonicalWriter | None = None,
+    regime_reader: RegimeContextReader | None = None,
+    snapshot_writer: SnapshotWriter | None = None,
+) -> GraphPhase1Runtime:
+    """Construct a real :class:`GraphPhase1Service` from environment variables.
+
+    Composes the graph-engine owned pieces required by the Phase 1 service:
+
+    * :class:`graph_engine.client.Neo4jClient` from ``NEO4J_*`` env (graph-engine).
+    * :class:`graph_engine.status.GraphStatusManager` over
+      :class:`graph_engine.status.PostgreSQLStatusStore` from ``DATABASE_URL``.
+    * :class:`graph_engine.snapshots.FormalArtifactSnapshotWriter` from
+      ``GRAPH_PHASE1_SNAPSHOT_ARTIFACT_ROOT`` (snapshot-writer-internal env).
+
+    Cross-module pieces must be supplied by orchestrator / assembly via the
+    Protocol arguments: ``candidate_reader``, ``entity_reader``,
+    ``canonical_writer``, and ``regime_reader``. Graph-engine never imports
+    data-platform or main-core adapter implementations. Raises
+    :class:`EnvironmentError` when env-driven construction of any
+    graph-engine-owned piece fails or when a required injected Protocol is
+    omitted.
+    """
+
+    import os
+    from pathlib import Path
+
+    from graph_engine.client import Neo4jClient
+    from graph_engine.config import load_config_from_env
+    from graph_engine.snapshots import FormalArtifactSnapshotWriter
+    from graph_engine.status import GraphStatusManager, PostgreSQLStatusStore
+
+    # --- graph-engine internals (NEO4J_* + DATABASE_URL) -------------------
+
+    try:
+        neo4j_config = load_config_from_env()
+    except (ValueError, RuntimeError) as exc:
+        raise EnvironmentError(
+            "Phase 1 runtime requires NEO4J_URI/USER/PASSWORD/DATABASE for "
+            "the live-graph client",
+        ) from exc
+
+    try:
+        store = PostgreSQLStatusStore.from_database_url()
+    except (RuntimeError, ValueError) as exc:
+        raise EnvironmentError(
+            "Phase 1 runtime requires DATABASE_URL pointing at the "
+            "PostgreSQL instance hosting neo4j_graph_status",
+        ) from exc
+
+    client = Neo4jClient(neo4j_config)
+    status_manager = GraphStatusManager(store)
+
+    # --- snapshot writer (graph-engine, FormalArtifactSnapshotWriter) -------
+
+    if snapshot_writer is None:
+        artifact_root = os.environ.get("GRAPH_PHASE1_SNAPSHOT_ARTIFACT_ROOT")
+        if not artifact_root:
+            raise EnvironmentError(
+                "Phase 1 runtime requires GRAPH_PHASE1_SNAPSHOT_ARTIFACT_ROOT "
+                "for the formal artifact snapshot writer",
+            )
+        snapshot_writer = FormalArtifactSnapshotWriter(Path(artifact_root))
+
+    # --- injected cross-module adapters ------------------------------------
+
+    missing_dependencies = [
+        name
+        for name, value in (
+            ("candidate_reader", candidate_reader),
+            ("entity_reader", entity_reader),
+            ("canonical_writer", canonical_writer),
+            ("regime_reader", regime_reader),
+        )
+        if value is None
+    ]
+    if missing_dependencies:
+        raise EnvironmentError(
+            "Phase 1 runtime requires injected Protocol adapters for "
+            + ", ".join(missing_dependencies)
+            + "; graph-engine does not import data-platform or main-core "
+            "adapter implementations",
+        )
+
+    # --- compose the real service ------------------------------------------
+
+    return GraphPhase1Service(
+        candidate_reader=candidate_reader,
+        entity_reader=entity_reader,
+        canonical_writer=canonical_writer,
+        client=client,
+        status_manager=status_manager,
+        regime_reader=regime_reader,
+        snapshot_writer=snapshot_writer,
     )
 
 
@@ -360,8 +515,8 @@ class _FailClosedGraphPhase1Runtime:
 
 _FAIL_CLOSED_RUNTIME_MESSAGE = (
     "Graph Phase 1 runtime dependencies are not configured; provide real "
-    "candidate_reader, canonical_writer, Neo4j client/status, regime_reader, "
-    "and formal artifact snapshot writer resources."
+    "candidate_reader, entity_reader, canonical_writer, Neo4j client/status, "
+    "regime_reader, and formal artifact snapshot writer resources."
 )
 
 
@@ -469,6 +624,41 @@ def _world_state_ref_from_promotion(
     return str(value)
 
 
+def _validate_world_state_ref_is_not_current_cycle(
+    world_state_ref: str,
+    current_cycle_id: str,
+) -> None:
+    """Reject world_state_ref values that point at the current cycle.
+
+    spec L466: Layer C must read world_state(N-1), not (N). The
+    canonical refs we recognise are:
+
+      - ``world-state:latest`` — caller is letting Layer C resolve the
+        latest published world state (orchestrator must ensure this is
+        not the current in-flight cycle's, but it is intentionally
+        opaque here);
+      - ``world-state:{cycle_id}`` — caller has resolved a specific
+        cycle's world_state to read.
+
+    Refs of the second form are checked literally against the current
+    cycle_id; matches raise ValueError so the orchestrator's Phase 1
+    wiring fails loudly instead of silently feeding propagation its own
+    output. Other shapes are accepted (defensive — we don't pretend to
+    own the ref grammar; that's a contracts concern).
+    """
+
+    if not world_state_ref or not current_cycle_id:
+        return
+    if world_state_ref == f"world-state:{current_cycle_id}":
+        raise ValueError(
+            f"Layer C must read world_state(N-1) (spec L466); got "
+            f"world_state_ref={world_state_ref!r} which points at the "
+            f"current cycle {current_cycle_id!r}. The orchestrator's "
+            "Phase 1 wiring must resolve the previous cycle's "
+            "world_state ref before invoking compute_graph_snapshot."
+        )
+
+
 def _artifact_ref_from_snapshot_writer(
     snapshot_writer: SnapshotWriter,
     graph_snapshot: GraphSnapshot,
@@ -547,6 +737,8 @@ __all__ = [
     "GraphPromotionAssetResult",
     "GraphSnapshotAssetRequest",
     "GraphSnapshotAssetResult",
+    "build_fail_closed_graph_phase1_provider",
     "build_graph_phase1_provider",
+    "build_graph_phase1_runtime_from_env",
     "prove_cold_reload_artifact",
 ]

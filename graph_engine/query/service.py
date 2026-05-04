@@ -13,7 +13,9 @@ from graph_engine.models import (
     GraphQueryResult,
     PropagationChannel,
 )
-from graph_engine.propagation.channels import effective_channel_expression
+from graph_engine.propagation.channels import (
+    PROPAGATION_CHANNELS_BY_RELATIONSHIP_TYPE,
+)
 from graph_engine.status import GraphStatusManager
 
 MAX_QUERY_DEPTH = 4
@@ -40,7 +42,6 @@ _EDGE_STRUCTURAL_PROPERTY_KEYS = frozenset(
         "weight",
     },
 )
-
 
 @dataclass(frozen=True)
 class BoundedSubgraph:
@@ -294,8 +295,16 @@ def _path_query(depth: int) -> str:
 
 
 def _frontier_expansion_query(*, include_channel: bool) -> str:
-    channel_expression = effective_channel_expression("relationship")
-    channel_projection = f"{channel_expression} AS channel" if include_channel else "null AS channel"
+    channel_projection = (
+        f"{_channel_projection_list_expression()} AS channels"
+        if include_channel
+        else "null AS channel"
+    )
+    channel_expansion = (
+        "UNWIND channels AS channel"
+        if include_channel
+        else ""
+    )
     channel_filter = (
         "WHERE $channel_filter IS NULL OR channel IN $channel_filter"
         if include_channel
@@ -304,6 +313,7 @@ def _frontier_expansion_query(*, include_channel: bool) -> str:
     order_by = (
         "ORDER BY coalesce(relationship.weight, 1.0) DESC,\n"
         "         relationship_key,\n"
+        "         channel,\n"
         "         source_key,\n"
         "         type(relationship),\n"
         "         target_key,\n"
@@ -353,6 +363,7 @@ WITH relationship,
      neighbor,
      coalesce(neighbor.node_id, elementId(neighbor)) AS neighbor_key,
      {channel_projection}
+{channel_expansion}
 {channel_filter}
 {order_by}
 LIMIT $per_depth_limit
@@ -388,6 +399,34 @@ RETURN relationship_key,
            weight: coalesce(relationship.weight, 1.0)
        }} AS relationship
 """
+
+
+def _channel_projection_list_expression(relationship_variable: str = "relationship") -> str:
+    default_channel_cases = "\n".join(
+        (
+            f'             WHEN "{relationship_type}" THEN '
+            f"{_cypher_string_list(channels)}"
+        )
+        for relationship_type, channels in PROPAGATION_CHANNELS_BY_RELATIONSHIP_TYPE.items()
+    )
+    return (
+        "CASE\n"
+        f"         WHEN {relationship_variable}.propagation_channel IS NOT NULL "
+        f"THEN [{relationship_variable}.propagation_channel]\n"
+        f"         WHEN {relationship_variable}.channel IS NOT NULL "
+        f"THEN [{relationship_variable}.channel]\n"
+        f"         WHEN {relationship_variable}.impact_channel IS NOT NULL "
+        f"THEN [{relationship_variable}.impact_channel]\n"
+        f"         ELSE CASE type({relationship_variable})\n"
+        f"{default_channel_cases}\n"
+        "             ELSE []\n"
+        "         END\n"
+        "     END"
+    )
+
+
+def _cypher_string_list(values: tuple[str, ...]) -> str:
+    return "[" + ", ".join(f'"{value}"' for value in values) + "]"
 
 
 def _read_propagation_paths(
@@ -450,19 +489,15 @@ def _read_propagation_paths(
             frontier_node_keys=frontier_node_keys,
             visited_relationship_keys=visited_relationship_keys,
             result_limit=result_limit,
-            include_channel=True,
+            include_channel=False,
         )
-        path_rows = (
-            frontier_rows
-            if channel_set is None
-            else _read_frontier_rows(
-                client,
-                frontier_node_keys=frontier_node_keys,
-                visited_relationship_keys=visited_relationship_keys,
-                result_limit=result_limit,
-                include_channel=True,
-                channels=channels,
-            )
+        path_rows = _read_frontier_rows(
+            client,
+            frontier_node_keys=frontier_node_keys,
+            visited_relationship_keys=visited_relationship_keys,
+            result_limit=result_limit,
+            include_channel=True,
+            channels=channels,
         )
         if len(frontier_rows) > result_limit:
             frontier_limit_reached = True
@@ -937,13 +972,16 @@ def _edge_sort_key(edge: Mapping[str, Any]) -> tuple[bool, str, str, str, str]:
     )
 
 
-def _path_sort_key(path: Mapping[str, Any]) -> tuple[float, int, bool, str, str, str, str]:
+def _path_sort_key(
+    path: Mapping[str, Any],
+) -> tuple[float, int, bool, str, str, str, str, str]:
     edge_id = _sort_text(path.get("edge_id"))
     return (
         -_float_or_default(path.get("score"), 0.0),
         _int_or_default(path.get("path_length"), 0),
         edge_id == "",
         edge_id,
+        _sort_text(path.get("channel")),
         _sort_text(path.get("source_node_id")),
         _sort_text(path.get("relationship_type")),
         _sort_text(path.get("target_node_id")),

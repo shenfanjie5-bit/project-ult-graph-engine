@@ -200,7 +200,16 @@ WHERE status_key = %s
             raise
         finally:
             if locked:
-                assert lock_key is not None
+                if lock_key is None:
+                    # Invariant: lock_key is set inside the cursor block above
+                    # before `locked` becomes True, so it cannot be None when
+                    # entering this branch. Retained as explicit raise so
+                    # the invariant survives `python -O`. Critical because
+                    # this sits inside a PG-backed locking flow where None
+                    # would corrupt the unlock SQL.
+                    raise AssertionError(
+                        "invariant: lock_key must be non-None when locked=True"
+                    )
                 try:
                     with connection.cursor() as cursor:
                         cursor.execute(
@@ -416,7 +425,15 @@ def _build_psycopg_connection_factory(
             "PostgreSQLStatusStore requires the optional 'psycopg' package",
         ) from exc
 
-    return lambda: psycopg.connect(database_url, **connect_kwargs)
+    psycopg_database_url = _normalize_psycopg_database_url(database_url)
+    return lambda: psycopg.connect(psycopg_database_url, **connect_kwargs)
+
+
+def _normalize_psycopg_database_url(database_url: str) -> str:
+    sqlalchemy_psycopg_scheme = "postgresql+psycopg://"
+    if database_url.startswith(sqlalchemy_psycopg_scheme):
+        return "postgresql://" + database_url.removeprefix(sqlalchemy_psycopg_scheme)
+    return database_url
 
 
 def _quote_qualified_identifier(identifier: str) -> str:

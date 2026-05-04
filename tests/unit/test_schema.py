@@ -28,7 +28,13 @@ def test_relationship_type_enum_covers_core_relationships() -> None:
         "SECTOR_MEMBERSHIP",
         "EVENT_IMPACT",
         "ASSERTION_LINK",
+        "CO_HOLDING",
+        "NORTHBOUND_HOLD",
     }
+    assert "TOP_SHAREHOLDER" not in {relationship.name for relationship in RelationshipType}
+    assert "PLEDGE_STATUS" not in {relationship.name for relationship in RelationshipType}
+    assert "MAJOR_CUSTOMER" not in {relationship.name for relationship in RelationshipType}
+    assert "MAJOR_SUPPLIER" not in {relationship.name for relationship in RelationshipType}
 
 
 def test_get_index_statements_returns_idempotent_cypher() -> None:

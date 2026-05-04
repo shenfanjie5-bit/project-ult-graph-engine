@@ -18,7 +18,7 @@ from graph_engine.models import (
 )
 from graph_engine.propagation._gds import execute_gds_read, execute_gds_write
 from graph_engine.propagation.channels import (
-    DEFAULT_CHANNEL_BY_RELATIONSHIP_TYPE,
+    PROPAGATION_CHANNELS_BY_RELATIONSHIP_TYPE,
     effective_channel_selector,
 )
 from graph_engine.propagation.pipeline import run_full_propagation
@@ -545,32 +545,41 @@ def _node_ids(nodes: list[dict[str, Any]]) -> list[str]:
 def _edge_ids_by_channel(edges: list[dict[str, Any]]) -> dict[str, list[str]]:
     edge_ids_by_channel: dict[str, list[str]] = {channel: [] for channel in _DEFAULT_CHANNELS}
     for edge in edges:
-        channel = _edge_channel(edge)
         edge_id = edge.get("edge_id")
-        if channel is None or edge_id is None:
+        if edge_id is None:
             continue
-        edge_ids_by_channel.setdefault(channel, []).append(str(edge_id))
+        for channel in _edge_channels(edge):
+            edge_ids_by_channel.setdefault(channel, []).append(str(edge_id))
     return {
         channel: _unique_text_values(edge_ids)
         for channel, edge_ids in edge_ids_by_channel.items()
     }
 
 
-def _edge_channel(edge: Mapping[str, Any]) -> str | None:
+def _edge_channels(edge: Mapping[str, Any]) -> tuple[str, ...]:
     properties = edge.get("properties")
     property_map = properties if isinstance(properties, Mapping) else {}
-    explicit_channel = (
-        property_map.get("propagation_channel")
-        or property_map.get("channel")
-        or property_map.get("impact_channel")
-    )
-    if explicit_channel is not None:
-        return str(explicit_channel)
+    for property_name in ("propagation_channel", "channel", "impact_channel"):
+        explicit_channels = _coerced_channels(property_map.get(property_name))
+        if explicit_channels:
+            return explicit_channels
 
     relationship_type = edge.get("relationship_type")
     if relationship_type is None:
-        return None
-    return DEFAULT_CHANNEL_BY_RELATIONSHIP_TYPE.get(str(relationship_type))
+        return ()
+    return PROPAGATION_CHANNELS_BY_RELATIONSHIP_TYPE.get(str(relationship_type), ())
+
+
+def _coerced_channels(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    raw_values = value if isinstance(value, (list, tuple, set)) else (value,)
+    allowed_channels = set(_DEFAULT_CHANNELS)
+    return tuple(
+        channel
+        for channel in _unique_text_values(list(raw_values))
+        if channel in allowed_channels
+    )
 
 
 def _unique_text_values(values: Iterator[Any] | list[Any]) -> list[str]:

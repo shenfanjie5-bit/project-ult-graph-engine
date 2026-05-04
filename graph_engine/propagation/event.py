@@ -14,12 +14,14 @@ from graph_engine.propagation._gds import (
     execute_gds_read,
     execute_gds_write,
 )
-from graph_engine.propagation.channels import effective_channel_selector
+from graph_engine.propagation.channels import (
+    effective_channel_selector,
+    relationship_types_for_channel,
+)
 from graph_engine.propagation.scoring import build_score_explanation
-from graph_engine.schema.definitions import RelationshipType
 from graph_engine.status import GraphStatusManager, hold_ready_read
 
-EVENT_RELATIONSHIP_TYPES = (RelationshipType.EVENT_IMPACT.value,)
+EVENT_RELATIONSHIP_TYPES = relationship_types_for_channel("event")
 _EVENT_CHANNEL = "event"
 _EVENT_PATH_SELECTOR = effective_channel_selector(_EVENT_CHANNEL)
 

@@ -146,8 +146,21 @@ class MissingGDSClient:
 
 
 def test_phase1_provider_assets_have_required_ancestry() -> None:
+    """Asset shapes are independent of the runtime; pass a sentinel runtime
+    so the provider construction does not require live env (M2.3a-2: the
+    no-arg ``build_graph_phase1_provider()`` now triggers env-driven runtime
+    construction which would fail in this unit-test venv)."""
+
     dagster = pytest.importorskip("dagster")
-    provider = build_graph_phase1_provider()
+
+    class _SentinelRuntime:
+        def promote_graph(self, request):  # type: ignore[no-untyped-def]
+            raise NotImplementedError
+
+        def compute_graph_snapshot(self, request):  # type: ignore[no-untyped-def]
+            raise NotImplementedError
+
+    provider = build_graph_phase1_provider(runtime=_SentinelRuntime())
 
     asset_by_key = {
         asset_key: asset_def

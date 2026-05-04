@@ -14,6 +14,7 @@ from contracts.schemas import (
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from graph_engine.evidence import evidence_refs_from_properties
+from graph_engine.schema.definitions import RelationshipType
 
 __all__ = [
     "CandidateGraphDelta",
@@ -39,11 +40,13 @@ PropagationChannel = Literal["fundamental", "event", "reflexive"]
 _ALLOWED_PROPAGATION_CHANNELS: frozenset[str] = frozenset(get_args(PropagationChannel))
 _PROPAGATABLE_RELATIONSHIP_TYPES: frozenset[str] = frozenset(
     {
-        "SUPPLY_CHAIN",
-        "OWNERSHIP",
-        "INDUSTRY_CHAIN",
-        "SECTOR_MEMBERSHIP",
-        "EVENT_IMPACT",
+        RelationshipType.SUPPLY_CHAIN.value,
+        RelationshipType.OWNERSHIP.value,
+        RelationshipType.INDUSTRY_CHAIN.value,
+        RelationshipType.SECTOR_MEMBERSHIP.value,
+        RelationshipType.EVENT_IMPACT.value,
+        RelationshipType.CO_HOLDING.value,
+        RelationshipType.NORTHBOUND_HOLD.value,
     }
 )
 _PROPAGATION_CHANNEL_PROPERTY_NAMES: tuple[str, ...] = (

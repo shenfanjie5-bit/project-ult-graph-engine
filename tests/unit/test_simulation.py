@@ -98,7 +98,7 @@ class FakeSimulationClient:
         rows = [
             edge
             for edge in self.live_edges
-            if channel is None or _edge_channel(edge) == channel
+            if channel is None or channel in _edge_channels(edge)
         ]
         return [
             {
@@ -173,7 +173,7 @@ class FakeSimulationClient:
         rows = [
             edge
             for edge in self.live_edges
-            if edge["edge_id"] in edge_ids and (channel is None or _edge_channel(edge) == channel)
+            if edge["edge_id"] in edge_ids and (channel is None or channel in _edge_channels(edge))
         ]
         return [
             {
@@ -665,6 +665,23 @@ def test_reflexive_tagged_ownership_is_not_counted_as_fundamental() -> None:
     assert channels_by_edge_id["edge-reflexive"] == {"reflexive"}
 
 
+def test_northbound_hold_participates_in_event_and_reflexive_simulation() -> None:
+    client = FakeSimulationClient()
+
+    result = simulate_readonly_impact(
+        ["entity-a"],
+        _request(enabled_channels=["event", "reflexive"]),
+        client=client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+    )
+
+    channels_by_edge_id: dict[str, set[str]] = {}
+    for path in result["activated_paths"]:
+        channels_by_edge_id.setdefault(str(path["edge_id"]), set()).add(str(path["channel"]))
+
+    assert channels_by_edge_id["edge-northbound"] == {"event", "reflexive"}
+
+
 def test_examples_do_not_import_business_modules() -> None:
     examples_dir = Path(__file__).resolve().parents[2] / "examples"
     for filename in ("consumer_main_core.py", "consumer_stream_layer.py"):
@@ -716,6 +733,14 @@ def _edges() -> list[dict[str, Any]]:
             "relationship_type": "OWNERSHIP",
             "properties": {"propagation_channel": "reflexive"},
             "weight": 3.0,
+        },
+        {
+            "edge_id": "edge-northbound",
+            "source_node_id": "node-a",
+            "target_node_id": "node-b",
+            "relationship_type": "NORTHBOUND_HOLD",
+            "properties": {},
+            "weight": 4.0,
         },
     ]
 
@@ -822,12 +847,21 @@ def _node_key(node: dict[str, Any]) -> str:
 
 
 def _edge_channel(edge: dict[str, Any]) -> str:
+    channels = _edge_channels(edge)
+    return channels[0] if channels else "fundamental"
+
+
+def _edge_channels(edge: dict[str, Any]) -> tuple[str, ...]:
     properties = edge.get("properties", {})
     if properties.get("propagation_channel") is not None:
-        return str(properties["propagation_channel"])
+        return (str(properties["propagation_channel"]),)
     if edge["relationship_type"] == "EVENT_IMPACT":
-        return "event"
-    return "fundamental"
+        return ("event",)
+    if edge["relationship_type"] == "CO_HOLDING":
+        return ("reflexive",)
+    if edge["relationship_type"] == "NORTHBOUND_HOLD":
+        return ("event", "reflexive")
+    return ("fundamental",)
 
 
 def _channel_from_query(query: str) -> str | None:
