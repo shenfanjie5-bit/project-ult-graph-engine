@@ -160,9 +160,11 @@ class TestConsumerSideRoundTripsThroughRealContracts:
         assert consumer_validated.target_node == wire_payload["target_node"]
         assert consumer_validated.relation_type == wire_payload["relation_type"]
 
+    @pytest.mark.parametrize("delta_type", ["upsert_edge", "edge_upsert"])
     @pytest.mark.parametrize("relation_type", ["CO_HOLDING", "NORTHBOUND_HOLD"])
     def test_holdings_relationship_terms_stay_inside_generic_ex3_contract(
         self,
+        delta_type: str,
         relation_type: str,
     ) -> None:
         from contracts.schemas import CandidateGraphDelta
@@ -175,7 +177,7 @@ class TestConsumerSideRoundTripsThroughRealContracts:
         payload = {
             "subsystem_id": "subsystem-holdings",
             "delta_id": f"{relation_type.lower()}-alignment-001",
-            "delta_type": "upsert_edge",
+            "delta_type": delta_type,
             "source_node": "ENT_HOLDING_SRC",
             "target_node": "ENT_HOLDING_DST",
             "relation_type": relation_type,

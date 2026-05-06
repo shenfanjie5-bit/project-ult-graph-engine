@@ -528,6 +528,51 @@ def test_query_propagation_paths_can_filter_northbound_hold_as_reflexive() -> No
     assert any('"NORTHBOUND_HOLD"' in query for query, _ in client.read_calls)
 
 
+def test_query_propagation_paths_can_filter_co_holding_as_reflexive() -> None:
+    client = FakeQueryClient(
+        edges=[
+            {
+                "edge_id": "edge-co-holding",
+                "source_node_id": "node-a",
+                "target_node_id": "node-b",
+                "relationship_type": "CO_HOLDING",
+                "properties": {},
+                "weight": 0.8,
+            }
+        ]
+    )
+
+    result = query_propagation_paths(
+        ["entity-a"],
+        1,
+        client=client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+        channels=["reflexive"],
+        result_limit=5,
+    )
+
+    assert result.paths == [
+        {
+            "channel": "reflexive",
+            "edge_id": "edge-co-holding",
+            "source_node_id": "node-a",
+            "target_node_id": "node-b",
+            "relationship_type": "CO_HOLDING",
+            "score": 0.8,
+            "path_length": 1,
+            "properties": {},
+        }
+    ]
+    assert any(
+        '"CO_HOLDING" THEN ["reflexive"]' in query
+        for query, _ in client.read_calls
+    )
+    assert any(
+        read_parameters.get("channel_filter") == ["reflexive"]
+        for _, read_parameters in client.read_calls
+    )
+
+
 def test_query_propagation_paths_depth_zero_returns_empty_path_summary() -> None:
     client = FakeQueryClient()
 

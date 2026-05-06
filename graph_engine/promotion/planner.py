@@ -38,6 +38,7 @@ _InternalContractDeltaType = Literal["edge_add"]
 _CONTRACT_DELTA_TYPE_TO_INTERNAL: Mapping[str, _InternalContractDeltaType] = {
     "add": "edge_add",
     "add_edge": "edge_add",
+    "edge_upsert": "edge_add",
     "upsert_edge": "edge_add",
     "upsert_relation": "edge_add",
 }
