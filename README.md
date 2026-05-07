@@ -98,6 +98,17 @@ evaluate a controlled opt-in canary for default propagation; it should
 still remain gated and should not be documented as default-enabled or
 broadly rolled out until separate evidence lands.
 
+## MVP20 Read Context
+
+`graph_engine.query.query_mvp20_context_subgraph` is the MVP20 read-side
+helper. It delegates to the status-gated `query_subgraph` path with graph
+depth fixed at `2`, requires exactly 20 decision target entity ids, and
+annotates returned nodes/edges as `decision_target` or `context_only`.
+
+This helper is context-only. It does not enable default propagation, full
+propagation, write routes, new relationships, financial-doc/M4.7 behavior,
+or broad rollout semantics.
+
 CLAUDE.md §10 domain invariants this module enforces by construction:
 
 - **Truth Before Mirror** (#1): Iceberg is canonical truth; Neo4j is

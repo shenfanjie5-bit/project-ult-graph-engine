@@ -11,6 +11,7 @@
         "seed_entity"
       ],
       "entity_id": "ENT_STOCK_600519.SH",
+      "entity_role": "decision_target",
       "impact_score": 1.0
     },
     {
@@ -22,7 +23,20 @@
         "EDGE_600519_300750_MACRO_EVENT"
       ],
       "entity_id": "ENT_STOCK_300750.SZ",
+      "entity_role": "decision_target",
       "impact_score": 0.35
+    },
+    {
+      "channels": [
+        "fundamental"
+      ],
+      "display_name": "Liquor",
+      "drivers": [
+        "EDGE_600519_SECTOR_LIQUOR"
+      ],
+      "entity_id": "SECTOR_LIQUOR",
+      "entity_role": "context_only",
+      "impact_score": 0.12
     }
   ],
   "metadata": {

@@ -19,7 +19,8 @@
       "score": 0.35,
       "seed": "ENT_STOCK_600519.SH",
       "summary": "Macro event channel connects Kweichow Moutai to CATL.",
-      "target": "ENT_STOCK_300750.SZ"
+      "target": "ENT_STOCK_300750.SZ",
+      "target_role": "decision_target"
     },
     {
       "channel": "fundamental",
@@ -35,7 +36,8 @@
       "score": 1.0,
       "seed": "ENT_STOCK_600519.SH",
       "summary": "Kweichow Moutai belongs to the Liquor sector.",
-      "target": "SECTOR_LIQUOR"
+      "target": "SECTOR_LIQUOR",
+      "target_role": "context_only"
     }
   ]
 }
