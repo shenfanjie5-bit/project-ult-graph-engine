@@ -55,8 +55,22 @@ Implemented interface/type decisions:
 - Represent pledge status as `OWNERSHIP` properties such as `pledge_ratio`;
   do not add a separate `PLEDGE_STATUS` relationship.
 - Issue #56 covers enum, planner, query, and propagation-channel support only.
-  Issue #55 remains the later place for co-holding cluster or
-  northbound-anomaly algorithms.
+- Issue #55 is narrowed to holdings-only algorithms. The current
+  implementation adds explicit entry points for `CO_HOLDING`
+  co-holding crowding and `NORTHBOUND_HOLD` northbound anomaly:
+  `HoldingsAlgorithmConfig`, `run_co_holding_crowding`,
+  `run_northbound_anomaly`, and `run_holdings_algorithms`.
+- The #55 implementation is deliberately **not** wired into
+  `run_full_propagation`; callers must opt in through the explicit
+  holdings entry points so the generic event/reflexive channels do not
+  double-count the same holdings edges.
+- Old #55 references to guarantees, related-party/financial-doc
+  propagation, contracts subtype work, `MAJOR_CUSTOMER`, and
+  `MAJOR_SUPPLIER` are superseded for the current execution scope.
+  This module still does not add `TOP_SHAREHOLDER` or `PLEDGE_STATUS`.
+- This is algorithm-level support over a ready live graph read. It does
+  not claim production rollout to live Neo4j, graph writeback, or new
+  cross-module contracts.
 
 CLAUDE.md §10 domain invariants this module enforces by construction:
 
@@ -130,6 +144,15 @@ Focused #56 holdings evidence:
   tests/unit/test_schema.py tests/unit/test_promotion.py \
   tests/unit/test_query.py tests/unit/test_propagation_channels.py \
   tests/boundary/test_red_lines.py -q
+```
+
+Focused #55 holdings-only algorithm evidence:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q \
+  tests/unit/test_propagation_holdings.py tests/unit/test_propagation_merge.py \
+  tests/unit/test_snapshots.py tests/unit/test_propagation_channels.py \
+  tests/unit/test_schema.py tests/boundary/test_red_lines.py
 ```
 
 Refresh global pass/skip counts only after running the full suite in the
