@@ -33,6 +33,7 @@ def promote_graph_deltas(
     client: Neo4jClient | None = None,
     status_manager: GraphStatusManager | None = None,
     sync_to_live_graph: bool = True,
+    allowed_relationship_types: set[str] | None = None,
 ) -> PromotionPlan:
     """Promote selected contract graph deltas, then optionally mirror them to Neo4j."""
 
@@ -48,6 +49,8 @@ def promote_graph_deltas(
     deltas = freeze_contract_deltas(cycle_id, contract_deltas, entity_reader)
     validate_entity_anchors(deltas, entity_reader)
     plan = build_promotion_plan(cycle_id, selection_ref, deltas)
+    if allowed_relationship_types is not None:
+        _validate_allowed_relationship_types(plan, allowed_relationship_types)
 
     if sync_to_live_graph and status_manager is not None:
         status_manager.require_ready()
@@ -67,6 +70,26 @@ def promote_graph_deltas(
         _sync_live_graph_with_status_barrier(plan, client, status_manager)
 
     return plan
+
+
+def _validate_allowed_relationship_types(
+    plan: PromotionPlan,
+    allowed_relationship_types: set[str],
+) -> None:
+    if not allowed_relationship_types:
+        raise ValueError("allowed_relationship_types must not be empty when provided")
+
+    relation_types = sorted({edge.relationship_type for edge in plan.edge_records})
+    disallowed = [
+        relationship_type
+        for relationship_type in relation_types
+        if relationship_type not in allowed_relationship_types
+    ]
+    if disallowed:
+        raise PermissionError(
+            "promotion plan contains relationship types outside the allowlist: "
+            + ", ".join(disallowed),
+        )
 
 
 def _require_contract_delta(delta: object) -> CandidateGraphDelta:
