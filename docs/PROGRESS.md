@@ -1,6 +1,6 @@
 # graph-engine 项目进度总览
 
-> **最后更新**: 2026-05-07
+> **最后更新**: 2026-05-08
 > **项目文档**: [graph-engine.project-doc.md](./graph-engine.project-doc.md)
 > **任务拆解**: [TASK_BREAKDOWN.md](./TASK_BREAKDOWN.md)
 
@@ -32,8 +32,12 @@ event/reflexive propagation、readonly query/simulation、snapshot generation
   safe namespace / artifact root、非默认 disposable Neo4j database label、
   client database match、ready status guard、relationship allowlist、
   evidence manifest 与 sanitized proof output。
-- 下一步是 post-canary operationalization / runbook hardening；之后才
-  进入 controlled opt-in default-propagation canary，不提前声明 default /
+- propagation canary runbook hardening baseline 已补在
+  [PROPAGATION_CANARY_RUNBOOK.md](./PROPAGATION_CANARY_RUNBOOK.md)：锁定
+  disposable DB/default DB guard、Layer A -> sync verification、rollback /
+  read-only algorithm diagnostics 与 evidence hygiene。
+- 下一步是按 hardened runbook 做 post-canary operationalization；之后才
+  评估 controlled opt-in default-propagation canary，不提前声明 default /
   full propagation enabled。
 
 ## 里程碑进度
@@ -55,9 +59,10 @@ event/reflexive propagation、readonly query/simulation、snapshot generation
 
 ## 下一步
 
-1. Post-canary operationalization / runbook hardening。
-2. 在 runbook 与操作 guard 补齐后，再评估 controlled opt-in default-propagation
-   canary。
+1. 按 [PROPAGATION_CANARY_RUNBOOK.md](./PROPAGATION_CANARY_RUNBOOK.md)
+   做 post-canary operationalization。
+2. 在 runbook 与操作 guard 继续经实跑验证后，再评估 controlled opt-in
+   default-propagation canary。
 3. 在单独证据完成前，不声明 default/full propagation enabled、broad
    production rollout complete、M4.7 / financial-doc complete 或 contracts
    subtype 支持。
@@ -69,6 +74,10 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q \
   tests/unit/test_propagation_holdings.py tests/unit/test_propagation_merge.py \
   tests/unit/test_snapshots.py tests/unit/test_propagation_channels.py \
   tests/unit/test_schema.py tests/boundary/test_red_lines.py
+
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q \
+  tests/unit/test_rollout.py tests/unit/test_rollout_runbook.py \
+  tests/unit/test_holdings_live_graph_proof.py
 ```
 
 ## 保留边界

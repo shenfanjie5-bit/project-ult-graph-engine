@@ -166,6 +166,12 @@ def _validate_relationship_allowlist(
     values = {str(value).strip() for value in allowed_relationship_types}
     if "" in values:
         raise ValueError("allowed_relationship_types must not contain empty values")
+    disallowed = sorted(values - HOLDINGS_RELATIONSHIP_ALLOWLIST)
+    if disallowed:
+        raise PermissionError(
+            "allowed_relationship_types may only include holdings relationships: "
+            + ", ".join(disallowed),
+        )
     return values
 
 
