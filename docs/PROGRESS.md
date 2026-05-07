@@ -40,7 +40,7 @@ event/reflexive propagation、readonly query/simulation、snapshot generation
 | Issue | 当前状态 | 说明 |
 |------|----------|------|
 | #56 | 已完成 | `CO_HOLDING` / `NORTHBOUND_HOLD` enum、planner、query、channel 基础能力 |
-| #55 | holdings-only 实现中/待发布 | 当前仅包含 co-holding crowding 与 northbound anomaly 显式算法 |
+| #55 | holdings-only 已完成/closed | 已完成 co-holding crowding 与 northbound anomaly 显式算法；broad/default propagation、financial-doc 与 contracts subtype 均不在本 scope |
 
 ## 验证命令
 
