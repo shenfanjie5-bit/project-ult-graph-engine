@@ -43,8 +43,14 @@ ALLOW_HOLDINGS = {"CO_HOLDING", "NORTHBOUND_HOLD"}
 
 
 class FakeClient:
-    def __init__(self, *, database: str = "graph-canary-test-20260507") -> None:
+    def __init__(
+        self,
+        *,
+        database: str = "graph-canary-test-20260507",
+        rows: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.config = SimpleNamespace(database=database)
+        self.rows = rows or []
         self.read_calls: list[tuple[str, dict[str, Any]]] = []
         self.write_calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -54,7 +60,7 @@ class FakeClient:
         parameters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         self.read_calls.append((query, parameters or {}))
-        return []
+        return list(self.rows)
 
     def execute_write(
         self,
@@ -119,6 +125,17 @@ def test_rollout_guard_requires_confirm_default_db_namespace_and_client_match(tm
     guarded = validate_rollout_config(config, env=ENV)
     with pytest.raises(PermissionError, match="client database does not match"):
         validate_client_database_matches_config(FakeClient(database="graph-canary-test-other"), guarded)
+
+
+def test_rollout_guard_rejects_allowlist_outside_holdings_scope(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(PermissionError, match="holdings relationships"):
+        validate_rollout_config(
+            _config(
+                tmp_path,
+                allowed_relationship_types={"CO_HOLDING", "SUPPLY_CHAIN"},
+            ),
+            env=ENV,
+        )
 
 
 def test_promotion_relation_allowlist_rejects_before_canonical_writer_and_sync(
@@ -242,8 +259,8 @@ def test_canary_runner_writes_evidence_and_uses_explicit_holdings_algorithms(
             northbound_path_count=1,
             total_path_count=2,
             impacted_entity_count=1,
-            co_holding_diagnostics={},
-            northbound_diagnostics={},
+            co_holding_diagnostics={"candidate_pair_count": 3},
+            northbound_diagnostics={"window_count": 2},
         )
 
     monkeypatch.setattr(canary_module, "promote_graph_deltas", fake_promote_graph_deltas)
@@ -279,7 +296,49 @@ def test_canary_runner_writes_evidence_and_uses_explicit_holdings_algorithms(
     assert evidence["mode"] == "canary"
     assert evidence["neo4j_database_label"] == "graph-canary-test-20260507"
     assert evidence["relation_counts"] == {"CO_HOLDING": 1, "NORTHBOUND_HOLD": 1}
+    assert evidence["layer_a_artifact"]["relation_counts"] == {
+        "CO_HOLDING": 1,
+        "NORTHBOUND_HOLD": 1,
+    }
+    assert evidence["edge_readback"]["missing_edge_ids"] == []
+    assert evidence["edge_readback"]["disallowed_relation_types"] == []
+    assert evidence["holdings_algorithms"]["co_holding_diagnostics"] == {
+        "candidate_pair_count": 3,
+    }
+    assert evidence["holdings_algorithms"]["northbound_diagnostics"] == {
+        "window_count": 2,
+    }
     assert "run_full_propagation" not in canary_module.__dict__
+
+
+def test_readback_canary_edges_is_read_only_and_reports_sync_failures() -> None:
+    client = FakeClient(
+        rows=[
+            {"edge_id": "edge-co", "relationship_type": "CO_HOLDING"},
+            {"edge_id": "edge-bad", "relationship_type": "SUPPLY_CHAIN"},
+        ],
+    )
+
+    with pytest.raises(ValueError, match="missing synced canary edges"):
+        canary_module.readback_canary_edges(
+            client,
+            plan=_promotion_plan(),
+            allowed_relationship_types=ALLOW_HOLDINGS,
+        )
+
+    summary = canary_module.readback_canary_edges(
+        client,
+        plan=_promotion_plan(),
+        allowed_relationship_types=ALLOW_HOLDINGS,
+        strict=False,
+    )
+
+    assert summary.missing_edge_ids == ["edge-nb"]
+    assert summary.disallowed_relation_types == ["SUPPLY_CHAIN"]
+    assert summary.relation_counts == {"CO_HOLDING": 1, "SUPPLY_CHAIN": 1}
+    assert client.write_calls == []
+    assert "MATCH" in client.read_calls[0][0]
+    assert "MERGE" not in client.read_calls[0][0]
 
 
 def test_holdings_canary_algorithm_summary_calls_only_explicit_algorithms(
@@ -339,12 +398,13 @@ def _config(
     *,
     namespace: str = "canary-20260507",
     neo4j_database: str = "graph-canary-test-20260507",
+    allowed_relationship_types: set[str] | None = None,
 ) -> LiveGraphRolloutConfig:
     return LiveGraphRolloutConfig(
         namespace=namespace,
         mode="canary",
         neo4j_database=neo4j_database,
-        allowed_relationship_types=set(ALLOW_HOLDINGS),
+        allowed_relationship_types=set(allowed_relationship_types or ALLOW_HOLDINGS),
         artifact_root=tmp_path,
     )
 

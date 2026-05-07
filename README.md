@@ -12,6 +12,8 @@ queries. Sole owner of:
 Source of truth:
 
 - `docs/graph-engine.project-doc.md`
+- `docs/PROPAGATION_CANARY_RUNBOOK.md` (holdings-only propagation
+  canary guardrails and evidence checklist)
 - `CLAUDE.md` (project-specific guardrails — domain rules, status
   guard, blocker triggers)
 
@@ -90,10 +92,11 @@ Current bounded canary / live-evidence state:
   the relationship scope beyond `CO_HOLDING` / `NORTHBOUND_HOLD`.
 
 Next step after the bounded canary evidence is post-canary
-operationalization and runbook hardening. Only after that should the
-project evaluate a controlled opt-in canary for default propagation; it
-should still remain gated and should not be documented as default-enabled
-or broadly rolled out until separate evidence lands.
+operationalization using the hardened runbook in
+`docs/PROPAGATION_CANARY_RUNBOOK.md`. Only after that should the project
+evaluate a controlled opt-in canary for default propagation; it should
+still remain gated and should not be documented as default-enabled or
+broadly rolled out until separate evidence lands.
 
 CLAUDE.md §10 domain invariants this module enforces by construction:
 
@@ -176,6 +179,14 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q \
   tests/unit/test_propagation_holdings.py tests/unit/test_propagation_merge.py \
   tests/unit/test_snapshots.py tests/unit/test_propagation_channels.py \
   tests/unit/test_schema.py tests/boundary/test_red_lines.py
+```
+
+Focused propagation canary / runbook hardening evidence:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q \
+  tests/unit/test_rollout.py tests/unit/test_rollout_runbook.py \
+  tests/unit/test_holdings_live_graph_proof.py
 ```
 
 Refresh global pass/skip counts only after running the full suite in the
