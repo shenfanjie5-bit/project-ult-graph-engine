@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ from contracts.schemas import CandidateGraphDelta
 import graph_engine.proofs.holdings_live_graph as proof_module
 from graph_engine.models import (
     GraphEdgeRecord,
+    GraphAssertionRecord,
     GraphNodeRecord,
     Neo4jGraphStatus,
     PropagationResult,
@@ -34,7 +36,13 @@ NOW = datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc)
 
 
 class FakeReadOnlyClient:
-    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        rows: list[dict[str, Any]] | None = None,
+        *,
+        database: str = "projectultproof20260507",
+    ) -> None:
+        self.config = SimpleNamespace(database=database)
         self.rows = rows or []
         self.read_calls: list[tuple[str, dict[str, Any]]] = []
         self.write_calls: list[tuple[str, dict[str, Any]]] = []
@@ -75,6 +83,47 @@ def test_live_graph_proof_guard_rejects_default_neo4j(tmp_path) -> None:  # type
 
     with pytest.raises(PermissionError, match="default Neo4j database"):
         validate_holdings_live_graph_proof_env(env, artifact_root=tmp_path / "proof-artifacts")
+
+
+@pytest.mark.parametrize("database", ["system", "prod", "production", "live"])
+def test_live_graph_proof_guard_rejects_unsafe_non_default_db_names(
+    tmp_path,
+    database: str,
+) -> None:  # type: ignore[no-untyped-def]
+    env = {
+        "GRAPH_ENGINE_LIVE_PROOF_CONFIRM": "1",
+        "GRAPH_ENGINE_LIVE_PROOF_NAMESPACE": "proof-20260507-a",
+        "NEO4J_DATABASE": database,
+    }
+
+    with pytest.raises(PermissionError, match="not allowed"):
+        validate_holdings_live_graph_proof_env(env, artifact_root=tmp_path / "proof-artifacts")
+
+
+def test_live_graph_proof_guard_requires_disposable_db_marker(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    env = {
+        "GRAPH_ENGINE_LIVE_PROOF_CONFIRM": "1",
+        "GRAPH_ENGINE_LIVE_PROOF_NAMESPACE": "proof-20260507-a",
+        "NEO4J_DATABASE": "analytics",
+    }
+
+    with pytest.raises(PermissionError, match="proof, smoke, or test"):
+        validate_holdings_live_graph_proof_env(env, artifact_root=tmp_path / "proof-artifacts")
+
+
+def test_live_graph_proof_guard_accepts_safe_proof_db(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    env = {
+        "GRAPH_ENGINE_LIVE_PROOF_CONFIRM": "1",
+        "GRAPH_ENGINE_LIVE_PROOF_NAMESPACE": "proof-20260507-a",
+        "NEO4J_DATABASE": "projectultproof20260507",
+    }
+
+    config = validate_holdings_live_graph_proof_env(
+        env,
+        artifact_root=tmp_path / "proof-artifacts",
+    )
+
+    assert config.neo4j_database == "projectultproof20260507"
 
 
 def test_live_graph_proof_guard_requires_namespace(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -134,6 +183,37 @@ def test_layer_a_artifact_writer_sanitizes_manifest_and_records(tmp_path) -> Non
         "CO_HOLDING",
         "NORTHBOUND_HOLD",
     }
+
+
+def test_layer_a_artifact_redacts_nested_sensitive_values(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    plan = _sensitive_promotion_plan()
+
+    summary = write_layer_a_artifact(
+        plan,
+        artifact_root=tmp_path / "proof-workspace",
+        namespace="proof-20260507-a",
+    )
+
+    records_text = summary.records_path.read_text(encoding="utf-8")
+    assert "postgresql://" not in records_text
+    assert "ghp_secretvalue" not in records_text
+    assert "/Users/fanjie/Desktop/Cowork/project-ult" not in records_text
+    assert "raw_provider_payload" not in records_text
+    assert "projectultproof20260507" in records_text
+
+    records = [json.loads(line) for line in records_text.splitlines()]
+    node_record = next(record["record"] for record in records if record["record_type"] == "node")
+    edge_record = next(record["record"] for record in records if record["record_type"] == "edge")
+    assertion_record = next(
+        record["record"] for record in records if record["record_type"] == "assertion"
+    )
+
+    assert node_record["properties"]["local_path"] == "<redacted>"
+    assert edge_record["properties"]["lineage"]["database_url"] == "<redacted>"
+    assert edge_record["properties"]["lineage"]["nested"]["raw_payload"] == "<redacted>"
+    assert edge_record["properties"]["notes"] == "<redacted>"
+    assert assertion_record["evidence"]["provider_payload"] == "<redacted>"
+    assert assertion_record["evidence"]["safe_summary"] == "projectultproof20260507"
 
 
 def test_layer_a_canonical_writer_records_last_summary(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -311,6 +391,38 @@ def test_live_graph_proof_harness_blocks_dangerous_db_before_promotion(
     assert called is False
 
 
+def test_live_graph_proof_harness_rejects_client_db_mismatch_before_promotion(
+    monkeypatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    called = False
+
+    def fail_if_called(*args: Any, **kwargs: Any) -> PromotionPlan:
+        nonlocal called
+        called = True
+        raise AssertionError("promotion must not run when client database mismatches")
+
+    monkeypatch.setattr(proof_module, "promote_graph_deltas", fail_if_called)
+
+    with pytest.raises(PermissionError, match="client database does not match"):
+        run_holdings_live_graph_proof(
+            cycle_id="cycle-1",
+            selection_ref="selection-1",
+            candidate_deltas=[_candidate_delta("delta-co", "CO_HOLDING")],
+            entity_reader=object(),  # type: ignore[arg-type]
+            client=FakeReadOnlyClient(database="neo4j"),
+            status_manager=_status_manager(graph_generation_id=4),
+            env={
+                "GRAPH_ENGINE_LIVE_PROOF_CONFIRM": "1",
+                "GRAPH_ENGINE_LIVE_PROOF_NAMESPACE": "proof-20260507-a",
+                "NEO4J_DATABASE": "projectultproof20260507",
+            },
+            artifact_root=tmp_path / "proof-workspace",
+        )
+
+    assert called is False
+
+
 def test_live_graph_proof_harness_runs_promotion_readback_and_algorithm_summary(
     monkeypatch,
     tmp_path,
@@ -410,6 +522,59 @@ def _promotion_plan(*, relationship_type: str = "CO_HOLDING") -> PromotionPlan:
     )
 
 
+def _sensitive_promotion_plan() -> PromotionPlan:
+    return PromotionPlan(
+        cycle_id="cycle-1",
+        selection_ref="selection-1",
+        delta_ids=["delta-sensitive"],
+        node_records=[
+            _node(
+                "node-a",
+                "entity-a",
+                properties={
+                    "canonical_id_rule_version": "proof/v1",
+                    "local_path": "/Users/fanjie/Desktop/Cowork/project-ult/.local/proof",
+                },
+            )
+        ],
+        edge_records=[
+            _edge(
+                "edge-sensitive",
+                "CO_HOLDING",
+                properties={
+                    "evidence_refs": ["fact-sensitive"],
+                    "lineage": {
+                        "database_url": "postgresql://dp:secret@localhost:5432/proof",
+                        "nested": {
+                            "raw_payload": {
+                                "provider": "raw_provider_payload",
+                                "token": "ghp_secretvalue",
+                            }
+                        },
+                    },
+                    "notes": '{"token":"ghp_secretvalue","raw_payload":"raw_provider_payload"}',
+                    "safe_summary": "projectultproof20260507",
+                },
+            )
+        ],
+        assertion_records=[
+            GraphAssertionRecord(
+                assertion_id="assertion-sensitive",
+                source_node_id="node-a",
+                target_node_id=None,
+                assertion_type="HOLDINGS_PROOF",
+                evidence={
+                    "provider_payload": '{"token":"ghp_secretvalue"}',
+                    "safe_summary": "projectultproof20260507",
+                },
+                confidence=0.9,
+                created_at=NOW,
+            )
+        ],
+        created_at=NOW,
+    )
+
+
 def _candidate_delta(delta_id: str, relation_type: str) -> CandidateGraphDelta:
     return CandidateGraphDelta(
         delta_id=delta_id,
@@ -423,12 +588,17 @@ def _candidate_delta(delta_id: str, relation_type: str) -> CandidateGraphDelta:
     )
 
 
-def _node(node_id: str, canonical_entity_id: str) -> GraphNodeRecord:
+def _node(
+    node_id: str,
+    canonical_entity_id: str,
+    *,
+    properties: dict[str, Any] | None = None,
+) -> GraphNodeRecord:
     return GraphNodeRecord(
         node_id=node_id,
         canonical_entity_id=canonical_entity_id,
         label="Entity",
-        properties={"canonical_id_rule_version": "proof/v1"},
+        properties=properties or {"canonical_id_rule_version": "proof/v1"},
         created_at=NOW,
         updated_at=NOW,
     )

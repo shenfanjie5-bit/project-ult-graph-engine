@@ -36,7 +36,34 @@ _DEFAULT_NEO4J_DATABASE = "neo4j"
 _SAFE_NAMESPACE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,95}$")
 _SAFE_FILE_COMPONENT_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 _PROOF_PATH_MARKER_PATTERN = re.compile(r"(^|[.-])(proof|smoke|test)([.-]|$)")
+_PROOF_NAME_MARKER_PATTERN = re.compile(r"(proof|smoke|test)", re.IGNORECASE)
+_SAFE_NEO4J_DATABASE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,95}$")
 _ALLOWED_HOLDINGS_RELATIONSHIPS = frozenset({"CO_HOLDING", "NORTHBOUND_HOLD"})
+_UNSAFE_NEO4J_DATABASE_NAMES = frozenset(
+    {
+        "default",
+        "live",
+        "main",
+        "neo4j",
+        "prod",
+        "production",
+        "system",
+    }
+)
+_SENSITIVE_KEY_PATTERN = re.compile(
+    r"(token|secret|password|passwd|pwd|dsn|database_url|private_key|"
+    r"raw[_-]?(payload|response|provider)?|provider[_-]?payload|"
+    r"local[_-]?path|runtime[_-]?path)",
+    re.IGNORECASE,
+)
+_SENSITIVE_VALUE_PATTERNS = (
+    re.compile(r"\b(?:postgres(?:ql)?|mysql|redis|mongodb)://\S+", re.IGNORECASE),
+    re.compile(r"\b(?:ghp|gho|github_pat)_[A-Za-z0-9_]+\b"),
+    re.compile(r"\b[A-Za-z0-9_]*token[A-Za-z0-9_]*=[^\s,;]+", re.IGNORECASE),
+    re.compile(r"/Users/[^,\s\"']+"),
+    re.compile(r"/tmp/[^,\s\"']*project-ult[^,\s\"']*", re.IGNORECASE),
+)
+_REDACTED_VALUE = "<redacted>"
 
 
 class ReadOnlyGraphClient(Protocol):
@@ -163,8 +190,7 @@ def validate_holdings_live_graph_proof_env(
     neo4j_database = str(env.get(_NEO4J_DATABASE_ENV) or "").strip()
     if not neo4j_database:
         raise PermissionError(f"{_NEO4J_DATABASE_ENV} is required for holdings live graph proof")
-    if neo4j_database.lower() == _DEFAULT_NEO4J_DATABASE:
-        raise PermissionError("default Neo4j database 'neo4j' is not allowed for this proof")
+    _validate_neo4j_database_name(neo4j_database)
 
     artifact_config = _validate_artifact_destination(artifact_root, namespace=namespace)
     return HoldingsLiveGraphProofConfig(
@@ -402,6 +428,7 @@ def run_holdings_live_graph_proof(
     """
 
     proof_config = validate_holdings_live_graph_proof_env(env, artifact_root=artifact_root)
+    validate_neo4j_client_database(client, proof_config.neo4j_database)
     validate_holdings_candidate_deltas(candidate_deltas)
 
     canonical_writer = LayerAArtifactCanonicalWriter(
@@ -482,6 +509,48 @@ def _require_namespace(namespace: str | None) -> str:
     return value
 
 
+def validate_neo4j_client_database(client: Any, expected_database: str) -> None:
+    """Bind the guarded env database to the actual client before live sync."""
+
+    actual_database = _client_database(client)
+    if actual_database != expected_database:
+        raise PermissionError(
+            "Neo4j client database does not match guarded proof database: "
+            f"expected {expected_database!r}",
+        )
+    _validate_neo4j_database_name(actual_database)
+
+
+def _validate_neo4j_database_name(database: str) -> str:
+    value = str(database or "").strip()
+    if not value:
+        raise PermissionError(f"{_NEO4J_DATABASE_ENV} is required for holdings live graph proof")
+    if not _SAFE_NEO4J_DATABASE_PATTERN.fullmatch(value):
+        raise ValueError("Neo4j proof database name must be a safe identifier")
+    if value.lower() == _DEFAULT_NEO4J_DATABASE:
+        raise PermissionError("default Neo4j database 'neo4j' is not allowed for this proof")
+    if value.lower() in _UNSAFE_NEO4J_DATABASE_NAMES:
+        raise PermissionError(
+            f"Neo4j database {value!r} is not allowed for holdings live graph proof",
+        )
+    if not _PROOF_NAME_MARKER_PATTERN.search(value):
+        raise PermissionError(
+            "Neo4j proof database name must contain proof, smoke, or test",
+        )
+    return value
+
+
+def _client_database(client: Any) -> str:
+    config = getattr(client, "config", None)
+    database = getattr(config, "database", None)
+    if database is None:
+        raise PermissionError("Neo4j client database could not be verified")
+    value = str(database).strip()
+    if not value:
+        raise PermissionError("Neo4j client database could not be verified")
+    return value
+
+
 def _path_has_proof_marker(path: Path) -> bool:
     return any(_PROOF_PATH_MARKER_PATTERN.search(part.lower()) for part in path.parts)
 
@@ -493,7 +562,7 @@ def _canonical_record_lines(plan: PromotionPlan) -> list[str]:
             _json_dumps(
                 {
                     "record_type": "node",
-                    "record": node_record.model_dump(mode="json"),
+                    "record": _curated_node_record(node_record),
                 }
             )
         )
@@ -502,7 +571,7 @@ def _canonical_record_lines(plan: PromotionPlan) -> list[str]:
             _json_dumps(
                 {
                     "record_type": "edge",
-                    "record": edge_record.model_dump(mode="json"),
+                    "record": _curated_edge_record(edge_record),
                 }
             )
         )
@@ -511,11 +580,94 @@ def _canonical_record_lines(plan: PromotionPlan) -> list[str]:
             _json_dumps(
                 {
                     "record_type": "assertion",
-                    "record": assertion_record.model_dump(mode="json"),
+                    "record": _curated_assertion_record(assertion_record),
                 }
             )
         )
     return lines
+
+
+def _curated_node_record(node_record: Any) -> dict[str, Any]:
+    return {
+        "node_id": node_record.node_id,
+        "canonical_entity_id": node_record.canonical_entity_id,
+        "label": node_record.label,
+        "properties": _redact_sensitive_payload(node_record.properties),
+        "created_at": node_record.created_at.isoformat(),
+        "updated_at": node_record.updated_at.isoformat(),
+    }
+
+
+def _curated_edge_record(edge_record: Any) -> dict[str, Any]:
+    return {
+        "edge_id": edge_record.edge_id,
+        "source_node_id": edge_record.source_node_id,
+        "target_node_id": edge_record.target_node_id,
+        "relationship_type": edge_record.relationship_type,
+        "properties": _redact_sensitive_payload(edge_record.properties),
+        "weight": edge_record.weight,
+        "created_at": edge_record.created_at.isoformat(),
+        "updated_at": edge_record.updated_at.isoformat(),
+    }
+
+
+def _curated_assertion_record(assertion_record: Any) -> dict[str, Any]:
+    return {
+        "assertion_id": assertion_record.assertion_id,
+        "source_node_id": assertion_record.source_node_id,
+        "target_node_id": assertion_record.target_node_id,
+        "assertion_type": assertion_record.assertion_type,
+        "evidence": _redact_sensitive_payload(assertion_record.evidence),
+        "confidence": assertion_record.confidence,
+        "created_at": assertion_record.created_at.isoformat(),
+    }
+
+
+def _redact_sensitive_payload(value: Any, *, key: str | None = None) -> Any:
+    if key is not None and _SENSITIVE_KEY_PATTERN.search(key):
+        return _REDACTED_VALUE
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _redact_sensitive_payload(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_sensitive_payload(item) for item in value]
+    if isinstance(value, str):
+        return _redact_sensitive_string(value)
+    return value
+
+
+def _redact_sensitive_string(value: str) -> str:
+    redacted = value
+    for pattern in _SENSITIVE_VALUE_PATTERNS:
+        redacted = pattern.sub(_REDACTED_VALUE, redacted)
+    if _looks_like_raw_payload_string(redacted):
+        return _REDACTED_VALUE
+    return redacted
+
+
+def _looks_like_raw_payload_string(value: str) -> bool:
+    stripped = value.strip()
+    if not (
+        (stripped.startswith("{") and stripped.endswith("}"))
+        or (stripped.startswith("[") and stripped.endswith("]"))
+    ):
+        return False
+    lowered = stripped.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            '"password"',
+            '"private_key"',
+            '"raw_payload"',
+            '"raw_response"',
+            '"secret"',
+            '"token"',
+        )
+    )
 
 
 def _safe_file_component(value: str) -> str:
