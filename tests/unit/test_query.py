@@ -15,8 +15,11 @@ from graph_engine.models import (
 )
 from graph_engine.query import (
     MAX_QUERY_DEPTH,
+    MVP20_GRAPH_DEPTH,
     query_propagation_paths,
+    query_mvp20_context_subgraph,
     query_subgraph,
+    validate_mvp20_decision_targets,
 )
 from graph_engine.status import GraphStatusManager
 from tests.fakes import InMemoryStatusStore
@@ -653,6 +656,63 @@ def test_query_apis_do_not_call_execute_write() -> None:
     assert client.write_calls == []
 
 
+def test_validate_mvp20_decision_targets_requires_exact_unique_universe() -> None:
+    assert validate_mvp20_decision_targets(_mvp20_targets()) == tuple(_mvp20_targets())
+
+    with pytest.raises(ValueError, match="exactly 20"):
+        validate_mvp20_decision_targets(_mvp20_targets()[:-1])
+    with pytest.raises(ValueError, match="unique"):
+        validate_mvp20_decision_targets([*_mvp20_targets()[:-1], "entity-a"])
+
+
+def test_query_mvp20_context_subgraph_locks_depth_two_and_marks_context_only() -> None:
+    client = FakeQueryClient()
+
+    result = query_mvp20_context_subgraph(
+        ["entity-a"],
+        decision_target_entities=_mvp20_targets(),
+        client=client,  # type: ignore[arg-type]
+        status_manager=_status_manager(),
+        result_limit=10,
+    )
+
+    roles = {
+        node["canonical_entity_id"]: node["entity_role"]
+        for node in result.subgraph_nodes
+    }
+    assert result.depth == MVP20_GRAPH_DEPTH
+    assert result.result_limit == 10
+    assert roles == {
+        "entity-a": "decision_target",
+        "entity-b": "decision_target",
+        "entity-c": "context_only",
+    }
+    assert all(
+        node["metadata"]["mvp20_entity_role"] == node["entity_role"]
+        for node in result.subgraph_nodes
+    )
+    assert {
+        edge["target_entity_role"] for edge in result.subgraph_edges
+    } == {"decision_target", "context_only"}
+    assert client.write_calls == []
+    assert all("run_full_propagation" not in query for query, _ in client.read_calls)
+
+
+def test_query_mvp20_context_subgraph_validates_targets_before_reading() -> None:
+    client = FakeQueryClient()
+
+    with pytest.raises(ValueError, match="exactly 20"):
+        query_mvp20_context_subgraph(
+            ["entity-a"],
+            decision_target_entities=_mvp20_targets()[:-1],
+            client=client,  # type: ignore[arg-type]
+            status_manager=_status_manager(),
+        )
+
+    assert client.read_calls == []
+    assert client.write_calls == []
+
+
 def _node_rows() -> list[dict[str, Any]]:
     return [
         {
@@ -814,6 +874,14 @@ def _edge_channels(edge: dict[str, Any]) -> tuple[str, ...]:
     if edge["relationship_type"] == "NORTHBOUND_HOLD":
         return ("event", "reflexive")
     return ("fundamental",)
+
+
+def _mvp20_targets() -> list[str]:
+    return [
+        "entity-a",
+        "entity-b",
+        *[f"entity-target-{index:02d}" for index in range(18)],
+    ]
 
 
 def _status_manager(
