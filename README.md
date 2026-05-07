@@ -72,6 +72,29 @@ Implemented interface/type decisions:
   not claim production rollout to live Neo4j, graph writeback, or new
   cross-module contracts.
 
+Current bounded canary / live-evidence state:
+
+- Bounded gated canary / live production evidence status: **PASS** for
+  the guarded proof/canary path only. This covers holdings-scoped
+  `CO_HOLDING` / `NORTHBOUND_HOLD` candidates, Layer A artifact evidence,
+  guarded live-graph sync/readback, explicit holdings algorithm summaries,
+  and CI evidence from the proof/canary hardening PRs.
+- Production hardening prerequisites and guards have landed for that
+  bounded path: explicit environment confirmation, safe namespace and
+  artifact-root validation, non-default disposable Neo4j database labels,
+  client database match checks, ready-status checks, relationship
+  allowlists, evidence manifests, and sanitized proof outputs.
+- This PASS does **not** mean default or full propagation is enabled. It
+  does **not** mean broad production rollout is complete. It does **not**
+  complete M4.7 / financial-doc scope, add contracts subtypes, or expand
+  the relationship scope beyond `CO_HOLDING` / `NORTHBOUND_HOLD`.
+
+Next step after the bounded canary evidence is post-canary
+operationalization and runbook hardening. Only after that should the
+project evaluate a controlled opt-in canary for default propagation; it
+should still remain gated and should not be documented as default-enabled
+or broadly rolled out until separate evidence lands.
+
 CLAUDE.md §10 domain invariants this module enforces by construction:
 
 - **Truth Before Mirror** (#1): Iceberg is canonical truth; Neo4j is

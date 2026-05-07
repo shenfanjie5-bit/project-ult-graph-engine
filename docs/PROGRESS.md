@@ -24,6 +24,17 @@ event/reflexive propagation、readonly query/simulation、snapshot generation
   `PLEDGE_STATUS`。
 - 未声明 live Neo4j production rollout；算法仅读取 ready live graph，
   不写 Neo4j。
+- bounded gated canary / live production evidence 已达到 PASS，但该
+  PASS 只覆盖 holdings-scoped `CO_HOLDING` / `NORTHBOUND_HOLD` proof /
+  canary 路径，不表示默认传播已启用，也不表示 broad production
+  rollout 已完成。
+- production hardening prerequisites / guards 已落地：显式环境确认、
+  safe namespace / artifact root、非默认 disposable Neo4j database label、
+  client database match、ready status guard、relationship allowlist、
+  evidence manifest 与 sanitized proof output。
+- 下一步是 post-canary operationalization / runbook hardening；之后才
+  进入 controlled opt-in default-propagation canary，不提前声明 default /
+  full propagation enabled。
 
 ## 里程碑进度
 
@@ -40,7 +51,16 @@ event/reflexive propagation、readonly query/simulation、snapshot generation
 | Issue | 当前状态 | 说明 |
 |------|----------|------|
 | #56 | 已完成 | `CO_HOLDING` / `NORTHBOUND_HOLD` enum、planner、query、channel 基础能力 |
-| #55 | holdings-only 已完成/closed | 已完成 co-holding crowding 与 northbound anomaly 显式算法；broad/default propagation、financial-doc 与 contracts subtype 均不在本 scope |
+| #55 | holdings-only 已完成/closed | 已完成 co-holding crowding 与 northbound anomaly 显式算法；bounded gated canary/live evidence PASS；broad/default propagation、financial-doc 与 contracts subtype 均不在本 scope |
+
+## 下一步
+
+1. Post-canary operationalization / runbook hardening。
+2. 在 runbook 与操作 guard 补齐后，再评估 controlled opt-in default-propagation
+   canary。
+3. 在单独证据完成前，不声明 default/full propagation enabled、broad
+   production rollout complete、M4.7 / financial-doc complete 或 contracts
+   subtype 支持。
 
 ## 验证命令
 
