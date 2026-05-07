@@ -291,6 +291,22 @@ def test_contract_delta_upsert_relation_maps_to_edge_promotion() -> None:
     assert plan.edge_records[0].relationship_type == contract_delta.relation_type
 
 
+def test_contract_delta_edge_upsert_maps_to_edge_promotion() -> None:
+    contract_delta = _contract_delta(delta_type="edge_upsert")
+
+    plan = promote_graph_deltas(
+        "cycle-1",
+        "selection-1",
+        candidate_reader=FakeCandidateReader([contract_delta]),
+        entity_reader=_contract_entity_reader(),
+        canonical_writer=FakeCanonicalWriter(),
+        sync_to_live_graph=False,
+    )
+
+    assert [edge.edge_id for edge in plan.edge_records] == [contract_delta.delta_id]
+    assert plan.edge_records[0].relationship_type == contract_delta.relation_type
+
+
 @pytest.mark.parametrize(
     "relationship_type",
     [
@@ -317,6 +333,84 @@ def test_contract_delta_promotes_holdings_relationship_types(
 
     assert plan.edge_records[0].relationship_type == relationship_type
     assert plan.edge_records[0].edge_id.startswith(f"{relationship_type.lower()}:")
+
+
+@pytest.mark.parametrize(
+    "relationship_type",
+    [
+        RelationshipType.CO_HOLDING.value,
+        RelationshipType.NORTHBOUND_HOLD.value,
+    ],
+)
+def test_frozen_holdings_edge_upsert_promotes_to_layer_a_without_live_sync(
+    monkeypatch: pytest.MonkeyPatch,
+    relationship_type: str,
+) -> None:
+    sync_live_graph = MagicMock()
+    monkeypatch.setattr(service_module, "sync_live_graph", sync_live_graph)
+    source_node = f"node-holder-{relationship_type.lower()}"
+    target_node = f"node-security-{relationship_type.lower()}"
+    source_entity = f"entity-holder-{relationship_type.lower()}"
+    target_entity = f"entity-security-{relationship_type.lower()}"
+    contract_delta = _contract_delta(
+        delta_id=f"{relationship_type.lower()}-live-proof-1",
+        delta_type="edge_upsert",
+        source_node=source_node,
+        target_node=target_node,
+        relation_type=relationship_type,
+        subsystem_id="subsystem-holdings",
+    )
+    contract_delta.properties = {
+        "weight": 0.7,
+        "edge_key": f"{relationship_type}|holder|security",
+        "source_mart": "mart_deriv_holdings_proof",
+    }
+    contract_delta.producer_context = {
+        "graph_node_upserts": [
+            _node_payload(source_node, canonical_entity_id=source_entity),
+            _node_payload(target_node, canonical_entity_id=target_entity),
+        ],
+    }
+    writer = FakeCanonicalWriter()
+
+    plan = promote_graph_deltas(
+        "cycle-1",
+        "selection-1",
+        candidate_reader=FakeCandidateReader([contract_delta]),
+        entity_reader=_contract_entity_reader(
+            existing_ids={source_entity, target_entity},
+            node_entity_ids={},
+        ),
+        canonical_writer=writer,
+        sync_to_live_graph=False,
+    )
+
+    edge = plan.edge_records[0]
+    assert writer.calls == ["canonical"]
+    assert writer.plans == [plan]
+    sync_live_graph.assert_not_called()
+    assert sorted(node.node_id for node in plan.node_records) == [
+        source_node,
+        target_node,
+    ]
+    assert edge.relationship_type == relationship_type
+    assert edge.source_node_id == source_node
+    assert edge.target_node_id == target_node
+    assert edge.edge_id.startswith(f"{relationship_type.lower()}:")
+    assert edge.edge_id != contract_delta.delta_id
+
+    replay_plan = promote_graph_deltas(
+        "cycle-1",
+        "selection-1",
+        candidate_reader=FakeCandidateReader([contract_delta]),
+        entity_reader=_contract_entity_reader(
+            existing_ids={source_entity, target_entity},
+            node_entity_ids={},
+        ),
+        canonical_writer=FakeCanonicalWriter(),
+        sync_to_live_graph=False,
+    )
+    assert replay_plan.edge_records[0].edge_id == edge.edge_id
 
 
 def test_holdings_contract_delta_can_upsert_endpoint_nodes_before_edge() -> None:
@@ -1207,6 +1301,7 @@ def _contract_delta(
     source_node: str = "node-1",
     target_node: str = "node-2",
     relation_type: str = RelationshipType.SUPPLY_CHAIN.value,
+    subsystem_id: str = "subsystem-news",
 ) -> CandidateGraphDelta:
     return CandidateGraphDelta(
         delta_id=delta_id,
@@ -1216,7 +1311,7 @@ def _contract_delta(
         relation_type=relation_type,
         properties={"weight": 0.7},
         evidence=[f"fact-{delta_id}"],
-        subsystem_id="subsystem-news",
+        subsystem_id=subsystem_id,
     )
 
 
